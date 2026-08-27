@@ -7,6 +7,8 @@
 #include "vg.hpp"
 #include "xg.hpp"
 #include "path.hpp"
+#include "../io/json2graph.hpp"
+#include <bdsg/hash_graph.hpp>
 
 namespace vg {
 namespace unittest {
@@ -83,13 +85,13 @@ TEST_CASE("basic graph chunking", "[chunk]") {
     
     )";
     
-    // Load it into Protobuf
-    Graph chunk;
-    json2pb(chunk, graph_json.c_str(), graph_json.size());
-    
+    // Load the graph
+    bdsg::HashGraph graph;
+    vg::io::json2graph(graph_json, &graph);
+
     // Pass it over to XG
     xg::XG index;
-    index.from_path_handle_graph(VG(chunk));
+    index.from_path_handle_graph(graph);
 
     PathChunker chunker(&index);
 
@@ -186,10 +188,28 @@ TEST_CASE("basic graph chunking", "[chunk]") {
         VG subgraph;
         Region out_region;        
         chunker.extract_subgraph(region, 1, 0, false, subgraph, out_region);
+
+        // We include node 4 in the cycle, and also node 3 which is 1 away, so
+        // we include all the loops arounf the cycle and need to start the
+        // extracted path region where it enters node 3 at base 6.
         
         REQUIRE(subgraph.node_count() == 7);
         REQUIRE(subgraph.edge_count() == 9);
+        REQUIRE(out_region.start == 6);
+        
+    }
+
+    SECTION("Partial graph via cyclic path, 0 expansion") {
+        
+        Region region = {"z", 35, 36};
+        VG subgraph;
+        Region out_region;        
+        chunker.extract_subgraph(region, 0, 0, false, subgraph, out_region);
+
+        REQUIRE(subgraph.node_count() == 1);
+        REQUIRE(subgraph.edge_count() == 0);
         REQUIRE(out_region.start == 31);
+        REQUIRE(out_region.end == 36); // End is inclusive
         
     }
 

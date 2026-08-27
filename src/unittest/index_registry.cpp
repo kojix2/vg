@@ -1,4 +1,4 @@
-/// \file indexed_vg.cpp
+/// \file index_registry.cpp
 ///  
 /// unit tests for the vg-file-backed handle graph implementation
 
@@ -22,6 +22,8 @@ using namespace std;
 TEST_CASE("IndexRegistry can make plans on a dummy recipe graph", "[indexregistry]") {
     
     TestIndexRegistry registry;
+    // Turn off file existence checking for unit tests
+    registry.check_files = false;
     
     // name the indexes
     registry.register_index("FASTA", "fasta");
@@ -275,6 +277,71 @@ TEST_CASE("IndexRegistry can make plans on a dummy recipe graph", "[indexregistr
 //        REQUIRE(plan.steps[made_at_step.at({"Pruned VG"})].second == 0);
 //        REQUIRE(plan.steps[made_at_step.at({"GCSA", "LCP"})].second == 0);
 //    }
+}
+
+TEST_CASE("IndexRegistry wildcard parsing works", "[indexregistry]") {
+    
+    SECTION("empty string") {
+        auto wildcards = IndexRegistry::get_wildcards("");
+        REQUIRE(wildcards.empty());
+    }
+
+    SECTION("string with no wildcards") {
+        auto wildcards = IndexRegistry::get_wildcards("no wildcards here");
+        REQUIRE(wildcards.empty());
+    }
+
+    SECTION("string with one wildcard") {
+        auto wildcards = IndexRegistry::get_wildcards("some {wildcards} here");
+        REQUIRE(wildcards.size() == 1);
+        REQUIRE(wildcards.count("wildcards"));
+    }
+
+    SECTION("string with several wildcards") {
+        auto wildcards = IndexRegistry::get_wildcards("{some} {wildcards} {here}");
+        REQUIRE(wildcards.size() == 3);
+        REQUIRE(wildcards.count("some"));
+        REQUIRE(wildcards.count("wildcards"));
+        REQUIRE(wildcards.count("here"));
+
+        // Make sure they iterate in alphabetical order
+        std::vector<std::string> found;
+        for (auto& w : wildcards) {
+            found.push_back(w);
+        }
+        REQUIRE(found.at(0) == "here");
+        REQUIRE(found.at(1) == "some");
+        REQUIRE(found.at(2) == "wildcards");
+    }
+}
+
+TEST_CASE("IndexRegistry wildcard substitution works", "[indexregistry]") {
+
+    SECTION("empty string, empty valuation") {
+        auto result = IndexRegistry::substitute_wildcards("", {});
+        REQUIRE(result == "");
+    }
+
+    SECTION("empty string, nonempty valuation") {
+        auto result = IndexRegistry::substitute_wildcards("", {{"a", "thing"}, {"b", "another thing"}});
+        REQUIRE(result == "");
+    }
+
+    SECTION("nonempty string, nonempty valuation") {
+        auto result = IndexRegistry::substitute_wildcards("stuff", {{"a", "thing"}, {"b", "another thing"}});
+        REQUIRE(result == "stuff");
+    }
+
+    SECTION("nonempty string with some wildcards, nonempty valuation") {
+        auto result = IndexRegistry::substitute_wildcards("st{a}ff", {{"a", "thing"}, {"b", "another thing"}});
+        REQUIRE(result == "stthingff");
+    }
+
+    SECTION("nonempty string with all wildcards, nonempty valuation") {
+        auto result = IndexRegistry::substitute_wildcards("st{a}ff{b}", {{"a", "thing"}, {"b", "another thing"}});
+        REQUIRE(result == "stthingffanother thing");
+    }
+
 }
 
 }

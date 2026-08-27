@@ -14,6 +14,7 @@
 
 #include "../vg.hpp"
 #include "../deconstructor.hpp"
+#include "../gref.hpp"
 #include "../integrated_snarl_finder.hpp"
 #include "../gbwtgraph_helper.hpp"
 #include "../gbwt_helper.hpp"
@@ -34,32 +35,50 @@ using namespace std;
 using namespace vg;
 using namespace vg::subcommand;
 
-void help_deconstruct(char** argv){
+void help_deconstruct(char** argv) {
     cerr << "usage: " << argv[0] << " deconstruct [options] [-p|-P] <PATH> <GRAPH>" << endl
-         << "Outputs VCF records for Snarls present in a graph (relative to a chosen reference path)." << endl
+         << "Output VCF records for Snarls present in a graph (relative to a reference path)." << endl
          << "options: " << endl
-         << "    -p, --path NAME          A reference path to deconstruct against (multiple allowed)." << endl
-         << "    -P, --path-prefix NAME   All paths [excluding GBWT threads / non-reference GBZ paths] beginning with NAME used as reference (multiple allowed)." << endl
-         << "                             Other non-ref paths not considered as samples. " << endl
-         << "    -r, --snarls FILE        Snarls file (from vg snarls) to avoid recomputing." << endl
-         << "    -g, --gbwt FILE          consider alt traversals that correspond to GBWT haplotypes in FILE (not needed for GBZ graph input)." << endl
-         << "    -T, --translation FILE   Node ID translation (as created by vg gbwt --translation) to apply to snarl names and AT fields in output" << endl
-         << "    -O, --gbz-translation    Use the ID translation from the input gbz to apply snarl names to snarl names and AT fields in output" << endl
-         << "    -a, --all-snarls         Process all snarls, including nested snarls (by default only top-level snarls reported)." << endl
-         << "    -c, --context-jaccard N  Set context mapping size used to disambiguate alleles at sites with multiple reference traversals (default: 10000)." << endl
-         << "    -u, --untangle-travs     Use context mapping to determine the reference-relative positions of each step in allele traversals (AP INFO field)." << endl
-         << "    -K, --keep-conflicted    Retain conflicted genotypes in output." << endl
-         << "    -S, --strict-conflicts   Drop genotypes when we have more than one haplotype for any given phase (set by default when using GBWT input)." << endl
-         << "    -C, --contig-only-ref    Only use the CONTIG name (and not SAMPLE#CONTIG#HAPLOTYPE etc) for the reference if possible (ie there is only one reference sample)." << endl
-         << "    -L, --cluster F          Cluster traversals whose (handle) Jaccard coefficient is >= F together (default: 1.0) [experimental]" << endl
-         << "    -n, --nested             Write a nested VCF, including special tags. [experimental]" << endl
-         << "    -R, --star-allele        Use *-alleles to denote alleles that span but do not cross the site. Only works with -n" << endl
-         << "    -t, --threads N          Use N threads" << endl
-         << "    -v, --verbose            Print some status messages" << endl
-         << endl;
+         << "  -p, --path NAME          a reference path to deconstruct against (may repeat)." << endl
+         << "  -P, --path-prefix NAME   all paths [minus GBWT threads / non-ref GBZ paths]" << endl
+         << "                           beginning with NAME used as reference (may repeat)." << endl
+         << "                           other non-ref paths not considered as samples. " << endl
+         << "  -r, --snarls FILE        snarls file (from vg snarls) to avoid recomputing." << endl
+         << "  -g, --gbwt FILE          consider alt traversals for GBWT haplotypes in FILE" << endl
+         << "                           (not needed for GBZ graph input)." << endl
+         << "  -T, --translation FILE   node ID translation (from vg gbwt --translation)" << endl
+         << "                           to apply to snarl names and AT fields in output" << endl
+         << "  -O, --gbz-translation    use the ID translation from the input GBZ to apply" << endl
+         << "                           snarl names to snarl names and AT fields in output" << endl
+         << "  -a, --all-snarls         process all snarls, including nested snarls" << endl
+         << "                           (by default only top-level snarls reported)." << endl
+         << "                           Uses hierarchical processing and writes LV/PS tags." << endl
+         << "  -c, --context-jaccard N  set context mapping size used to disambiguate alleles" << endl
+         << "                           at sites with multiple reference traversals [10000]" << endl
+         << "  -u, --untangle-travs     use context mapping for reference-relative positions" << endl
+         << "                           of each step in allele traversals (AP INFO field)." << endl
+         << "  -K, --keep-conflicted    retain conflicted genotypes in output." << endl
+         << "  -S, --strict-conflicts   drop genotypes when we have more than one haplotype" << endl
+         << "                           for any given phase (set by default for GBWT input)." << endl
+         << "  -C, --contig-only-ref    only use CONTIG name (not SAMPLE#CONTIG#HAPLOTYPE)" << endl
+         << "                           for reference if possible (i.e. only one ref sample)" << endl
+         << "  -L, --cluster F          cluster traversals whose length-weighted" << endl
+         << "                           similarity is >= F together [1.0; experimental]" << endl
+         << "      --cluster-min-len N  only apply -L clustering at sites whose core" << endl
+         << "                           length -- the longest allele after stripping" << endl
+         << "                           the prefix and suffix common to all alleles" << endl
+         << "                           -- is >= N bp (0 = every site) [50]" << endl
+         << "                           in a nested run (-a) a clustered parent" << endl
+         << "                           disagrees with its own child records by design" << endl
+         << "  -R, --star-allele        use *-alleles to represent haplotypes that span the" << endl
+         << "                           parent but don't traverse nested sites (requires -a)" << endl
+         << "  -t, --threads N          use N threads" << endl
+         << "  -v, --verbose            print some status messages" << endl
+         << "  -h, --help               print this help message to stderr and exit" << endl;
 }
 
-int main_deconstruct(int argc, char** argv){
+int main_deconstruct(int argc, char** argv) {
+    Logger logger("vg deconstruct");
     if (argc <= 2) {
         help_deconstruct(argv);
         return 1;
@@ -81,9 +100,15 @@ int main_deconstruct(int argc, char** argv){
     bool untangle_traversals = false;
     bool contig_only_ref = false;
     double cluster_threshold = 1.0;
-    bool nested = false;
+    // -L is for collapsing near-identical structural alleles.  At 0 the similarity is dominated by
+    // sequence every allele shares, so a het SNP scores ~1 against its own alternative and is
+    // merged away; 50 is the standard SV size cutoff.  Pass 0 explicitly to gate nothing.
+    int64_t cluster_min_allele_len = 50;
+    bool cluster_min_len_set = false;
     bool star_allele = false;
-    
+
+    constexpr int OPT_CLUSTER_MIN_LEN = 1000;
+
     int c;
     optind = 2; // force optind past command positional argument
     while (true) {
@@ -98,6 +123,7 @@ int main_deconstruct(int argc, char** argv){
                 {"translation", required_argument, 0, 'T'},
                 {"gbz-translation", no_argument, 0, 'O'},                
                 {"path-traversals", no_argument, 0, 'e'},
+                {"ploidy", required_argument, 0, 'd'},
                 {"context-jaccard", required_argument, 0, 'c'},
                 {"untangle-travs", no_argument, 0, 'u'},
                 {"all-snarls", no_argument, 0, 'a'},
@@ -105,15 +131,15 @@ int main_deconstruct(int argc, char** argv){
                 {"strict-conflicts", no_argument, 0, 'S'},
                 {"contig-only-ref", no_argument, 0, 'C'},
                 {"cluster", required_argument, 0, 'L'},
-                {"nested", no_argument, 0, 'n'},
-                {"start-allele", no_argument, 0, 'R'},
+                {"cluster-min-len", required_argument, 0, OPT_CLUSTER_MIN_LEN},
+                {"star-allele", no_argument, 0, 'R'},
                 {"threads", required_argument, 0, 't'},
                 {"verbose", no_argument, 0, 'v'},
                 {0, 0, 0, 0}
             };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hp:P:H:r:g:T:OeKSCd:c:uaL:nRt:v",
+        c = getopt_long (argc, argv, "h?p:P:H:r:g:T:OeKSCd:c:uaL:Rt:v",
                          long_options, &option_index);
 
         // Detect the end of the options.
@@ -129,27 +155,26 @@ int main_deconstruct(int argc, char** argv){
             refpath_prefixes.push_back(optarg);
             break;
         case 'H':
-            cerr << "Warning [vg deconstruct]: -H is deprecated, and will be ignored" << endl;
+            logger.warn() << "-H is deprecated, and will be ignored" << endl;
             break;
         case 'r':
-            snarl_file_name = optarg;
+            snarl_file_name = require_exists(logger, optarg);
             break;
         case 'g':
-            gbwt_file_name = optarg;
+            gbwt_file_name = require_exists(logger, optarg);
             break;
         case 'T':
-            translation_file_name = optarg;
+            translation_file_name = require_exists(logger, optarg);
             break;
         case 'O':
             gbz_translation = true;
             break;                        
         case 'e':
-            cerr << "Warning [vg deconstruct]: -e is deprecated as it's now on default" << endl;
+            logger.warn() << "-e is deprecated as it's now on default" << endl;
             break;
         case 'd':
-            cerr << "Warning [vg deconstruct]: -d is deprecated - ploidy now inferred from haplotypes in path names" << endl;
+            logger.warn() << "-d is deprecated - ploidy now inferred from haplotypes in path names" << endl;
             break;
-            break;            
         case 'c':
             context_jaccard_window = parse<int>(optarg);
             break;
@@ -171,14 +196,18 @@ int main_deconstruct(int argc, char** argv){
         case 'L':
             cluster_threshold = max(0.0, min(1.0, parse<double>(optarg)));
             break;
-        case 'n':
-            nested = true;
+        case OPT_CLUSTER_MIN_LEN:
+            cluster_min_allele_len = parse<int64_t>(optarg);
+            cluster_min_len_set = true;
+            if (cluster_min_allele_len < 0) {
+                logger.error() << "--cluster-min-len must be >= 0" << endl;
+            }
             break;
         case 'R':
             star_allele = true;
             break;
         case 't':
-            omp_set_num_threads(parse<int>(optarg));
+            set_thread_count(logger, optarg);
             break;
         case 'v':
             show_progress = true;
@@ -194,15 +223,27 @@ int main_deconstruct(int argc, char** argv){
 
     }
 
-    if (nested == true && contig_only_ref == true) {
-        cerr << "Error [vg deconstruct]: -C cannot be used with -n" << endl;
-        return 1;
+    if (star_allele == true && all_snarls == false) {
+        logger.error() << "-R can only be used with -a" << endl;
     }
-    if (star_allele == true && nested == false) {
-        cerr << "Error [vg deconstruct]: -R can only be used with -n" << endl;
-        return 1;
+
+    // -R writes "*" in a child record to mean "an upstream deletion covers this site".  Clustering
+    // can absorb the very allele that deletion came from -- which one survives is decided by
+    // traversal order, so it is a matter of path names -- leaving the "*" referring to nothing in
+    // the file.  That is a malformed record rather than a lossy one, which is what separates it
+    // from ordinary nested clustering: there a clustered parent deliberately disagrees with its own
+    // child records, giving the collapsed view of a large variant while the children keep the
+    // precise one.  vg call refuses -L with -Y for the same reason.
+    if (star_allele == true && cluster_threshold < 1.0) {
+        logger.error() << "-L/--cluster cannot be used with -R/--star-allele" << endl;
     }
-    
+
+    // only for an explicit --cluster-min-len: the default is nonzero, so testing the value alone
+    // would warn on every run that does not pass -L
+    if (cluster_min_len_set && cluster_min_allele_len > 0 && cluster_threshold >= 1.0) {
+        logger.warn() << "--cluster-min-len has no effect without -L (cluster threshold < 1.0)" << endl;
+    }
+
     // Read the graph
     unique_ptr<PathHandleGraph> path_handle_graph_up;
     unique_ptr<GBZGraph> gbz_graph;
@@ -219,12 +260,11 @@ int main_deconstruct(int argc, char** argv){
         path_handle_graph_up = std::move(get<1>(input));
         path_handle_graph = path_handle_graph_up.get();
     } else {
-        cerr << "Error [vg deconstruct]: Input graph is not a GBZ or path handle graph" << endl;
-        return 1;
+        logger.error() << "Input graph is not a GBZ or path handle graph" << endl;
     }
 
     if (!gbz_graph && gbz_translation) {
-        cerr << "Error [vg deconstruct]: -O can only be used when input graph is in GBZ format" << endl;
+        logger.error() << "-O can only be used when input graph is in GBZ format" << endl;
     }
 
     if (!gbwt_file_name.empty() || gbz_graph) {
@@ -243,7 +283,9 @@ int main_deconstruct(int argc, char** argv){
     std::chrono::time_point<std::chrono::system_clock> overlay_start_time = std::chrono::system_clock::now(); 
     
     // Make the overlay
-    PathPositionHandleGraph* graph = overlay_helper.apply(path_handle_graph);
+    // When not using GBWT/GBZ, embedded HAPLOTYPE paths are the sample alleles
+    bool embedded_haplotype_paths = gbwt_file_name.empty() && !gbz_graph;
+    PathPositionHandleGraph* graph = overlay_helper.apply(path_handle_graph, embedded_haplotype_paths);
     
     // See how long that took
     clock_t overlay_stop_clock = clock();
@@ -252,19 +294,20 @@ int main_deconstruct(int argc, char** argv){
     std::chrono::duration<double> overlay_seconds = overlay_stop_time - overlay_start_time;
     
     if (show_progress && graph != dynamic_cast<PathPositionHandleGraph*>(path_handle_graph)) {
-        std::cerr << "Computed overlay in " << overlay_seconds.count() << " seconds using " << overlay_cpu_seconds << " CPU seconds." << std::endl;
+        logger.info() << "Computed overlay in " << overlay_seconds.count()
+                      << " seconds using " << overlay_cpu_seconds << " CPU seconds." << std::endl;
     }
 
     // Read the GBWT
     unique_ptr<gbwt::GBWT> gbwt_index_up;
     if (!gbwt_file_name.empty()) {
         if (gbwt_index) {
-            cerr << "Warning [vg deconstruct]: Using GBWT from -g overrides that in input GBZ (you probably don't want to use -g)" << endl;
+            logger.warn() << "Using GBWT from -g overrides that in input GBZ "
+                          << "(you probably don't want to use -g)" << endl;
         }
         gbwt_index_up = vg::io::VPKG::load_one<gbwt::GBWT>(gbwt_file_name);
         if (!gbwt_index_up) {
-            cerr << "Error [vg deconstruct]: Unable to load gbwt index file: " << gbwt_file_name << endl;
-            return 1;
+            logger.error() << "Unable to load GBWT index file: " << gbwt_file_name << endl;
         }
         gbwt_index = gbwt_index_up.get();
     }
@@ -273,28 +316,39 @@ int main_deconstruct(int argc, char** argv){
         // Check our paths
         for (const string& ref_path : refpaths) {
             if (!graph->has_path(ref_path)) {
-                cerr << "error [vg deconstruct]: Reference path \"" << ref_path << "\" not found in graph/gbwt" << endl;
-                return 1;
+                logger.error() << "Reference path \"" << ref_path
+                               << "\" not found in graph/GBWT" << endl;
             }
         }
     }
     
     if (refpaths.empty() && refpath_prefixes.empty()) {
-        bool found_hap;
-        // No paths specified: use them all
-        graph->for_each_path_handle([&](path_handle_t path_handle) {
+        // We will set this if we found any haplotypes or alt paths to use as alternatives to the reference.
+        bool found_hap = false;
+
+        // No paths specified: use all reference and non-alt generic paths as reference to deconstruct against.
+        // Altpaths are included as reference paths (priority given to non-altpaths in deconstructor.cpp)
+        graph->for_each_path_of_sense({PathSense::REFERENCE, PathSense::GENERIC}, [&](path_handle_t path_handle) {
             const string& name = graph->get_path_name(path_handle);
-            if (!Paths::is_alt(name) && PathMetadata::parse_sense(name) != PathSense::HAPLOTYPE) {
+            if (!Paths::is_alt(name)) {
                 refpaths.push_back(name);
             } else {
                 found_hap = true;
             }
         });
 
+        if (!found_hap) {
+            // See if we have any haplotypes.
+            graph->for_each_path_of_sense(PathSense::HAPLOTYPE, [&](path_handle_t path_handle) {
+                found_hap = true;
+                return false;
+            });
+        }
+
         if (!found_hap && gbwt_index == nullptr) {
-            cerr << "error [vg deconstruct]: All graph paths selected as references (leaving no alts). Please use -P/-p "
-                 << "to narrow down the reference to a subset of paths, or GBZ/GBWT input that contains haplotype paths" << endl;
-            return 1;
+            logger.error() << "All graph paths selected as references (leaving no alternative alleles). Please use -P/-p "
+                           << "to narrow down the reference to a subset of paths, "
+                           << "or GBZ/GBWT input that contains haplotype paths" << endl;
         }        
     }
 
@@ -311,53 +365,79 @@ int main_deconstruct(int argc, char** argv){
     }
     if (!translation_file_name.empty()) {
         if (!translation->empty()) {
-            cerr << "Warning [vg deconstruct]: Using translation from -T overrides that in input GBZ (you probably don't want to use -T)" << endl;
+            logger.warn() << "Using translation from -T overrides that in input GBZ "
+                          << "(you probably don't want to use -T)" << endl;
         }
         ifstream translation_file(translation_file_name.c_str());
-        if (!translation_file) {
-            cerr << "Error [vg deconstruct]: Unable to load translation file: " << translation_file_name << endl;
-            return 1;
-        }
         translation = make_unique<unordered_map<nid_t, pair<string, size_t>>>();
         *translation = load_translation_back_map(*graph, translation_file);
     }
-    
+
+    // process the prefixes to find ref paths
+    if (!refpath_prefixes.empty()) {
+        graph->for_each_path_of_sense({PathSense::REFERENCE, PathSense::GENERIC}, [&](const path_handle_t& path_handle) {
+            string path_name = graph->get_path_name(path_handle);
+            for (auto& prefix : refpath_prefixes) {
+                if (path_name.compare(0, prefix.size(), prefix) == 0) {
+                    refpaths.push_back(path_name);
+                    break;
+                }
+            }
+        });
+    }
+
+    // Check that -C (--contig-only-ref) won't produce ambiguous contig names
+    if (contig_only_ref) {
+        unordered_map<string, string> locus_to_refpath;
+        for (const string& refpath : refpaths) {
+            string locus = PathMetadata::parse_locus_name(refpath);
+            if (locus == PathMetadata::NO_LOCUS_NAME) {
+                locus = refpath;
+            }
+            // Strip subrange so that subpaths of the same contig (e.g.
+            // chr6[0-133516] and chr6[135228-245436]) are not treated as
+            // ambiguous — they map to the same contig name by design.
+            subrange_t subrange;
+            string base_refpath = Paths::strip_subrange(refpath, &subrange);
+            auto it = locus_to_refpath.find(locus);
+            if (it != locus_to_refpath.end() && it->second != base_refpath) {
+                logger.error() << "-C (--contig-only-ref) cannot be used because reference paths \""
+                               << it->second << "\" and \"" << refpath
+                               << "\" both map to contig name \"" << locus << "\"" << endl;
+            }
+            locus_to_refpath[locus] = base_refpath;
+        }
+    }
+
     // Load or compute the snarls
-    unique_ptr<SnarlManager> snarl_manager;    
+    unique_ptr<SnarlManager> snarl_manager;
     if (!snarl_file_name.empty()) {
         ifstream snarl_file(snarl_file_name.c_str());
-        if (!snarl_file) {
-            cerr << "Error [vg deconstruct]: Unable to load snarls file: " << snarl_file_name << endl;
-            return 1;
-        }
         if (show_progress) {
-            cerr << "Loading snarls" << endl;
+            logger.info() << "Loading snarls" << endl;
         }
         snarl_manager = vg::io::VPKG::load_one<SnarlManager>(snarl_file);
     } else {
-        IntegratedSnarlFinder finder(*graph);
+        std::unordered_map<nid_t, size_t> extra_node_weight;
+        constexpr size_t EXTRA_WEIGHT = 10000000000;
+        for (const string& refpath_name : refpaths) {
+            // Skip altpaths (they shouldn't influence snarl decomposition)
+            if (GrefCover::is_gref_name(refpath_name)) {
+                continue;
+            }
+            path_handle_t refpath_handle = graph->get_path_handle(refpath_name);
+            extra_node_weight[graph->get_id(graph->get_handle_of_step(graph->path_begin(refpath_handle)))] += EXTRA_WEIGHT;
+            extra_node_weight[graph->get_id(graph->get_handle_of_step(graph->path_back(refpath_handle)))] += EXTRA_WEIGHT;
+        }
+        IntegratedSnarlFinder finder(*graph, extra_node_weight);
         if (show_progress) {
-            cerr << "Finding snarls" << endl;
+            logger.info() << "Finding snarls" << endl;
         }
         snarl_manager = unique_ptr<SnarlManager>(new SnarlManager(std::move(finder.find_snarls_parallel())));
     }
     
-    // process the prefixes to find ref paths
-    if (!refpath_prefixes.empty()) {
-        graph->for_each_path_handle([&](const path_handle_t& path_handle) {
-                string path_name = graph->get_path_name(path_handle);
-                for (auto& prefix : refpath_prefixes) {                    
-                    if (path_name.compare(0, prefix.size(), prefix) == 0) {
-                        refpaths.push_back(path_name);
-                        break;
-                    }
-                }
-            });
-    }
-
     if (refpaths.empty()) {
-        cerr << "Error [vg deconstruct]: No specified reference path or prefix found in graph" << endl;
-        return 1;
+        logger.error() << "No specified reference path or prefix found in graph" << endl;
     }
 
 #ifdef USE_CALLGRIND
@@ -368,10 +448,10 @@ int main_deconstruct(int argc, char** argv){
     // Deconstruct
     Deconstructor dd;
     if (show_progress) {
-        cerr << "Deconstructing top-level snarls" << endl;
+        logger.info() << "Deconstructing top-level snarls" << endl;
     }
     dd.set_translation(translation.get());
-    dd.set_nested(all_snarls || nested);
+    dd.set_nested(all_snarls);
     dd.deconstruct(refpaths, graph, snarl_manager.get(),
                    all_snarls,
                    context_jaccard_window,
@@ -380,9 +460,10 @@ int main_deconstruct(int argc, char** argv){
                    strict_conflicts,
                    !contig_only_ref,
                    cluster_threshold,
+                   cluster_min_allele_len,
                    gbwt_index,
-                   nested,
                    star_allele);
+
     return 0;
 }
 

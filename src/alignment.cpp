@@ -1,4 +1,5 @@
 #include "alignment.hpp"
+#include "longest_overlap.hpp"
 #include "vg/io/gafkluge.hpp"
 #include "annotation.hpp"
 #include <vg/io/stream.hpp>
@@ -10,7 +11,8 @@ using namespace vg::io;
 
 namespace vg {
 
-int hts_for_each(string& filename, function<void(Alignment&)> lambda, const PathPositionHandleGraph* graph) {
+int hts_for_each(string& filename, function<void(Alignment&)> lambda,
+                 const PathPositionHandleGraph* graph, bool allow_missing_contig) {
 
     samFile *in = hts_open(filename.c_str(), "r");
     if (in == NULL) return 0;
@@ -21,7 +23,16 @@ int hts_for_each(string& filename, function<void(Alignment&)> lambda, const Path
     parse_tid_path_handle_map(hdr, graph, tid_path_handle);
     bam1_t *b = bam_init1();
     while (sam_read1(in, hdr, b) >= 0) {
-        Alignment a = bam_to_alignment(b, rg_sample, tid_path_handle, hdr, graph);
+        Alignment a;
+        try {
+            a = bam_to_alignment(b, rg_sample, tid_path_handle, hdr, graph, allow_missing_contig);
+        } catch (AlignmentEmbeddingError& e) {
+            #pragma omp critical (cerr)
+            std::cerr << "[vg::alignment.cpp] error: Input file " << filename 
+                << " contains an uninterpretable read and may not actually be in the correct coordinate space for the graph. "
+                << e.what() << std::endl;
+            exit(1);
+        }
         lambda(a);
     }
     bam_destroy1(b);
@@ -36,7 +47,7 @@ int hts_for_each(string& filename, function<void(Alignment&)> lambda) {
 }
 
 int hts_for_each_parallel(string& filename, function<void(Alignment&)> lambda,
-                          const PathPositionHandleGraph* graph) {
+                          const PathPositionHandleGraph* graph , bool allow_missing_contig) {
 
     samFile *in = hts_open(filename.c_str(), "r");
     if (in == NULL) return 0;
@@ -69,7 +80,16 @@ int hts_for_each_parallel(string& filename, function<void(Alignment&)> lambda,
             }
             // Now we're outside the critical section so we can only rely on our own variables.
             if (got_read) {
-                Alignment a = bam_to_alignment(b, rg_sample, tid_path_handle, hdr, graph);
+                Alignment a;
+                try {
+                    a = bam_to_alignment(b, rg_sample, tid_path_handle, hdr, graph, allow_missing_contig);
+                } catch (AlignmentEmbeddingError& e) {
+                    #pragma omp critical (cerr)
+                    std::cerr << "[vg::alignment.cpp] error: Input file " << filename 
+                        << " contains an uninterpretable read and may not actually be in the correct coordinate space for the graph. "
+                        << e.what() << std::endl;
+                    exit(1);
+                }
                 lambda(a);
             }
         }
@@ -100,24 +120,30 @@ bam_hdr_t* hts_file_header(string& filename, string& header) {
 }
 
 bam_hdr_t* hts_string_header(string& header,
-                             const map<string, int64_t>& path_length,
-                             const map<string, string>& rg_sample) {
-    
-    // Copy the map into a vecotr in its own order
-    vector<pair<string, int64_t>> path_order_and_length(path_length.begin(), path_length.end());
-    
-    // Make header in that order.
-    return hts_string_header(header, path_order_and_length, rg_sample);
-}
-
-bam_hdr_t* hts_string_header(string& header,
-                             const vector<pair<string, int64_t>>& path_order_and_length,
+                             const SequenceDictionary& sequence_dictionary,
                              const map<string, string>& rg_sample) {
     stringstream hdr;
     hdr << "@HD\tVN:1.5\tSO:unknown\n";
-    for (auto& p : path_order_and_length) {
-        hdr << "@SQ\tSN:" << p.first << "\t" << "LN:" << p.second << "\n";
-    }
+    // Make an @sq line for each distinct base path name
+    std::unordered_set<std::string> seen_base_paths;
+    for (auto& entry : sequence_dictionary) {
+        auto found = seen_base_paths.find(entry.base_path_name);
+        if (found == seen_base_paths.end()) {
+            // This is new
+            
+            // Write a line for it
+            hdr << "@SQ\tSN:" << entry.base_path_name << "\tLN:" <<entry.base_path_length;
+            if (!entry.base_md5_sum.empty()) {
+                // Include the hash if we have one
+                hdr << "\tM5:" << entry.base_md5_sum;
+            }
+            hdr << "\n";
+
+            // Mark it seen
+            seen_base_paths.emplace_hint(found, entry.base_path_name);
+        }
+    }   
+    
     for (auto& s : rg_sample) {
         hdr << "@RG\tID:" << s.first << "\t" << "SM:" << s.second << "\n";
     }
@@ -130,25 +156,29 @@ bam_hdr_t* hts_string_header(string& header,
     return h;
 }
 
-bool get_next_alignment_from_fastq(gzFile fp, char* buffer, size_t len, Alignment& alignment) {
+bool get_next_alignment_from_fastq(gzFile fp, char* buffer, size_t len, Alignment& alignment, bool comment_as_tags) {
 
     alignment.Clear();
     bool is_fasta = false;
     // handle name
-    string name;
+    string name_line;
     if (gzgets(fp,buffer,len) != 0) {
         buffer[strlen(buffer)-1] = '\0';
-        name = buffer;
-        if (name[0] == '@') {
+        name_line = buffer;
+        if (name_line[0] == '@') {
             is_fasta = false;
-        } else if (name[0] == '>') {
+        } else if (name_line[0] == '>') {
             is_fasta = true;
         } else {
-            throw runtime_error("Found unexpected delimiter " + name.substr(0,1) + " in fastq/fasta input");
+            throw runtime_error("Found unexpected delimiter " + name_line.substr(0,1) + " in fastq/fasta input");
         }
-        name = name.substr(1, name.find(' ') - 1); // trim off leading @ and things after the first whitespace
-        // keep trailing /1 /2
-        alignment.set_name(name);
+        // trim off leading @ and things after the first whitespace, keep trailing /1 /2
+        auto div = name_line.find_first_of(whitespace);
+        alignment.set_name(name_line.substr(1, div - 1));
+        if (comment_as_tags && div < name_line.size()) {
+            // interpret comments as SAM-style tags
+            set_annotation(alignment, "tags", name_line.substr(div + 1, string::npos));
+        }
     }
     else {
         // no more to get
@@ -161,7 +191,7 @@ bool get_next_alignment_from_fastq(gzFile fp, char* buffer, size_t len, Alignmen
         if (gzgets(fp,buffer,len) == 0) {
             if (sequence.empty()) {
                 // there was no sequence
-                throw runtime_error("[vg::alignment.cpp] incomplete fastq/fasta record " + name);
+                throw runtime_error("[vg::alignment.cpp] incomplete fastq/fasta record " + alignment.name());
             }
             else {
                 // we hit the end of the file
@@ -202,7 +232,7 @@ bool get_next_alignment_from_fastq(gzFile fp, char* buffer, size_t len, Alignmen
     if (!is_fasta) {
         if (0!=gzgets(fp,buffer,len)) {
         } else {
-            cerr << "[vg::alignment.cpp] error: incomplete fastq record " << name << endl; exit(1);
+            cerr << "[vg::alignment.cpp] error: incomplete fastq record " << alignment.name() << endl; exit(1);
         }
         // handle quality
         if (0!=gzgets(fp,buffer,len)) {
@@ -211,7 +241,7 @@ bool get_next_alignment_from_fastq(gzFile fp, char* buffer, size_t len, Alignmen
             //cerr << string_quality_short_to_char(quality) << endl;
             alignment.set_quality(quality);
         } else {
-            cerr << "[vg::alignment.cpp] error: fastq record missing base quality " << name << endl; exit(1);
+            cerr << "[vg::alignment.cpp] error: fastq record missing base quality " <<  alignment.name() << endl; exit(1);
         }
     }
 
@@ -219,15 +249,15 @@ bool get_next_alignment_from_fastq(gzFile fp, char* buffer, size_t len, Alignmen
 
 }
 
-bool get_next_interleaved_alignment_pair_from_fastq(gzFile fp, char* buffer, size_t len, Alignment& mate1, Alignment& mate2) {
-    return get_next_alignment_from_fastq(fp, buffer, len, mate1) && get_next_alignment_from_fastq(fp, buffer, len, mate2);
+bool get_next_interleaved_alignment_pair_from_fastq(gzFile fp, char* buffer, size_t len, Alignment& mate1, Alignment& mate2, bool comment_as_tags) {
+    return get_next_alignment_from_fastq(fp, buffer, len, mate1, comment_as_tags) && get_next_alignment_from_fastq(fp, buffer, len, mate2, comment_as_tags);
 }
 
-bool get_next_alignment_pair_from_fastqs(gzFile fp1, gzFile fp2, char* buffer, size_t len, Alignment& mate1, Alignment& mate2) {
-    return get_next_alignment_from_fastq(fp1, buffer, len, mate1) && get_next_alignment_from_fastq(fp2, buffer, len, mate2);
+bool get_next_alignment_pair_from_fastqs(gzFile fp1, gzFile fp2, char* buffer, size_t len, Alignment& mate1, Alignment& mate2, bool comment_as_tags) {
+    return get_next_alignment_from_fastq(fp1, buffer, len, mate1, comment_as_tags) && get_next_alignment_from_fastq(fp2, buffer, len, mate2, comment_as_tags);
 }
 
-size_t fastq_unpaired_for_each_parallel(const string& filename, function<void(Alignment&)> lambda, uint64_t batch_size) {
+size_t fastq_unpaired_for_each_parallel(const string& filename, function<void(Alignment&)> lambda, bool comment_as_tags, uint64_t batch_size) {
     
     gzFile fp = (filename != "-") ? gzopen(filename.c_str(), "r") : gzdopen(fileno(stdin), "r");
     if (!fp) {
@@ -238,7 +268,7 @@ size_t fastq_unpaired_for_each_parallel(const string& filename, function<void(Al
     char* buf = new char[len];
     
     function<bool(Alignment&)> get_read = [&](Alignment& aln) {
-        return get_next_alignment_from_fastq(fp, buf, len, aln);;
+        return get_next_alignment_from_fastq(fp, buf, len, aln, comment_as_tags);
     };
     
     
@@ -250,17 +280,18 @@ size_t fastq_unpaired_for_each_parallel(const string& filename, function<void(Al
     
 }
 
-size_t fastq_paired_interleaved_for_each_parallel(const string& filename, function<void(Alignment&, Alignment&)> lambda, uint64_t batch_size) {
-    return fastq_paired_interleaved_for_each_parallel_after_wait(filename, lambda, [](void) {return true;}, batch_size);
+size_t fastq_paired_interleaved_for_each_parallel(const string& filename, function<void(Alignment&, Alignment&)> lambda, bool comment_as_tags, uint64_t batch_size) {
+    return fastq_paired_interleaved_for_each_parallel_after_wait(filename, lambda, [](void) {return true;}, comment_as_tags, batch_size);
 }
     
-size_t fastq_paired_two_files_for_each_parallel(const string& file1, const string& file2, function<void(Alignment&, Alignment&)> lambda, uint64_t batch_size) {
-    return fastq_paired_two_files_for_each_parallel_after_wait(file1, file2, lambda, [](void) {return true;}, batch_size);
+size_t fastq_paired_two_files_for_each_parallel(const string& file1, const string& file2, function<void(Alignment&, Alignment&)> lambda, bool comment_as_tags, uint64_t batch_size) {
+    return fastq_paired_two_files_for_each_parallel_after_wait(file1, file2, lambda, [](void) {return true;}, comment_as_tags, batch_size);
 }
     
 size_t fastq_paired_interleaved_for_each_parallel_after_wait(const string& filename,
                                                              function<void(Alignment&, Alignment&)> lambda,
                                                              function<bool(void)> single_threaded_until_true,
+                                                             bool comment_as_tags,
                                                              uint64_t batch_size) {
     
     gzFile fp = (filename != "-") ? gzopen(filename.c_str(), "r") : gzdopen(fileno(stdin), "r");
@@ -272,7 +303,7 @@ size_t fastq_paired_interleaved_for_each_parallel_after_wait(const string& filen
     char* buf = new char[len];
     
     function<bool(Alignment&, Alignment&)> get_pair = [&](Alignment& mate1, Alignment& mate2) {
-        return get_next_interleaved_alignment_pair_from_fastq(fp, buf, len, mate1, mate2);
+        return get_next_interleaved_alignment_pair_from_fastq(fp, buf, len, mate1, mate2, comment_as_tags);
     };
     
     size_t nLines = paired_for_each_parallel_after_wait(get_pair, lambda, single_threaded_until_true, batch_size);
@@ -285,6 +316,7 @@ size_t fastq_paired_interleaved_for_each_parallel_after_wait(const string& filen
 size_t fastq_paired_two_files_for_each_parallel_after_wait(const string& file1, const string& file2,
                                                            function<void(Alignment&, Alignment&)> lambda,
                                                            function<bool(void)> single_threaded_until_true,
+                                                           bool comment_as_tags,
                                                            uint64_t batch_size) {
     
     gzFile fp1 = (file1 != "-") ? gzopen(file1.c_str(), "r") : gzdopen(fileno(stdin), "r");
@@ -300,7 +332,7 @@ size_t fastq_paired_two_files_for_each_parallel_after_wait(const string& file1, 
     char* buf = new char[len];
     
     function<bool(Alignment&, Alignment&)> get_pair = [&](Alignment& mate1, Alignment& mate2) {
-        return get_next_alignment_pair_from_fastqs(fp1, fp2, buf, len, mate1, mate2);
+        return get_next_alignment_pair_from_fastqs(fp1, fp2, buf, len, mate1, mate2, comment_as_tags);
     };
     
     size_t nLines = paired_for_each_parallel_after_wait(get_pair, lambda, single_threaded_until_true, batch_size);
@@ -311,7 +343,7 @@ size_t fastq_paired_two_files_for_each_parallel_after_wait(const string& file1, 
     return nLines;
 }
 
-size_t fastq_unpaired_for_each(const string& filename, function<void(Alignment&)> lambda) {
+size_t fastq_unpaired_for_each(const string& filename, function<void(Alignment&)> lambda, bool comment_as_tags) {
     gzFile fp = (filename != "-") ? gzopen(filename.c_str(), "r") : gzdopen(fileno(stdin), "r");
     if (!fp) {
         cerr << "[vg::alignment.cpp] couldn't open " << filename << endl; exit(1);
@@ -320,7 +352,7 @@ size_t fastq_unpaired_for_each(const string& filename, function<void(Alignment&)
     size_t nLines = 0;
     char *buffer = new char[len];
     Alignment alignment;
-    while(get_next_alignment_from_fastq(fp, buffer, len, alignment)) {
+    while(get_next_alignment_from_fastq(fp, buffer, len, alignment, comment_as_tags)) {
         lambda(alignment);
         nLines++;
     }
@@ -329,7 +361,7 @@ size_t fastq_unpaired_for_each(const string& filename, function<void(Alignment&)
     return nLines;
 }
 
-size_t fastq_paired_interleaved_for_each(const string& filename, function<void(Alignment&, Alignment&)> lambda) {
+size_t fastq_paired_interleaved_for_each(const string& filename, function<void(Alignment&, Alignment&)> lambda, bool comment_as_tags) {
     gzFile fp = (filename != "-") ? gzopen(filename.c_str(), "r") : gzdopen(fileno(stdin), "r");
     if (!fp) {
         cerr << "[vg::alignment.cpp] couldn't open " << filename << endl; exit(1);
@@ -338,7 +370,7 @@ size_t fastq_paired_interleaved_for_each(const string& filename, function<void(A
     size_t nLines = 0;
     char *buffer = new char[len];
     Alignment mate1, mate2;
-    while(get_next_interleaved_alignment_pair_from_fastq(fp, buffer, len, mate1, mate2)) {
+    while(get_next_interleaved_alignment_pair_from_fastq(fp, buffer, len, mate1, mate2, comment_as_tags)) {
         lambda(mate1, mate2);
         nLines++;
     }
@@ -348,7 +380,7 @@ size_t fastq_paired_interleaved_for_each(const string& filename, function<void(A
 }
 
 
-size_t fastq_paired_two_files_for_each(const string& file1, const string& file2, function<void(Alignment&, Alignment&)> lambda) {
+size_t fastq_paired_two_files_for_each(const string& file1, const string& file2, function<void(Alignment&, Alignment&)> lambda, bool comment_as_tags) {
     gzFile fp1 = (file1 != "-") ? gzopen(file1.c_str(), "r") : gzdopen(fileno(stdin), "r");
     if (!fp1) {
         cerr << "[vg::alignment.cpp] couldn't open " << file1 << endl; exit(1);
@@ -361,7 +393,7 @@ size_t fastq_paired_two_files_for_each(const string& file1, const string& file2,
     size_t nLines = 0;
     char *buffer = new char[len];
     Alignment mate1, mate2;
-    while(get_next_alignment_pair_from_fastqs(fp1, fp2, buffer, len, mate1, mate2)) {
+    while(get_next_alignment_pair_from_fastqs(fp1, fp2, buffer, len, mate1, mate2, comment_as_tags)) {
         lambda(mate1, mate2);
         nLines++;
     }
@@ -370,6 +402,113 @@ size_t fastq_paired_two_files_for_each(const string& file1, const string& file2,
     delete[] buffer;
     return nLines;
 
+}
+
+void for_each_gaf_record_in_ranges(htsFile* gaf_fp, tbx_t* gaf_tbx, const vector<pair<vg::id_t, vg::id_t>>& ranges, const std::function<void(const std::string&)>& iteratee) {
+    // If we just query each range, we get duplicate reads when a read overlaps
+    // multiple ranges. We want to use an htslib multi-region iterator instead.
+    //
+    // According to
+    // <https://github.com/samtools/htslib/issues/785#issuecomment-433869384>,
+    // "If the target regions overlap, hts_itr_t visits the overlapping section
+    // twice, while hts_itr_multi_t removes this overlap.". And according to
+    // <https://github.com/samtools/htslib/issues/785#issuecomment-464135842>,
+    // "a read will only be output once even if it covers more than one
+    // region".
+    //
+    // But, htslib multi-region iterators don't support tabix files yet. See
+    // <https://github.com/samtools/htslib/issues/1913>. So we have to fake it
+    // with single-region iterators until that's fixed.
+    
+    // To hack around the duplicate entries from the query, we keep all the GAF
+    // records around as strings in memory.
+    std::unordered_set<std::string> seen_records;
+
+    // TODO: If this becomes a memory usage problem before htslib implements
+    // the multi-iterator, switch to keeping the records organized by their
+    // ending node ID in an ordered map of sets. Then we could throw out all
+    // earlier sets when we start a range that begins after their end point,
+    // and we can still check membership with a lookup on endpoint and then a
+    // lookup in the set. 
+
+    for (auto range : ranges) {
+        std::stringstream query_stream;
+        query_stream << "{node}:" << range.first << "-" << range.second;
+        std::string query_string(std::move(query_stream.str()));
+        hts_itr_t *itr = tbx_itr_querys(gaf_tbx, query_string.c_str());
+        if (!itr) {
+            // Can't visit this range. Nothing there?
+            // TODO: Is there an error to be handled here?
+            continue;
+        }
+        // We need a kstring_t to hold each result line from the tabix iterator.
+        kstring_t str;
+        ks_initialize(&str);
+        try {
+            while (tbx_itr_next(gaf_fp, gaf_tbx, itr, &str) >= 0) {
+                // The iterator will allocate/expand/overwrite the kstring_t
+                // storage, but we need to free it later.
+    
+                // Store the record as a C++ string.
+                std::string record_string(ks_str(&str));
+
+                // Parse the GAF record we got from the index
+                gafkluge::GafRecord record;
+                gafkluge::parse_gaf_record(record_string, record);
+
+                // We also have to account for how, even if a GAF record
+                // overlaps a tabix ID range, that just means it has a node ID
+                // before the range start and a node ID after the range end. It
+                // doesn't guarantee that those are ever the *same* ID; the GAF
+                // record might completely skip all the IDs in the range.
+                if (!gaf_record_intersects_range(record, range)) {
+                    // We don't actually intersect the range, so skip this record.
+                    continue;
+                }
+
+                auto found = seen_records.find(record_string);
+                if (found == seen_records.end()) {
+                    // This is a novel record.
+                    //
+                    // TODO: Handle GAF files that repeat the same record
+                    // multiple times, where we actually want to keep the
+                    // repeats.
+
+                    // Handle the record
+                    iteratee(record_string);
+
+                    // Mark it as handled and move it into the set.
+                    seen_records.emplace_hint(found, std::move(record_string));
+                }
+            }
+
+            // Make sure the iterator and kstring_t are cleaned up.
+            tbx_itr_destroy(itr);
+            // This is safe to do even if the kstring_t's buffer is not
+            // allocated.
+            ks_free(&str);
+        } catch(...) {
+            tbx_itr_destroy(itr);
+            ks_free(&str);
+            throw;
+        }
+    }
+}
+
+bool gaf_record_intersects_range(const gafkluge::GafRecord& record, const std::pair<nid_t, nid_t>& range) {
+    for (const gafkluge::GafStep& step : record.path) {
+        if (step.is_stable) {
+            // We can't parse the name field as a node ID, it's a path name.
+            throw std::runtime_error("Cannot parse GAF record with stable step on: " + step.name);
+        }
+        nid_t node_id = std::stol(step.name);
+        if (node_id >= range.first && node_id < range.second) {
+            // Found an intersection
+            return true;
+        }
+    }
+    // No intersection was ever found
+    return false;
 }
 
 void parse_rg_sample_map(char* hts_header, map<string, string>& rg_sample) {
@@ -476,6 +615,8 @@ string alignment_to_sam_internal(const Alignment& alignment,
                                  const int32_t tlen,
                                  bool paired,
                                  const int32_t tlen_max) {
+    
+    
 
     // Determine flags, using orientation, next/prev fragments, and pairing status.
     int32_t flags = determine_flag(alignment, refseq, refpos, refrev, mateseq, matepos, materev, tlen, paired, tlen_max);
@@ -532,7 +673,23 @@ string alignment_to_sam_internal(const Alignment& alignment,
         sam << "*";
     }
     //<< (alignment.has_quality() ? string_quality_short_to_char(alignment.quality()) : string(alignment.sequence().size(), 'I'));
+    sam << "\tAS:i:" << alignment.score();
     if (!alignment.read_group().empty()) sam << "\tRG:Z:" << alignment.read_group();
+    if (has_annotation(alignment, "tags")) {
+        sam << '\t' << get_annotation<string>(alignment, "tags");
+    }
+
+    // emit annotations that come from surject
+    if (has_annotation(alignment, "all_scores")) {
+        sam << "\tSS:Z:" << get_annotation<string>(alignment, "all_scores");
+    }
+    if (has_annotation(alignment, "graph_cigar")) {
+        sam << "\tGR:Z:" << get_annotation<string>(alignment, "graph_cigar");
+    }
+    if (has_annotation(alignment, "nearest_ref_pos")) {
+        sam << "\tNR:Z:" << get_annotation<string>(alignment, "nearest_ref_pos");
+    }
+
     sam << "\n";
     return sam.str();
 }
@@ -551,8 +708,12 @@ int32_t determine_flag(const Alignment& alignment,
     // Determine flags, using orientation, next/prev fragments, and pairing status.
     int32_t flags = sam_flag(alignment, refrev, paired);
     
-    // We've observed some reads with the unmapped flag set and also a CIGAR string set, which shouldn't happen.
-    // We will check for this. The CIGAR string will only be set in the output if the alignment has a path.
+    // We've observed some reads with the unmapped flag set and also a CIGAR
+    // string set, which is allowed by the SAM spec but which we are not
+    // supposed to generate.
+    //
+    // We will check for this. The CIGAR string will only be set in the output
+    // if the alignment has a path.
     assert((bool)(flags & BAM_FUNMAP) != (alignment.has_path() && alignment.path().mapping_size()));
     
     if (!((bool)(flags & BAM_FUNMAP)) && paired && !refseq.empty() && refseq == mateseq) {
@@ -585,6 +746,10 @@ int32_t determine_flag(const Alignment& alignment,
         flags |= BAM_FMREVERSE;
     }
     
+    if (is_supplementary(alignment)) {
+        flags |= BAM_FSUPPLEMENTARY;
+    }
+    
     return flags;
 }
 
@@ -613,6 +778,50 @@ string alignment_to_sam(const Alignment& alignment,
 
 }
 
+vector<tuple<string, char, string>> parse_sam_tags(const string& tags) {
+    
+    vector<tuple<string, char, string>> parsed;
+    for (const auto& tag : split_delims(tags, whitespace)) {
+        if (tag.empty()) {
+            continue;
+        }
+        if (tag.size() < 5 || tag[2] != ':' || tag[4] != ':') {
+            std::cerr << ("error: failed to parse malformed SAM tag '" + tag + "'\n");
+            exit(1);
+        }
+        parsed.emplace_back(tag.substr(0, 2), tag[3], tag.substr(5, string::npos));
+    }
+    return parsed;
+}
+
+// template to reduce redunant code parsing and writing B type SAM tags
+template<typename T>
+void write_array_to_aux(bam1_t* bam, const char* tag_name, const string& arr_string) {
+    
+    vector<T> parsed;
+    for (const auto& token : split_delims(arr_string.substr(1, string::npos), ",")) {
+        if (token.empty()) {
+            // there is a leading ','
+            continue;
+        }
+        parsed.push_back(parse<T>(token));
+    }
+    // size includes array type and length
+    size_t data_size = parsed.size() * sizeof(T) + 5;
+    uint8_t* data = (uint8_t*) malloc(data_size);
+    // add the type
+    data[0] = arr_string[0];
+    // add the length
+    *((uint32_t*) (data + 1)) = (uint32_t) parsed.size();
+    // add the array
+    for (size_t i = 0, j = 5; i < parsed.size(); ++i, j += sizeof(T)) {
+        *((T*) (data + j)) = parsed[i];
+    }
+    bam_aux_append(bam, tag_name, 'B', data_size, data);
+    free(data);
+}
+
+
 // Internal conversion function for both paired and unpaired codepaths
 bam1_t* alignment_to_bam_internal(bam_hdr_t* header,
                                   const Alignment& alignment,
@@ -621,7 +830,7 @@ bam1_t* alignment_to_bam_internal(bam_hdr_t* header,
                                   const bool refrev,
                                   const vector<pair<int, char>>& cigar,
                                   const string& mateseq,
-                                  const int32_t matepos,
+                                  int32_t matepos,
                                   bool materev,
                                   const int32_t tlen,
                                   bool paired,
@@ -823,6 +1032,135 @@ bam1_t* alignment_to_bam_internal(bam_hdr_t* header,
         bam_aux_append(bam, "SS", 'Z', all_scores.size() + 1, (uint8_t*) all_scores.c_str());
     }
     
+    if (has_annotation(alignment, "graph_cigar")) {
+        string graph_cigar = get_annotation<string>(alignment, "graph_cigar");
+        bam_aux_append(bam, "GR", 'Z', graph_cigar.size() + 1, (uint8_t*) graph_cigar.c_str());
+    }
+    
+    if (has_annotation(alignment, "nearest_ref_pos")) {
+        string pos = get_annotation<string>(alignment, "nearest_ref_pos");
+        bam_aux_append(bam, "NR", 'Z', pos.size() + 1, (uint8_t*) pos.c_str());
+    }
+    
+    // TODO: it would be nice wrap htslib and set the other tags this way as well
+    if (has_annotation(alignment, "tags")) {
+        // encode the alignments SAM tags
+        auto parsed_tags = parse_sam_tags(get_annotation<string>(alignment, "tags"));
+        for (const auto& tag : parsed_tags) {
+            
+            if (get<0>(tag) == "AS" || get<0>(tag) == "RG" || get<0>(tag) == "SS" || get<0>(tag) == "GR" || get<0>(tag) == "NR") {
+                // we handle these tags separately
+                continue;
+            }
+
+            // This is already guaranteed to be exactly 2 characters by parse_sam_tags()
+            const char* tag_id = get<0>(tag).c_str();
+            char tag_type = get<1>(tag);
+            // The value may be empty (in cases like a string tag with an empty string value)
+            const string& tag_val = get<2>(tag);
+            
+            switch (tag_type) {
+                case 'A':
+                    // character
+                    if (tag_val.size() != 1) {
+                        cerr << ("error: SAM tag of type 'A' is not a single character: " + tag_val + "\n");
+                        exit(1);
+                    }
+                    bam_aux_append(bam, tag_id, tag_type, sizeof(char), (uint8_t*) &tag_val[0]);
+                    break;
+                case 'c':
+                {
+                    int8_t val = parse<int8_t>(tag_val);
+                    bam_aux_append(bam, tag_id, tag_type, sizeof(int8_t), (uint8_t*) &val);
+                    break;
+                }
+                case 'C':
+                {
+                    uint8_t val = parse<uint8_t>(tag_val);
+                    bam_aux_append(bam, tag_id, tag_type, sizeof(uint8_t), (uint8_t*) &val);
+                    break;
+                }
+                case 's':
+                {
+                    int16_t val = parse<int16_t>(tag_val);
+                    bam_aux_append(bam, tag_id, tag_type, sizeof(int16_t), (uint8_t*) &val);
+                    break;
+                }
+                case 'S':
+                {
+                    uint16_t val = parse<uint16_t>(tag_val);
+                    bam_aux_append(bam, tag_id, tag_type, sizeof(uint16_t), (uint8_t*) &val);
+                    break;
+                }
+                case 'i':
+                {
+                    int32_t val = parse<int32_t>(tag_val);
+                    bam_aux_append(bam, tag_id, tag_type, sizeof(int32_t), (uint8_t*) &val);
+                    break;
+                }
+                case 'I':
+                {
+                    uint32_t val = parse<uint32_t>(tag_val);
+                    bam_aux_append(bam, tag_id, tag_type, sizeof(uint32_t), (uint8_t*) &val);
+                    break;
+                }
+                case 'f':
+                {
+                    float val = parse<float>(tag_val);
+                    bam_aux_append(bam, tag_id, tag_type, sizeof(float), (uint8_t*) &val);
+                    break;
+                }
+                case 'Z':
+                    // string
+                case 'H':
+                    // hex strings are copied as raw strings
+                    bam_aux_append(bam, tag_id, tag_type, tag_val.size() + 1, (uint8_t*) tag_val.c_str());
+                    break;
+                case 'B':
+                {
+                    // the array of values has its own sub-type for entries
+                    if (tag_val.empty()) {
+                        std::cerr << "error: SAM array tag " << get<0>(tag) << " is missing an item type" << std::endl;
+                        exit(1);
+                    }
+                    char subtype = tag_val.front();
+                    switch (subtype) {
+                        case 'c':
+                            write_array_to_aux<int8_t>(bam, tag_id, tag_val);
+                            break;
+                        case 'C':
+                            write_array_to_aux<uint8_t>(bam, tag_id, tag_val);
+                            break;
+                        case 's':
+                            write_array_to_aux<int16_t>(bam, tag_id, tag_val);
+                            break;
+                        case 'S':
+                            write_array_to_aux<uint16_t>(bam, tag_id, tag_val);
+                            break;
+                        case 'i':
+                            write_array_to_aux<int32_t>(bam, tag_id, tag_val);
+                            break;
+                        case 'I':
+                            write_array_to_aux<uint32_t>(bam, tag_id, tag_val);
+                            break;
+                        case 'f':
+                            write_array_to_aux<float>(bam, tag_id, tag_val);
+                            break;
+                        default:
+                            cerr << ("error: unrecognized array type '" + string(1, subtype) + "' in 'B' type SAM tag\n");
+                            exit(1);
+                            break;
+                    }
+                    break;
+                }
+                default:
+                    cerr << ("error: unrecognized SAM tag type '" + string(1, tag_type) + "'\n");
+                    exit(1);
+                    break;
+            }
+        }
+    }
+    
     // TODO: this does not seem to be a standardized field (https://samtools.github.io/hts-specs/SAMtags.pdf)
 //    if (!alignment.sample_name()) {
 //
@@ -912,9 +1250,9 @@ string mapping_string(const string& source, const Mapping& mapping) {
     return result;
 }
 
-void mapping_cigar(const Mapping& mapping, vector<pair<int, char>>& cigar) {
+void mapping_cigar(const Mapping& mapping, vector<pair<int, char>>& cigar, char mismatch_operation) {
     for (const auto& edit : mapping.edit()) {
-        if (edit.from_length() && edit.from_length() == edit.to_length()) {
+        if (edit.sequence().empty() && edit.from_length() && edit.from_length() == edit.to_length()) {
 // *matches* from_length == to_length, or from_length > 0 and offset unset
             // match state
             append_cigar_operation(edit.from_length(), 'M', cigar);
@@ -923,8 +1261,8 @@ void mapping_cigar(const Mapping& mapping, vector<pair<int, char>>& cigar) {
             // mismatch/sub state
 // *snps* from_length == to_length; sequence = alt
             if (edit.from_length() == edit.to_length()) {
-                append_cigar_operation(edit.from_length(), 'M', cigar);
-                //cerr << "match " << edit.from_length() << endl;
+                append_cigar_operation(edit.from_length(), mismatch_operation, cigar);
+                //cerr << "mismatch " << edit.from_length() << endl;
             } else if (edit.from_length() > edit.to_length()) {
 // *deletions* from_length > to_length; sequence may be unset or empty
                 int32_t del = edit.from_length() - edit.to_length();
@@ -984,8 +1322,11 @@ void mapping_against_path(Alignment& alignment, const bam1_t *b, const path_hand
     Mapping mapping;
 
     int64_t length = cigar_mapping(b, &mapping);
-
-    Alignment aln = target_alignment(graph, path, b->core.pos, b->core.pos + length, "", on_reverse_strand, mapping);
+    
+    // The BAM core.pos has already been converted from SAM-file 1-based
+    // coordinates to 0-based coordinates by HTSlib. So we can use it as
+    // 0-based here.
+    Alignment aln = target_alignment(graph, path, b->core.pos, b->core.pos + length, alignment.name(), on_reverse_strand, mapping);
 
     *alignment.mutable_path() = aln.path();
 
@@ -1043,9 +1384,134 @@ vector<pair<int, char>> cigar_against_path(const Alignment& alignment, bool on_r
             cigar.front().second = 'S';
         }
     }
-    
+
     simplify_cigar(cigar);
 
+    return cigar;
+}
+
+vector<pair<int, char>> spliced_cigar_against_path(const Alignment& aln, const PathPositionHandleGraph& graph, const string& path_name, 
+                                                   int64_t pos, bool rev, int64_t min_splice_length) {
+    // the return value
+    vector<pair<int, char>> cigar;
+    
+    if (aln.has_path() && aln.path().mapping_size() > 0) {
+        // the read is aligned to the path
+        
+        path_handle_t path_handle = graph.get_path_handle(path_name);
+        step_handle_t step = graph.get_step_at_position(path_handle, pos);
+        
+        // to indicate whether we've found the edit that corresponds to the BAM position
+        bool found_pos = false;
+        
+        const Path& path = aln.path();
+        for (size_t i = 0; i < path.mapping_size(); ++i) {
+            
+            // we traverse backwards on a reverse strand mapping
+            const Mapping& mapping = path.mapping(rev ? path.mapping_size() - 1 - i : i);
+            
+            for (size_t j = 0; j < mapping.edit_size(); ++j) {
+                                
+                // we traverse backwards on a reverse strand mapping
+                const Edit& edit = mapping.edit(rev ? mapping.edit_size() - 1 - j : j);
+                
+                if (!found_pos) {
+                    // we may still be searching through an initial softclip to find
+                    // the edit that corresponds to the BAM position
+                    if (edit.to_length() > 0 && edit.from_length() == 0) {
+                        append_cigar_operation(edit.to_length(), 'S', cigar);
+                        // skip the main block where we assign cigar operations
+                        continue;
+                    }
+                    else {
+                        found_pos = true;
+                    }
+                }
+                
+                // identify the cigar operation
+                char cigar_code;
+                int length;
+                if (edit.from_length() == edit.to_length()) {
+                    cigar_code = 'M';
+                    length = edit.from_length();
+                }
+                else if (edit.from_length() > 0 && edit.to_length() == 0) {
+                    cigar_code = 'D';
+                    length = edit.from_length();
+                }
+                else if (edit.to_length() > 0 && edit.from_length() == 0) {
+                    cigar_code = 'I';
+                    length = edit.to_length();
+                }
+                else {
+                    throw std::runtime_error("Spliced CIGAR construction can only convert simple edits");
+                }
+                
+                append_cigar_operation(length, cigar_code, cigar);
+            } // close loop over edits
+            
+            if (found_pos && i + 1 < path.mapping_size()) {
+                // we're anchored on the path by the annotated position, and we're transitioning between
+                // two mappings, so we should check for a deletion/splice edge
+                
+                step_handle_t next_step = graph.get_next_step(step);
+                
+                handle_t next_handle = graph.get_handle_of_step(next_step);
+                const Position& next_pos = path.mapping(rev ? path.mapping_size() - 2 - i : i + 1).position();
+                if (graph.get_id(next_handle) != next_pos.node_id()
+                    || (graph.get_is_reverse(next_handle) != next_pos.is_reverse()) != rev) {
+                    
+                    // the next mapping in the alignment is not the next mapping on the path, so we must have
+                    // taken a deletion
+                    
+                    // find the closest step that is further along the path than the current one
+                    // and matches the next position (usually there will only be one)
+                    size_t curr_offset = graph.get_position_of_step(step);
+                    size_t nearest_offset = numeric_limits<size_t>::max();
+                    graph.for_each_step_on_handle(graph.get_handle(next_pos.node_id()),
+                                                  [&](const step_handle_t& candidate) {
+                        
+                        if (graph.get_path_handle_of_step(candidate) == path_handle) {
+                            size_t candidate_offset = graph.get_position_of_step(candidate);
+                            if (candidate_offset < nearest_offset && candidate_offset > curr_offset) {
+                                nearest_offset = candidate_offset;
+                                next_step = candidate;
+                            }
+                        }
+                    });
+                    
+                    if (nearest_offset == numeric_limits<size_t>::max()) {
+                        throw std::runtime_error("Spliced BAM conversion could not find path steps that match alignment");
+                    }
+                    
+                    // the gap between the current step and the next one along the path
+                    size_t deletion_length = (nearest_offset - curr_offset -
+                                              graph.get_length(graph.get_handle_of_step(step)));
+                    
+                    // add to the cigar
+                    if (deletion_length >= min_splice_length) {
+                        // long enough to be a splice
+                        append_cigar_operation(deletion_length, 'N', cigar);
+                    }
+                    else if (deletion_length) {
+                        // create or extend a deletion
+                        append_cigar_operation(deletion_length, 'D', cigar);
+                    }
+                }
+                
+                // iterate along the path
+                step = next_step;
+            }
+        } // close loop over mappings
+        
+        if (cigar.back().second == 'I') {
+            // the final insertion is actually a softclip
+            cigar.back().second = 'S';
+        }
+    }
+    
+    simplify_cigar(cigar);
+    
     return cigar;
 }
 
@@ -1055,8 +1521,8 @@ void simplify_cigar(vector<pair<int, char>>& cigar) {
     for (size_t i = 0, j = 0; i < cigar.size(); ++j) {
         if (j == cigar.size() || (cigar[j].second != 'I' && cigar[j].second != 'D')) {
             // this is the end boundary of a runs of I/D operations
-            if (j - i >= 3) {
-                // we have at least 3 adjacent I/D operations, which means they should
+            if (j - i >= 2) {
+                // we have at least 2 adjacent I/D operations, which means they should
                 // be re-consolidated
                 int d_total = 0, i_total = 0;
                 for (size_t k = i - removed, end = j - removed; k < end; ++k) {
@@ -1099,6 +1565,1276 @@ void simplify_cigar(vector<pair<int, char>>& cigar) {
     cigar.resize(cigar.size() - removed);
 }
 
+// #define debug_indel_adjustment
+// this algorithm is a pain to debug without these consistency checks
+// #define debug_indel_adjustment_tombstone
+
+void normalize_indel_adjustment(Alignment& aln, bool adjust_left, const HandleGraph& graph, bool preserve_end_pos) {
+
+    // a simplified Edit that can be shifted more easily
+    struct simple_edit_t {
+        simple_edit_t(int64_t f, int64_t t, bool m) : from_length(f), to_length(t), is_match(m) {}
+        simple_edit_t(const simple_edit_t& other) = default;
+        int64_t from_length = 0;
+        int64_t to_length = 0;
+        bool is_match = false;
+
+#ifdef debug_indel_adjustment_tombstone
+        // ---- tombstone state ----
+        uint32_t _tombstone_generation = 1;
+
+        void _assert_alive() const {
+            assert(_tombstone_generation != 0 && "use-after-erase detected");
+        }
+
+        void _invalidate() {
+            _tombstone_generation = 0;
+        }
+        
+        const simple_edit_t& checked() const {
+            _assert_alive();
+            return *this;
+        }
+
+        simple_edit_t& checked() {
+            _assert_alive();
+            return *this;
+        }
+#else
+        inline const simple_edit_t& checked() const {
+            return *this;
+        }
+
+        inline simple_edit_t& checked() {
+            return *this;
+        }
+#endif
+    };
+
+    auto tombstone_erase = [](list<simple_edit_t>& lst, list<simple_edit_t>::iterator it) -> list<simple_edit_t>::iterator  {
+#ifdef debug_indel_adjustment_tombstone
+        it->_invalidate();
+#endif
+        return lst.erase(it);
+    };
+
+    // copy the alignment path into data structures that facilitate internal edits
+    auto& path = *aln.mutable_path();
+
+    // collect the aligned node sequences and re-format the alignment into modifiable data structs
+    // we also consolidate runs of insertions and deletions so they are a contiguous block of deletion edits
+    // followed by a single insertion edit
+    vector<string> aligned_seqs(path.mapping_size());
+    vector<list<simple_edit_t>> shiftable_aln(path.mapping_size());
+    vector<pos_t> mapping_positions(path.mapping_size());
+    size_t buffered_insertion = 0;
+    for (size_t i = 0; i < path.mapping_size(); ++i) {
+        const auto& mapping = path.mapping(i);
+        auto& shift_mapping = shiftable_aln[i];
+        for (size_t j = 0; j < mapping.edit_size(); ++j) {
+            const auto& edit = mapping.edit(j);
+            if (edit.from_length() == 0 && !(i == 0 && j == 0)) {
+                // non-soft clip insertion
+                buffered_insertion += edit.to_length();
+            }
+            else {
+                if (edit.to_length() != 0 && buffered_insertion != 0) {
+                    // the next edit isn't a deletion, flush the insertion buffer
+                    shift_mapping.emplace_back(0, buffered_insertion, false);
+                    buffered_insertion = 0;
+                }
+                shift_mapping.emplace_back(edit.from_length(), edit.to_length(), edit.from_length() == edit.to_length() && edit.sequence().empty());
+            }
+        }
+        const auto& pos = mapping.position();
+        aligned_seqs[i] = graph.get_subsequence(graph.get_handle(pos.node_id(), pos.is_reverse()), pos.offset(), mapping_from_length(mapping));
+        mapping_positions[i] = make_pos_t(pos);
+    }
+    // flush the insertion buffer a final time
+    if (buffered_insertion) {
+        shiftable_aln.back().emplace_back(0, buffered_insertion, false);
+    }
+
+#ifdef debug_indel_adjustment
+    cerr << "adjusting left? " << adjust_left << " for alignment" << endl;
+    cerr << pb2json(aln) << endl;
+    cerr << "shiftable aln, seq " << aln.sequence() << endl;
+    size_t debug_seq_idx = 0;
+    for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+        size_t debug_node_idx = 0;
+        cerr << i << ": " << mapping_positions[i] << " " << aligned_seqs[i] << endl;
+        for (const auto& edit : shiftable_aln[i])  {
+            cerr << '\t' << edit.from_length << ", " << edit.to_length << ", " << edit.is_match << ", " << debug_seq_idx << ", " << debug_node_idx << endl;
+            debug_node_idx += edit.from_length;
+            debug_seq_idx += edit.to_length;
+        }
+    }
+#endif
+
+    // reverse everything if we're adjusting left instead of right so that everything can be implemented
+    // as adjusting to the right internally
+    string rev_seq;
+    if (adjust_left) {
+        rev_seq.resize(aln.sequence().size(), '\0');
+        reverse_copy(aln.sequence().begin(), aln.sequence().end(), rev_seq.begin());
+        
+        reverse(shiftable_aln.begin(), shiftable_aln.end());
+        for (auto& mapping : shiftable_aln) {
+            mapping.reverse();
+        }
+        reverse(aligned_seqs.begin(), aligned_seqs.end());
+        for (auto& aligned_seq : aligned_seqs) {
+            reverse(aligned_seq.begin(), aligned_seq.end());
+        }
+        reverse(mapping_positions.begin(), mapping_positions.end());
+    }
+    const auto& seq = adjust_left ? rev_seq : aln.sequence();
+
+
+#ifdef debug_indel_adjustment
+    cerr << "after reversals, seq " << seq << endl;
+    debug_seq_idx = 0;
+    for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+        size_t debug_node_idx = 0;
+        cerr << i << ": " << mapping_positions[i] << " " << aligned_seqs[i] << endl;
+        for (const auto& edit : shiftable_aln[i])  {
+            cerr << '\t' << edit.from_length << ", " << edit.to_length << ", " << edit.is_match << ", " << debug_seq_idx << ", " << debug_node_idx << ", " << seq.substr(debug_seq_idx, edit.to_length) << ", " << aligned_seqs[i].substr(debug_node_idx, edit.from_length) << endl;
+            debug_node_idx += edit.from_length;
+            debug_seq_idx += edit.to_length;
+        }
+    }
+#endif
+    
+    // we'll keep track of whether anything changed to determine whether we need to re-construct the Alignment path
+    bool did_a_shift = false;
+
+    // move forward one edit in the shiftable alignment
+    auto advance = [&](size_t& i, list<simple_edit_t>::iterator& edit_it) {
+        ++edit_it;
+        while (i < shiftable_aln.size() && edit_it == shiftable_aln[i].end()) {
+            ++i;
+            if (i < shiftable_aln.size()) {
+                edit_it = shiftable_aln[i].begin();
+            }
+        }
+    };
+
+    // initiate shifting on an interval that contains only deletions or only insertions (although we may switch between
+    // the edit types at the end of the interval)
+    auto dispatch_shift = [&](size_t i, list<simple_edit_t>::iterator edit_it, size_t seq_idx, size_t node_idx, bool deletion_run) {
+#ifdef debug_indel_adjustment
+        cerr  << "dispatch from " << i << ", " << seq_idx << ", " << node_idx << ", " << deletion_run << endl;
+#endif
+
+        // for the current run of insertion/deletions, a buffer of (mapping idx, node seq idx, edit)
+        deque<tuple<size_t, size_t, list<simple_edit_t>::iterator>> curr_indel;
+
+        // if we partially cancel out an indel of the other type, we will switch run type and see if we can move it further
+        bool find_post_cancel_switch = false;
+        bool in_post_cancel_switch = false;
+        size_t prev_i = i;
+        for (; i < shiftable_aln.size(); advance(i, edit_it)) {
+
+#ifdef debug_indel_adjustment
+            cerr << "inner iter i " << i << ", si " << seq_idx << ", ni " << node_idx << ", fl " << edit_it->checked().from_length << ", tl " << edit_it->checked().to_length << ", im? " << edit_it->checked().is_match << endl; 
+#endif
+            
+            if (i != prev_i) {
+                node_idx = 0;
+                if (!curr_indel.empty() && get<2>(curr_indel.front())->checked().from_length == 0) {
+#ifdef debug_indel_adjustment
+                    cerr << "shift current insertion to current node" << endl;
+#endif
+                    // shift the insert from the end of the previous node to the start of this one
+                    shiftable_aln[i].emplace_front(*get<2>(curr_indel.front()));
+                    tombstone_erase(shiftable_aln[i - 1], get<2>(curr_indel.front()));
+                    get<0>(curr_indel.front()) = i;
+                    get<1>(curr_indel.front()) = 0;
+                    get<2>(curr_indel.front()) = shiftable_aln[i].begin();
+                }
+            }
+
+            if ((edit_it->checked().from_length == 0 && deletion_run) || (edit_it->checked().to_length == 0 && !deletion_run)) {
+#ifdef debug_indel_adjustment
+                cerr << "type switch" << endl;
+                cerr << "curr indel:" << endl;
+                for (const auto& r : curr_indel) {
+                    cerr << "\t" << get<0>(r) << '\t' << get<1>(r) << '\t' << get<2>(r)->checked().from_length << '\t' << get<2>(r)->checked().to_length << '\t' << get<2>(r)->checked().is_match << '\t';
+                    for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+                        size_t j = 0;
+                        for (auto it = shiftable_aln[i].begin(); it != shiftable_aln[i].end(); ++it) {
+                            if (std::get<2>(r) == it) {
+                                cerr << i << ',' << j;
+                            }
+                            ++j;
+                        }
+                    }
+                    cerr << endl;
+                }
+#endif
+                // we've left an indel run of one time for the indel run of the other type
+                if (find_post_cancel_switch) {
+                    // we want to try to switch type and try to shift this partially cancelled indel
+                    curr_indel.clear();
+                    deletion_run = !deletion_run;
+                    find_post_cancel_switch = false;
+                    in_post_cancel_switch = true;
+#ifdef debug_indel_adjustment
+                    cerr << "switching run type to " << (deletion_run ? "deletion" : "insertion") << " for post-cancel shift" << endl;
+#endif
+                }
+                else if (curr_indel.empty()) {
+                    // no opportunity to cancel out an insertion and deletion
+#ifdef debug_indel_adjustment
+                    cerr << "type switch without curr indel" << endl;
+#endif
+                    break;
+                }
+                else {
+                    // try to cancel out the insertion and deletion
+
+                    size_t overlap = 0;
+                    for (bool swapped : {false, true}) {
+                        if (swapped) {
+#ifdef debug_indel_adjustment
+                            cerr << "swapping order" << endl;
+#endif
+                            // since the order of an adjacent insertion and deletion is arbitrary, try in the other orientation
+                            if (deletion_run) {
+                                // move insertion before the current deletion
+                                auto swapped_it = shiftable_aln[get<0>(curr_indel.front())].emplace(get<2>(curr_indel.front()), edit_it->checked());
+                                tombstone_erase(shiftable_aln[i], edit_it);
+                                // move trackers to before the deletion but after the insertion
+                                i = get<0>(curr_indel.front());
+                                node_idx = get<1>(curr_indel.front());
+                                edit_it = get<2>(curr_indel.front());
+                                seq_idx += swapped_it->checked().to_length;
+                                // update the indel to be the insertion
+                                curr_indel.clear();
+                                curr_indel.emplace_front(i, node_idx, swapped_it);
+                            }
+                            else {
+                                // remember the current insertion
+                                auto ins_it = get<2>(curr_indel.front());
+                                // walk the deletion and construct the new current indel
+                                curr_indel.clear();
+                                size_t del_i = i;
+                                auto del_it = edit_it;
+                                size_t prev_del_i = del_i;
+                                for (; del_i < shiftable_aln.size(); advance(del_i, del_it)) {
+                                    if (del_i != prev_del_i) {
+                                        node_idx = 0;
+                                    }
+                                    if (del_it->checked().to_length != 0) {
+                                        break;
+                                    }
+                                    curr_indel.emplace_back(del_i, node_idx, del_it);
+                                    node_idx += del_it->checked().from_length;
+                                    prev_del_i = del_i;
+                                }
+                                // swap the insertion to the other side of the deletion
+                                list<simple_edit_t>::iterator swapped_it;
+                                if (del_i == shiftable_aln.size()) {
+                                    swapped_it = shiftable_aln.back().emplace(shiftable_aln.back().end(), ins_it->checked());
+                                }
+                                else {
+                                    swapped_it = shiftable_aln[del_i].emplace(del_it, ins_it->checked());
+                                }
+                                
+                                tombstone_erase(shiftable_aln[i], ins_it);
+
+                                // update the trackers (note: node_idx was already updated)
+                                seq_idx -= swapped_it->checked().to_length;
+                                edit_it = swapped_it;
+                                i = del_i < shiftable_aln.size() ? del_i : del_i - 1;
+                            }
+                            deletion_run = !deletion_run;
+#ifdef debug_indel_adjustment
+                            cerr << "now in " << (deletion_run ? "deletion" : "insertion") << " run with curr indel:" << endl;
+                            for (const auto& r : curr_indel) {
+                                cerr << "\t" << get<0>(r) << '\t' << get<1>(r) << '\t' << get<2>(r)->checked().from_length << '\t' << get<2>(r)->checked().to_length << '\t' << get<2>(r)->checked().is_match << '\t';
+                                for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+                                    size_t j = 0;
+                                    for (auto it = shiftable_aln[i].begin(); it != shiftable_aln[i].end(); ++it) {
+                                        if (std::get<2>(r) == it) {
+                                            cerr << i << ',' << j;
+                                        }
+                                        ++j;
+                                    }
+                                }
+                                cerr << endl;
+                            }
+                            
+                            cerr << "i " << i << ", node idx " << node_idx << ", seq idx " << seq_idx << ", edit " << edit_it->checked().from_length << ", " << edit_it->checked().to_length << ", " << edit_it->checked().is_match << endl;
+#endif
+                        }
+
+                        if (!deletion_run) {
+                            // insertion run
+#ifdef debug_indel_adjustment
+                            cerr << "try to cancel in ins run" << endl;
+                            cerr << "align state before attempting cancellation, seq " << seq << endl;
+                            size_t debug_seq_idx = 0;
+                            for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+                                size_t debug_node_idx = 0;
+                                cerr << i << ": " << mapping_positions[i] << " " << aligned_seqs[i] << endl;
+                                for (auto it = shiftable_aln[i].begin(); it != shiftable_aln[i].end(); ++it)  {
+                                    const auto& edit  = it->checked();
+                                    cerr << '\t' << edit.from_length << ", " << edit.to_length << ", " << edit.is_match << ", " << debug_seq_idx << ", " << debug_node_idx << ", " << seq.substr(debug_seq_idx, edit.to_length) << ", " << aligned_seqs[i].substr(debug_node_idx, edit.from_length) << endl;
+                                    debug_node_idx += edit.from_length;
+                                    debug_seq_idx += edit.to_length;
+                                }
+                            }
+#endif
+
+                            // get the insertion string
+                            string curr_indel_string = std::move(seq.substr(seq_idx - get<2>(curr_indel.front())->checked().to_length, get<2>(curr_indel.front())->checked().to_length));
+                            // get the deletion string
+                            string del_ahead_string;
+                            auto del_it = edit_it;
+                            size_t del_i = i;
+                            size_t prev_del_i = del_i;
+                            size_t del_node_idx = node_idx;
+                            while (del_i != shiftable_aln.size() && del_it->checked().to_length == 0) {
+                                if (del_i != prev_del_i) {
+                                    del_node_idx = 0;
+                                }
+                                del_ahead_string.append(aligned_seqs[del_i].substr(del_node_idx, del_it->checked().from_length));
+                                del_node_idx += del_it->checked().from_length;
+                                prev_del_i = del_i;
+                                advance(del_i, del_it);
+                            }
+
+                            // figure out how much we can cancel out
+                            overlap = longest_overlap(curr_indel_string, del_ahead_string);
+#ifdef debug_indel_adjustment
+                            cerr << "strings: " << curr_indel_string << ", " << del_ahead_string << '\n';
+                            cerr << "overlap: " << overlap << endl;
+#endif
+
+                            if (overlap != 0 && overlap < del_ahead_string.size()) {
+                                // we shortened the deletion ahead, it might be possible to move it now
+                                find_post_cancel_switch = true;
+                                in_post_cancel_switch = false;
+                            }
+
+                            // we're moving this much sequence ahead of where we are now
+                            seq_idx -= overlap;
+
+                            // convert deletions ahead to matches
+                            del_it = edit_it;
+                            del_i = i;
+                            size_t overlap_remaining = overlap;
+                            while (overlap_remaining) {
+#ifdef debug_indel_adjustment
+                                cerr << "have " << overlap_remaining << " overlap remaining at " << del_i << ", " << del_it->checked().from_length << ", " << del_it->checked().to_length << ", " << del_it->checked().is_match << endl;
+#endif
+                                if (overlap_remaining < del_it->checked().from_length) {
+#ifdef debug_indel_adjustment
+                                    cerr << "make new partial edit match" << endl;
+#endif
+                                    auto split_it = shiftable_aln[del_i].emplace(del_it, overlap_remaining, overlap_remaining, true);
+                                    del_it->checked().from_length -= overlap_remaining;
+                                    if (del_it == edit_it) {
+                                        edit_it = split_it;
+                                    }
+                                    break;
+                                }
+                                else {
+                                    // entirely convert to match
+#ifdef debug_indel_adjustment
+                                    cerr << "convert to match" << endl;
+#endif
+                                    del_it->checked().to_length = del_it->checked().from_length;
+                                    del_it->checked().is_match = true;
+                                    overlap_remaining -= del_it->checked().from_length;
+                                }
+                                advance(del_i, del_it);
+                            }
+                            if (overlap != 0 && overlap_remaining == 0 && del_i != shiftable_aln.size() && del_it != shiftable_aln[del_i].begin() && del_it->checked().is_match) {
+                                // we created an adjacency between matches by clearing out the deletion ahead
+                                // note: del_i and del_it now point to the past-the-last position for the deletion 
+#ifdef debug_indel_adjustment
+                                cerr << "created adjacency between match at end of conversion: " << del_i << ", " << del_it->checked().from_length << ", " << del_it->checked().to_length << ", " << del_it->checked().is_match << endl;
+#endif
+                                auto prev_it = del_it;
+                                --prev_it;
+                                prev_it->checked().from_length += del_it->checked().from_length;
+                                prev_it->checked().to_length += del_it->checked().to_length;
+                                tombstone_erase(shiftable_aln[del_i], del_it);
+                            }
+
+                            if (overlap == get<2>(curr_indel.front())->checked().to_length) {
+#ifdef debug_indel_adjustment
+                                cerr << "entirely consumed current insertion" << endl;
+
+#endif
+                                // the entire insertion is consumed
+                                auto next_it = tombstone_erase(shiftable_aln[i], get<2>(curr_indel.front()));
+                                curr_indel.clear();
+
+                                if (next_it != shiftable_aln[i].end() && next_it != shiftable_aln[i].begin()) {
+                                    // we may have created an adjacency between matches by clearing out the insertion
+#ifdef debug_indel_adjustment
+                                    cerr << "created adjacency at beginning of conversion" << endl;
+#endif
+                                    auto prev_it = next_it;
+                                    --prev_it;
+                                    if (next_it->checked().is_match && prev_it->checked().is_match) {
+                                        if (next_it == edit_it) {
+                                            edit_it = prev_it;
+                                            seq_idx -= prev_it->checked().to_length;
+                                            node_idx -= prev_it->checked().from_length;
+                                        }
+                                        prev_it->checked().from_length += next_it->checked().from_length;
+                                        prev_it->checked().to_length += next_it->checked().to_length;
+                                        tombstone_erase(shiftable_aln[i], next_it);
+                                    }
+                                }
+                            }
+                            else if (overlap != 0) {
+#ifdef debug_indel_adjustment
+                                cerr << "current insert is reduced by " << overlap << endl;
+#endif
+                                get<2>(curr_indel.front())->checked().to_length -= overlap;
+                            }
+
+                            if (overlap != 0) {
+                                // don't continue to the swapped order
+                                break;
+                            }
+                        }
+                        else {
+                            // deletion run
+#ifdef debug_indel_adjustment
+                            cerr << "try to cancel in del run" << endl;
+                            cerr << "align state before attempting cancelation, seq " << seq << endl;
+                            size_t debug_seq_idx = 0;
+                            for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+                                size_t debug_node_idx = 0;
+                                cerr << i << ": " << mapping_positions[i] << " " << aligned_seqs[i] << ", " << shiftable_aln[i].size() << " edits" << endl;
+                                for (auto it = shiftable_aln[i].begin(); it != shiftable_aln[i].end(); ++it)  {
+                                    const auto& edit = it->checked();
+                                    cerr << '\t' << edit.from_length << ", " << edit.to_length << ", " << edit.is_match << ", " << debug_seq_idx << ", " << debug_node_idx << ", " << seq.substr(debug_seq_idx, edit.to_length) << ", " << aligned_seqs[i].substr(debug_node_idx, edit.from_length) << endl;
+                                    debug_node_idx += edit.from_length;
+                                    debug_seq_idx += edit.to_length;
+                                }
+                            }
+#endif
+
+                            // get the deletion string
+                            string curr_indel_string;
+                            for (const auto& rec : curr_indel) {
+                                curr_indel_string.append(aligned_seqs[get<0>(rec)].substr(get<1>(rec), get<2>(rec)->checked().from_length));
+                            }
+                            // get the insertion string
+                            string ins_ahead_string = std::move(seq.substr(seq_idx, edit_it->checked().to_length));
+
+                            // figure out how much we can cancel out
+                            overlap = longest_overlap(curr_indel_string, ins_ahead_string);
+#ifdef debug_indel_adjustment
+                            cerr << "overlap " << overlap << ", del string len " << curr_indel_string.size() << endl;
+#endif
+
+                            if (overlap != 0 && overlap < ins_ahead_string.size()) {
+                                // we shortened the insertion ahead, it might be possible to move it now
+                                find_post_cancel_switch = true;
+                                in_post_cancel_switch = false;
+                            }
+                            
+                            // save these so we can access the insertion after retracting the cursor
+                            size_t ins_i = i;
+                            auto ins_it = edit_it;
+
+                            size_t overlap_remaining = overlap;
+                            while (overlap_remaining != 0) {
+                                if (get<0>(curr_indel.back()) != i) {
+                                    i = get<0>(curr_indel.back());
+                                    node_idx = aligned_seqs[i].size();
+                                }
+                                if (get<2>(curr_indel.back())->checked().from_length > overlap_remaining) {
+                                    // split into match and deletion
+                                    auto inserter = get<2>(curr_indel.back());
+                                    ++inserter;
+                                    edit_it = shiftable_aln[get<0>(curr_indel.back())].emplace(inserter, overlap_remaining, overlap_remaining, true);
+                                    node_idx -= overlap_remaining;
+                                    get<2>(curr_indel.back())->checked().from_length -= overlap_remaining;
+                                    break;
+                                }
+                                else {
+                                    // convert to match
+                                    edit_it = get<2>(curr_indel.back());
+                                    overlap_remaining -= edit_it->checked().from_length;
+                                    node_idx -= edit_it->checked().from_length;
+
+                                    edit_it->checked().to_length = edit_it->checked().from_length;
+                                    edit_it->checked().is_match = true;
+
+                                    curr_indel.pop_back();
+                                }
+                            }
+#ifdef debug_indel_adjustment
+                            cerr << "end with overlap remaining: " << overlap_remaining << endl;
+                            cerr << "cursor is at i " << i << ", ni " << node_idx << ", si " << seq_idx << ", edit " << edit_it->checked().from_length << ", " << edit_it->checked().to_length << ", "  << edit_it->checked().is_match << endl;
+#endif
+                            if (overlap != 0 && curr_indel.empty() && edit_it != shiftable_aln[i].begin()) {
+                                // we may have created an adjacency between matches by clearing out the deletion
+#ifdef debug_indel_adjustment
+                                cerr << "check for adjacency at start of match " << i << ", " << edit_it->checked().from_length << ", " << edit_it->checked().to_length << ", " << edit_it->checked().is_match << endl;
+#endif
+                                auto prev_it = edit_it;
+                                --prev_it;
+                                if (prev_it->checked().is_match) {
+#ifdef debug_indel_adjustment
+                                    cerr << "merge at start" << endl;
+#endif
+                                    seq_idx -= prev_it->checked().to_length;
+                                    node_idx -= prev_it->checked().from_length;
+                                    prev_it->checked().from_length += edit_it->checked().from_length;
+                                    prev_it->checked().to_length += edit_it->checked().to_length;
+                                    tombstone_erase(shiftable_aln[i], edit_it);
+                                    edit_it = prev_it;
+                                }
+                            }
+
+                            if (overlap == ins_it->checked().to_length) {
+#ifdef debug_indel_adjustment
+                                cerr << "insert is consumed" << endl;
+#endif
+                                // the neighboring insertion is consumed
+                                ins_it = tombstone_erase(shiftable_aln[ins_i], ins_it);
+
+                                // we may have created adjacencies between matches that can be merged
+                                if (ins_it != shiftable_aln[ins_i].begin() && ins_it != shiftable_aln[ins_i].end()) {
+                                    auto prev_it = ins_it;
+                                    --prev_it;
+                                    if (ins_it->checked().is_match && prev_it->checked().is_match) {
+                                        prev_it->checked().from_length += ins_it->checked().from_length;
+                                        prev_it->checked().to_length += ins_it->checked().to_length;
+                                        tombstone_erase(shiftable_aln[ins_i], ins_it);
+                                    }
+                                }
+                            }
+                            else {
+#ifdef debug_indel_adjustment
+                                cerr << "insert is reduced by " << overlap << endl;
+#endif
+                                // insertion is reduced
+                                ins_it->checked().to_length -= overlap;
+                            }
+
+                            if (overlap != 0) {
+                                // don't continue to the swapped order
+                                break;
+                            }
+                        }
+                    }
+
+                    // count an indel cancellation as a nontrivial shift
+                    did_a_shift = did_a_shift || (overlap != 0);
+                    
+                    if (!find_post_cancel_switch && (curr_indel.empty() || overlap == 0)) {
+                        // either no cancellation or both insert and delete were fully consumed
+#ifdef debug_indel_adjustment
+                        cerr << "non-cancelable type switch from run, exiting dispatch" << endl;
+#endif
+                        break;
+                    }
+#ifdef debug_indel_adjustment
+                    else if (find_post_cancel_switch) {
+                        cerr << "proceeding forward to find potentialy post-cancellation shifts in other run time" << endl;
+                    }
+#endif
+
+#ifdef debug_indel_adjustment
+                    cerr << "align state after cancellation, seq " << seq << endl;
+                    debug_seq_idx = 0;
+                    for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+                        size_t debug_node_idx = 0;
+                        cerr << i << ": " << mapping_positions[i] << " " << aligned_seqs[i] << ", " << shiftable_aln[i].size() << " edits"  << endl;
+                        for (const auto& edit : shiftable_aln[i])  {
+                            cerr << '\t' << edit.from_length << ", " << edit.to_length << ", " << edit.is_match << ", " << debug_seq_idx << ", " << debug_node_idx << ", " << seq.substr(debug_seq_idx, edit.to_length) << ", " << aligned_seqs[i].substr(debug_node_idx, edit.from_length) << endl;
+                            debug_node_idx += edit.from_length;
+                            debug_seq_idx += edit.to_length;
+                        }
+                    }
+
+                    cerr << "continuing from cancellation at i " << i << ", si " << seq_idx << ", ni " << node_idx << ", " << edit_it->checked().from_length << ", " << edit_it->checked().to_length << ", " << edit_it->checked().is_match << ", run type " << (deletion_run ? "del" : "ins") << endl;
+                    cerr << "and curr indel:" << endl;
+                    for (const auto& r : curr_indel) {
+                        cerr << "\t" << get<0>(r) << '\t' << get<1>(r) << '\t' << get<2>(r)->checked().from_length << '\t' << get<2>(r)->checked().to_length << '\t' << get<2>(r)->checked().is_match << '\t';
+                        for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+                            size_t j = 0;
+                            for (auto it = shiftable_aln[i].begin(); it != shiftable_aln[i].end(); ++it) {
+                                if (std::get<2>(r) == it) {
+                                    cerr << i << ',' << j;
+                                }
+                                ++j;
+                            }
+                        }
+                        cerr << endl;
+                    }
+#endif
+                }
+            }
+            
+            // record these before we start messing around with the edits
+            int64_t next_node_idx = node_idx + edit_it->checked().from_length;
+            int64_t next_seq_idx = seq_idx + edit_it->checked().to_length;
+
+            if (!curr_indel.empty() && edit_it->checked().from_length == 0) {
+                // extend the current insertion by merging the edits
+                auto insert = get<2>(curr_indel.front());
+                insert->checked().to_length += edit_it->checked().to_length;
+                tombstone_erase(shiftable_aln[i], edit_it);
+                edit_it = insert;
+            }
+            else if (!curr_indel.empty() && edit_it->checked().to_length == 0) {
+                // extend the current deletion
+                if (get<0>(curr_indel.back()) == i) {
+                    // same node, merge the edits
+                    auto del = get<2>(curr_indel.back());
+                    del->checked().from_length += edit_it->checked().from_length;
+                    tombstone_erase(shiftable_aln[i], edit_it);
+                    edit_it = del;
+                }
+                else {
+                    // different nodes, add the edit to the run
+                    curr_indel.emplace_back(i, node_idx, edit_it);
+                }
+            }
+            else if (!curr_indel.empty() && edit_it->checked().from_length == edit_it->checked().to_length) {
+                // try to shift through a match/mismatch
+
+                if (get<2>(curr_indel.front())->checked().from_length == 0) {
+                    // we're shifting an insertion
+                    
+                    int64_t shift_seq_idx = seq_idx - get<2>(curr_indel.front())->checked().to_length;
+                    while (edit_it->checked().from_length != 0 && (seq[seq_idx] == seq[shift_seq_idx] || !edit_it->checked().is_match)) {
+                        // are we shifting a match or a mismatch
+                        bool is_match = (seq[shift_seq_idx] == aligned_seqs[i][node_idx]);
+                        // get the match/mismatch we'll shift into
+                        auto leftward_aligned_it = get<2>(curr_indel.front());
+                        if (leftward_aligned_it == shiftable_aln[i].begin()) {
+                            // start a new match/mismatch at the beginning of the node
+                            leftward_aligned_it = shiftable_aln[i].emplace(leftward_aligned_it, 0, 0, is_match);
+                        }
+                        else {
+                            --leftward_aligned_it;
+                            if (leftward_aligned_it->checked().from_length != leftward_aligned_it->checked().to_length || 
+                                leftward_aligned_it->checked().is_match != is_match) {
+                                // start a new match/mismatch before the current indel
+                                leftward_aligned_it = shiftable_aln[i].emplace(get<2>(curr_indel.front()), 0, 0, is_match);
+                            }
+                        }
+                        // adjust the indexes
+                        --edit_it->checked().from_length;
+                        --edit_it->checked().to_length;
+                        ++leftward_aligned_it->checked().from_length;
+                        ++leftward_aligned_it->checked().to_length;
+                        ++seq_idx;
+                        ++node_idx;
+                        ++shift_seq_idx;
+                        did_a_shift = true;
+                    }
+                }
+                else {
+                    // we're shifting a deletion
+
+                    // cerr << "i " << i << ", fl " << edit_it->checked().from_length << ", tl " << edit_it->checked().to_length << ", im? " << edit_it->checked().is_match << ", si " << seq_idx << ", ni " << node_idx << ", cmp " << get<0>(curr_indel.front()) << ", " << get<1>(curr_indel.front()) << ", chars " << aligned_seqs[get<0>(curr_indel.front())][get<1>(curr_indel.front())] << " " << aligned_seqs[i][node_idx] << endl;
+                    while (edit_it->checked().from_length != 0 && 
+                           (aligned_seqs[get<0>(curr_indel.front())][get<1>(curr_indel.front())] == aligned_seqs[i][node_idx] || !edit_it->checked().is_match)) {
+                        // are we creating a match or a mismatch
+                        bool is_match = (seq[seq_idx] == aligned_seqs[get<0>(curr_indel.front())][get<1>(curr_indel.front())]);
+                        // get the match/mismatch we'll shift into
+                        // TODO: repetitive with insertions
+                        auto leftward_aligned_it = get<2>(curr_indel.front());
+                        if (leftward_aligned_it == shiftable_aln[get<0>(curr_indel.front())].begin()) {
+                            // start a new match/mismatch at the beginning of the node
+                            leftward_aligned_it = shiftable_aln[get<0>(curr_indel.front())].emplace(leftward_aligned_it, 0, 0, is_match);
+                        }
+                        else {
+                            --leftward_aligned_it;
+                            if (leftward_aligned_it->checked().from_length != leftward_aligned_it->checked().to_length || leftward_aligned_it->checked().is_match != is_match) {
+                                // start a new match/mismatch before the current indel
+                                leftward_aligned_it = shiftable_aln[get<0>(curr_indel.front())].emplace(get<2>(curr_indel.front()), 0, 0, is_match);
+                            }
+                        }
+                        // adjust the indexes
+                        ++seq_idx;
+                        ++node_idx;
+                        --edit_it->checked().from_length;
+                        --edit_it->checked().to_length;
+                        if (get<0>(curr_indel.back()) != i) {
+                            curr_indel.emplace_back(i, 0, shiftable_aln[i].emplace(shiftable_aln[i].begin(), 1, 0, false));
+                        }
+                        else {
+                            ++get<2>(curr_indel.back())->checked().from_length;
+                        }
+                        ++leftward_aligned_it->checked().from_length;
+                        ++leftward_aligned_it->checked().to_length;
+                        ++get<1>(curr_indel.front());
+                        --get<2>(curr_indel.front())->checked().from_length;
+                        
+                        if (get<2>(curr_indel.front())->checked().from_length == 0) {
+                            // we've shifted through the first deletion edit in this run
+                            tombstone_erase(shiftable_aln[get<0>(curr_indel.front())], get<2>(curr_indel.front()));
+                            curr_indel.pop_front();
+                        }
+                        did_a_shift = true;
+                    }
+                }
+
+                if (edit_it->checked().from_length == 0) {
+                    // we cleared out the entire match
+                    tombstone_erase(shiftable_aln[i], edit_it);
+                    edit_it = get<2>(curr_indel.back());
+                }
+                else {
+                    // we've shifted this indel as far as possible
+                    curr_indel.clear();
+                    if (in_post_cancel_switch) {
+                        // this was a partially cancelled indel, so we've shifted the remaining and can quit early
+#ifdef debug_indel_adjustment
+                        cerr << "end post cancel switch due to not clearing out a match" << endl;
+#endif
+                        break;
+                    }
+                }
+            }
+            else {
+                // we can't shift an indel through the next edit because it's not a match
+                if (in_post_cancel_switch && !curr_indel.empty()) {
+                    // this was a partially cancelled indel, so we've shifted the remaining and can quit early
+#ifdef debug_indel_adjustment
+                    cerr << "end post cancel switch due to finding a non-match" << endl;
+#endif
+                    break;
+                }
+                curr_indel.clear();
+
+                auto next_it = edit_it;
+                ++next_it;
+                if ((edit_it->checked().from_length == 0 && 
+                     !(i == 0 && edit_it == shiftable_aln[i].begin()) && !(i + 1 == shiftable_aln.size() && next_it == shiftable_aln[i].end())) ||
+                    edit_it->checked().to_length == 0) {
+                    // the next edit is a non-softclip insertion or deletion
+                    curr_indel.emplace_back(i, node_idx, edit_it);
+                }
+            }
+
+            seq_idx = next_seq_idx;
+            node_idx = next_node_idx; 
+
+            prev_i = i;
+        }
+
+#ifdef debug_indel_adjustment
+        cerr << "align state after completing dispatch, seq " << seq << endl;
+        size_t debug_seq_idx = 0;
+        for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+            size_t debug_node_idx = 0;
+            cerr << i << ": " << mapping_positions[i] << " " << aligned_seqs[i] << endl;
+            for (const auto& edit : shiftable_aln[i])  {
+                cerr << '\t' << edit.from_length << ", " << edit.to_length << ", " << edit.is_match << ", " << debug_seq_idx << ", " << debug_node_idx << ", " << seq.substr(debug_seq_idx, edit.to_length) << ", " << aligned_seqs[i].substr(debug_node_idx, edit.from_length) << endl;
+                debug_node_idx += edit.from_length;
+                debug_seq_idx += edit.to_length;
+            }
+        }
+#endif
+    };
+
+    // leftward outer iteration
+    bool in_deletion_run = false;
+    bool in_insertion_run = false;
+    size_t seq_idx = aln.sequence().size();
+    // TODO: doing this manually is somehow less cumbersome than working around the iterator invalidation on
+    // reverse_iterators
+    auto iter_backward = [](list<simple_edit_t>& l, list<simple_edit_t>::iterator& it) {
+        if (it == l.begin()) {
+            it = l.end();
+        }
+        else {
+            --it;
+        }
+    };
+    auto loop_backward = [&](int64_t& i, list<simple_edit_t>::iterator& it) {
+        iter_backward(shiftable_aln[i], it);
+        while (i >= 0 && it == shiftable_aln[i].end()) {
+            --i;
+            if (i >= 0) {
+                it = shiftable_aln[i].end();
+                iter_backward(shiftable_aln[i], it);
+            }
+        }
+    };
+
+    for (int64_t j = shiftable_aln.size() - 1; j >= 0; --j) {
+
+        size_t node_idx = aligned_seqs[j].size();
+
+        auto it = shiftable_aln[j].end();
+        --it;
+        for (; it != shiftable_aln[j].end(); iter_backward(shiftable_aln[j], it)) {
+
+#ifdef debug_indel_adjustment
+            cerr << "outer iter j " << j << ", si " << seq_idx << ", ni " << node_idx << ", fl " << it->checked().from_length << ", tl " << it->checked().to_length << ", im? " << it->checked().is_match << endl;
+#endif
+            
+            auto next_it = it;
+            ++next_it;
+            if (it->checked().from_length == 0) {
+                // insertion
+
+                if (in_deletion_run) {
+                    // see if we can swap a deletion from the other side of this insertion into this deletion run
+
+                    // look back one position
+                    int64_t s = j;
+                    auto s_it = it;
+                    loop_backward(s, s_it);
+                    // find the end of the deletion (if any)
+                    bool found = false;
+                    while (s >= 0) {
+#ifdef debug_indel_adjustment
+                        cerr << "check " << s << ", " << s_it->checked().from_length << ", " << s_it->checked().to_length << ", " << s_it->checked().is_match << " for a boundary deletion to swap into run" << endl;
+#endif
+                        if (s_it->checked().to_length == 0) {
+                            found = true;
+                        }
+                        else {
+                            break;
+                        }
+                        loop_backward(s, s_it);
+                    }
+                    if (found) {
+                        // there's a deletion preceding this insertion
+#ifdef debug_indel_adjustment
+                        cerr << "found swappable deletion" << endl;
+#endif
+
+                        // navigate back to the first edit of the deletion
+                        if (s < 0) {
+                            s = 0;
+                            s_it = shiftable_aln.front().begin();
+                        }
+                        else {
+                            // TODO: annoying type conversion
+                            size_t s_us = s;
+                            advance(s_us, s_it);
+                            s = s_us;
+                        }
+
+                        // update the node seq index
+                        // note: we only walked through deletions, so we don't need to worry about updating seq_idx
+                        node_idx = (s == j) ? node_idx : aligned_seqs[s].size();
+                        size_t t = s;
+                        auto t_it = s_it;
+                        while (t_it != it && t == s) {
+                            node_idx -= t_it->checked().from_length;
+                            advance(t, t_it);
+                        }
+
+                        // move the insertion to the beginning of the deletion
+                        auto ins_it = shiftable_aln[s].emplace(s_it, it->checked());
+                        tombstone_erase(shiftable_aln[j], it);
+
+                        // update the iteration pointer to the new location
+                        it = ins_it;
+                        j = s;
+
+#ifdef debug_indel_adjustment
+                        cerr << "align state after swapping into run" << endl;
+                        size_t debug_seq_idx = 0;
+                        for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+                            size_t debug_node_idx = 0;
+                            cerr << i << ": " << mapping_positions[i] << " " << aligned_seqs[i] << endl;
+                            for (const auto& edit : shiftable_aln[i])  {
+                                cerr << '\t' << edit.from_length << ", " << edit.to_length << ", " << edit.is_match << ", " << debug_seq_idx << ", " << debug_node_idx << ", " << seq.substr(debug_seq_idx, edit.to_length) << ", " << aligned_seqs[i].substr(debug_node_idx, edit.from_length) << endl;
+                                debug_node_idx += edit.from_length;
+                                debug_seq_idx += edit.to_length;
+                            }
+                        }
+                        cerr << "j " << j << ", ni " << node_idx << ", si " << seq_idx << ", ed " << it->checked().from_length << ", " << it->checked().to_length << ", "  << it->checked().is_match << endl;
+#endif
+                    }
+
+                    // move back into the deletion run and dispatch a right shift inside it
+                    size_t i = j;
+                    auto edit_it = it;
+                    advance(i, edit_it);
+                    dispatch_shift(i, edit_it, seq_idx, i == j ? node_idx : 0, true);
+                    in_deletion_run = false;
+                }
+                
+                if (!(j == 0 && it == shiftable_aln[j].begin()) && !(j + 1 == shiftable_aln.size() && next_it == shiftable_aln.back().end())) {
+                    in_insertion_run = true;
+                }
+            }
+            else if (it->checked().to_length == 0) {
+                // deletion
+
+                if (in_insertion_run) {
+                    // see if we can find an insertion on the other side of this deletion to swap into this run
+
+                    // traverse the deletion
+                    int64_t s = j;
+                    auto s_it = it;
+                    loop_backward(s, s_it);
+                    while (s >= 0 && s_it->checked().to_length == 0) {
+#ifdef debug_indel_adjustment
+                        cerr << "check " << s << ", " << s_it->checked().from_length << ", " << s_it->checked().to_length << ", " << s_it->checked().is_match << " for a boundary insertion to swap into run" << endl;
+#endif
+                        loop_backward(s, s_it);
+                    }
+                    if (s >= 0 && s_it->checked().from_length == 0 && !(s_it == shiftable_aln.front().begin())) {
+                        // there's a non-soft-clip insertion on this boundary
+
+#ifdef debug_indel_adjustment
+                        cerr << "found swappable insertion" << endl;
+                        cerr << aln.name() << endl;
+#endif
+
+                        // update the sequence to being in front of the cursor
+                        seq_idx -= s_it->checked().to_length;
+
+                        // move the insertion ahead of the cursor
+                        auto t_it = it;
+                        ++t_it;
+                        shiftable_aln[j].emplace(t_it, s_it->checked());
+                        tombstone_erase(shiftable_aln[s], s_it);
+
+#ifdef debug_indel_adjustment
+                        cerr << "align state after swapping into run" << endl;
+                        size_t debug_seq_idx = 0;
+                        for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+                            size_t debug_node_idx = 0;
+                            cerr << i << ": " << mapping_positions[i] << " " << aligned_seqs[i] << endl;
+                            for (const auto& edit : shiftable_aln[i])  {
+                                cerr << '\t' << edit.from_length << ", " << edit.to_length << ", " << edit.is_match << ", " << debug_seq_idx << ", " << debug_node_idx << ", " << seq.substr(debug_seq_idx, edit.to_length) << ", " << aligned_seqs[i].substr(debug_node_idx, edit.from_length) << endl;
+                                debug_node_idx += edit.from_length;
+                                debug_seq_idx += edit.to_length;
+                            }
+                        }
+                        cerr << "j " << j << ", ni " << node_idx << ", si " << seq_idx << ", ed " << it->checked().from_length << ", " << it->checked().to_length << ", "  << it->checked().is_match << endl;
+#endif
+                    }
+
+                    // move back to insertion run and dispatch a right shift
+                    size_t i = j;
+                    auto edit_it = it;
+                    advance(i, edit_it);
+                    dispatch_shift(i, edit_it, seq_idx, i == j ? node_idx : 0, false);
+                    in_insertion_run = false;
+                }
+
+                in_deletion_run = true;
+            }
+
+            seq_idx -= it->checked().to_length;
+            node_idx -= it->checked().from_length;
+        }
+    }
+
+    if (in_deletion_run || in_insertion_run) {
+        // dispatch the last run that wasn't triggered by an alternation in type
+#ifdef debug_indel_adjustment
+        cerr << "final dispatch" << endl;
+#endif
+        dispatch_shift(0, shiftable_aln.front().begin(), 0, 0, in_deletion_run);
+    }
+
+    if (!did_a_shift) {
+        // no need to re-translate the path
+        return;
+    }
+
+    // indels may have moved to the end of the alignment, which can mess up softclipping and position semantics
+    {
+        // find a non-empty mapping
+        int64_t i = shiftable_aln.size() - 1;
+        auto it = shiftable_aln[i].end();
+        while (it == shiftable_aln[i].begin()) {
+            --i;
+            it = shiftable_aln[i].end();
+        }
+        // look at the final edit
+        --it;
+        size_t softclip_len = 0;
+#ifdef debug_indel_adjustment
+        cerr << "found non-empty mapping at " << i << ", fl " << it->checked().from_length << ", tl " << it->checked().to_length << ", im? " << it->checked().is_match << endl;
+#endif
+        if (it->checked().from_length == 0) {
+            // there is a softclip, erase it so we can make sure it gets added back in the right place
+            softclip_len = it->checked().to_length;
+            auto clip = it;
+            if (it == shiftable_aln[i].begin()) {
+                --i;
+                it = shiftable_aln[i].end();
+            }
+            --it;
+#ifdef debug_indel_adjustment
+            cerr << "erasing clip" << endl;
+#endif
+            //shiftable_aln[i].erase(clip);
+            tombstone_erase(shiftable_aln[i], clip);
+        }
+        while (true) {
+#ifdef debug_indel_adjustment
+            cerr << "check for hanging deletions on " << i << ", " << it->checked().from_length << ", tl " << it->checked().to_length << ", im? " << it->checked().is_match << endl;
+#endif
+            if (it->checked().from_length == it->checked().to_length || (preserve_end_pos && it->checked().from_length != 0)) {
+                // we found an aligned base, reposition the softclip if necessary
+#ifdef debug_indel_adjustment
+                cerr << "match" << endl;
+#endif
+                if (softclip_len > 0) {
+                    shiftable_aln[i].emplace_back(0, softclip_len, false);
+                }
+                break;
+            }
+            else if (it->checked().to_length == 0) {
+#ifdef debug_indel_adjustment
+                cerr << "deletion length " << it->checked().from_length << endl;
+#endif
+                if (adjust_left) {
+                    // we're removing reference bases, which will affect the position
+                    get_offset(mapping_positions[i]) += it->checked().from_length;
+                }
+            }
+            else {
+                // we will accumulate this insertion into the softclip
+#ifdef debug_indel_adjustment
+                cerr << "extra softclip" << endl;
+#endif
+                softclip_len += it->checked().to_length;
+            }
+            auto eraser = it;
+            int64_t e = i;
+#ifdef debug_indel_adjustment
+            cerr << "erase " << i << ", " << eraser->from_length << ", " << eraser->to_length << ", " << eraser->is_match << endl;
+#endif  
+            if (it == shiftable_aln[i].begin()) {
+                --i;
+                it = shiftable_aln[i].end();
+            }
+            --it;
+            tombstone_erase(shiftable_aln[e], eraser);
+        }
+    }
+
+#ifdef debug_indel_adjustment
+    cerr << "finished handling clips" << endl;
+#endif
+
+    if (adjust_left) {
+        // un-reverse the alignment for reconstruction
+        reverse(shiftable_aln.begin(), shiftable_aln.end());
+        for (auto& mapping : shiftable_aln) {
+            mapping.reverse();
+        }
+        reverse(mapping_positions.begin(), mapping_positions.end());
+    }
+
+    // clear out the old alignment path
+    path.Clear();
+    // replace it by reconstructing the shifted path
+    seq_idx = 0;
+    for (size_t i = 0; i < shiftable_aln.size(); ++i) {
+        if (shiftable_aln[i].empty()) {
+            continue;
+        }
+        auto mapping = path.add_mapping();
+        mapping->set_rank(path.mapping_size());
+        auto position = mapping->mutable_position();
+        const auto& shift_pos = mapping_positions[i];
+        position->set_node_id(id(shift_pos));
+        position->set_is_reverse(is_rev(shift_pos));
+        position->set_offset(offset(shift_pos));
+
+        for (const auto& shift_edit : shiftable_aln[i]) {
+            auto edit = mapping->add_edit();
+            edit->set_from_length(shift_edit.from_length);
+            edit->set_to_length(shift_edit.to_length);
+            if (shift_edit.from_length == 0 || !shift_edit.is_match) {
+                edit->set_sequence(aln.sequence().substr(seq_idx, shift_edit.to_length));
+            }
+            seq_idx += shift_edit.to_length;
+        }
+    }
+}
+
+vector<pair<int, char>> graph_cigar(const Alignment& aln, bool rev_strand) {
+    vector<pair<int, char>> cigar;
+    const auto& path = aln.path();
+    for (size_t i = 0; i < path.mapping_size(); ++i) {
+        const auto& mapping = path.mapping(i);
+        for (size_t j = 0; j < mapping.edit_size(); ++j) {
+            const auto& edit = mapping.edit(j);
+            char op;
+            int len;
+            if (edit.from_length() == edit.to_length()) {
+                if (!edit.sequence().empty()) {
+                    op = 'X';
+                }
+                else {
+                    op = '=';
+                }
+                len = edit.from_length();
+            }
+            else if (edit.from_length() != 0) {
+                op = 'D';
+                len = edit.from_length();
+            }
+            else {
+                if ((i == 0 && j == 0) ||
+                    (i + 1 == path.mapping_size() && j + 1 == mapping.edit_size())) {
+                    op = 'S';
+                }
+                else {
+                    op = 'I';
+                }
+                len = edit.to_length();
+            }
+            
+            if (!cigar.empty() && cigar.back().second == op) {
+                cigar.back().first += len;
+            }
+            else {
+                cigar.emplace_back(len, op);
+            }
+        }
+    }
+    
+    // TODO: use this for the I/D merging, but it's overkill for the
+    // adjacent operations
+    simplify_cigar(cigar);
+    
+    if (rev_strand) {
+        reverse(cigar.begin(), cigar.end());
+    }
+    
+    return cigar;
+}
+
+string graph_CS_cigar_internal(const Alignment& aln, const HandleGraph& graph, bool rev_strand, bool verbose_format) {
+    
+    // states that can be extended across edits (except null)
+    enum Operation {Null, Match, Insert, Delete};
+        
+    stringstream strm;
+    
+    const auto& path = aln.path();
+    const auto& seq = aln.sequence();
+    
+    Operation curr_op = Null;
+    size_t read_idx = rev_strand ? seq.size() : 0;
+    size_t match_len = 0;
+    int64_t incr = rev_strand ? -1 : 1;
+    for (int64_t i = rev_strand ? aln.path().mapping_size() - 1 : 0; i < aln.path().mapping_size() && i >= 0; i += incr) {
+        const auto& mapping = path.mapping(i);
+        const auto& pos = mapping.position();
+        handle_t handle = graph.get_handle(pos.node_id(), pos.is_reverse());
+        size_t offset = pos.offset();
+        if (rev_strand) {
+            offset += mapping_from_length(mapping);
+        }
+        for (int64_t j = rev_strand ? mapping.edit_size() - 1 : 0; j < mapping.edit_size() && j >= 0; j += incr) {
+            const auto& edit = mapping.edit(j);
+            if (edit.from_length() == edit.to_length()) {
+                // aligned base
+                if (edit.sequence().empty()) {
+                    if (curr_op != Match) {
+                        strm << (verbose_format ? '=' : ':');
+                        curr_op = Match;
+                    }
+                    if (verbose_format) {
+                        if (rev_strand) {
+                            strm << reverse_complement(seq.substr(read_idx - edit.to_length(), edit.to_length()));
+                        }
+                        else {
+                            strm << seq.substr(read_idx, edit.to_length());
+                        }
+                    }
+                    else {
+                        match_len += edit.to_length();
+                    }
+                }
+                else {
+                    if (match_len != 0) {
+                        strm << match_len;
+                        match_len = 0;
+                    }
+                    string graph_subseq = graph.get_subsequence(handle, offset - (rev_strand ? edit.from_length(): 0),
+                                                                edit.from_length());
+                    for (int64_t k = rev_strand ? edit.from_length() - 1 : 0; k < edit.from_length() && k >= 0; k += incr) {
+                        char gnt = graph_subseq[k];
+                        char rnt = seq[read_idx + k - (rev_strand ? edit.from_length() : 0)];
+                        if (rev_strand) {
+                            gnt = reverse_complement(gnt);
+                            rnt = reverse_complement(rnt);
+                        }
+                        strm << '*' << gnt;
+                        if (verbose_format) {
+                            strm << "->";
+                        }
+                        strm << rnt;
+                    }
+                    curr_op = Null;
+                }
+            }
+            else if (edit.from_length() != 0) {
+                // deletion
+                if (curr_op != Delete) {
+                    if (match_len != 0) {
+                        strm << match_len;
+                        match_len = 0;
+                    }
+                    strm << '-';
+                    curr_op = Delete;
+                }
+                if (rev_strand) {
+                    strm << reverse_complement(graph.get_subsequence(handle, offset - edit.from_length(), edit.from_length()));
+                }
+                else {
+                    strm << graph.get_subsequence(handle, offset, edit.from_length());
+                }
+            }
+            else if (edit.to_length() != 0) {
+                // insertion
+                if (curr_op != Insert) {
+                    if (match_len != 0) {
+                        strm << match_len;
+                        match_len = 0;
+                    }
+                    strm << '+';
+                    curr_op = Insert;
+                }
+                if (rev_strand) {
+                    strm << reverse_complement(seq.substr(read_idx - edit.to_length(), edit.to_length()));
+                }
+                else {
+                    strm << seq.substr(read_idx, edit.to_length());
+                }
+            }
+            read_idx += edit.to_length() * incr;
+            offset += edit.from_length() * incr;
+        }
+    }
+    if (match_len != 0) {
+        strm << match_len;
+        match_len = 0;
+    }
+    return strm.str();
+}
+
+string graph_CS_cigar(const Alignment& aln, const HandleGraph& graph, bool rev_strand) {
+    return graph_CS_cigar_internal(aln, graph, rev_strand, true);
+}
+string graph_cs_cigar(const Alignment& aln, const HandleGraph& graph, bool rev_strand) {
+    return graph_CS_cigar_internal(aln, graph, rev_strand, false);
+}
+
 pair<int32_t, int32_t> compute_template_lengths(const int64_t& pos1, const vector<pair<int, char>>& cigar1,
     const int64_t& pos2, const vector<pair<int, char>>& cigar2) {
 
@@ -1118,14 +2854,20 @@ pair<int32_t, int32_t> compute_template_lengths(const int64_t& pos1, const vecto
         int64_t here = pos;
         for (auto& item : cigar) {
             // Trace along the cigar
-            if (item.second == 'M') {
-                // Bases are matched. Count them in the bounds and execute the operation
-                low = min(low, here);
-                here += item.first;
-                high = max(high, here);
-            } else if (item.second == 'D') {
-                // Only other way to advance in the reference
-                here += item.first;
+            switch (item.second) {
+                case 'M':
+                case 'X':
+                case '=':
+                    // Bases are matched or mismatched. Count them in the bounds and execute the operation
+                    low = min(low, here);
+                    high = max(high, here + item.first);
+                    // Fall through.
+                case 'D':
+                case 'N':
+                    // Even for deletions/gaps, we advance on the reference.
+                    here += item.first;
+                    break;
+                // Inserts and various clips/paddings don't do anything.
             }
         }
         
@@ -1134,19 +2876,17 @@ pair<int32_t, int32_t> compute_template_lengths(const int64_t& pos1, const vecto
     
     auto bounds1 = find_bounds(pos1, cigar1);
     auto bounds2 = find_bounds(pos2, cigar2);
+
+    // We wanted the distance between the outermost points. So find them.
+    auto min_start = std::min(bounds1.first, bounds2.first);
+    auto max_end = std::max(bounds1.second, bounds2.second);
+    // And find the distance
+    int32_t dist = max_end - min_start;
     
-    // Compute the separation
-    int32_t dist = 0;
-    if (bounds1.first < bounds2.second) {
-        // The reads are in order
-        dist = bounds2.second - bounds1.first;
-    } else if (bounds2.first < bounds1.second) {
-        // The reads are out of order so the other bounds apply
-        dist = bounds1.second - bounds2.first;
-    }
-    
-    if (pos1 < pos2) {
-        // Count read 1 as the overall "leftmost", so its value will be positive
+    if (bounds1.first < bounds2.first || (bounds1.first == bounds2.first && bounds1.second < bounds2.second)) {
+        // Count read 1 as the overall "leftmost" if it starts earlier or
+        // starts at the same point and ends earlier, so its value will be
+        // positive
         return make_pair(dist, -dist);
     } else {
         // Count read 2 as the overall leftmost
@@ -1176,7 +2916,7 @@ int32_t sam_flag(const Alignment& alignment, bool on_reverse_strand, bool paired
         // TODO: catch reads with pair partners when they shouldn't be paired?
     }
 
-    if (!alignment.has_path() || alignment.path().mapping_size() == 0) {
+    if (!is_mapped(alignment)) {
         // unmapped
         flag |= BAM_FUNMAP;
     } 
@@ -1190,11 +2930,101 @@ int32_t sam_flag(const Alignment& alignment, bool on_reverse_strand, bool paired
     return flag;
 }
 
+vector<string> bam_tag_strings(const bam1_t* b) {
+    vector<string> tag_strings;
+    
+    for (uint8_t* aux = bam_aux_first(b); aux != NULL; aux = bam_aux_next(b, aux)) {
+        // For each aux field (i.e. tag)
+        tag_strings.emplace_back();
+        auto& tag_string = tag_strings.back();
+        tag_string.reserve(6);
+        // We know that this returns a pointer to 2 characters in a row, with
+        // no null terminator. We smuggle it into an array type by thinking of
+        // the const char* as a pointer-to-an-array and then dereferencing
+        // that, as suggested by helpful robots.
+        const char (&tag)[2] = *reinterpret_cast<const char (*)[2]>(bam_aux_tag(aux));
+        char type = bam_aux_type(aux);
+        tag_string.push_back(tag[0]);
+        tag_string.push_back(tag[1]);
+        tag_string.push_back(':');
+        tag_string.push_back(type);
+        tag_string.push_back(':');
+        switch (type) {
+            case 'A':
+                // Handle single characters
+                tag_string.push_back(bam_aux2A(aux));
+                break;
+            case 'c':
+            case 'C':
+            case 's':
+            case 'S':
+            case 'i':
+            case 'I':
+                // Handle any integral number (with fall-through)
+                tag_string.append(std::to_string(bam_aux2i(aux)));
+                break;
+            case 'f':
+                // Handle a float
+                tag_string.append(std::to_string(bam_aux2f(aux)));
+                break;
+            case 'H':
+            case 'Z':
+                // Handle string data (with fall-through)
+                tag_string.append(bam_aux2Z(aux));
+                break;
+            case 'B':
+            {
+                // Handle arrays, which can actually only be of integral or float types.
+                uint32_t arr_len = bam_auxB_len(aux);
+                // Get the type of the items *in* the array. There's no
+                // dedicated accessor to do this, but the htslib example code
+                // does it this way. See
+                // <https://github.com/samtools/htslib/blob/d677f345fe35d451587319ca38ac611862a46e1b/samples/read_aux.c#L91>
+                char arr_type = bam_aux_type(aux + 1);
+                // Include the type of the array data
+                tag_string.push_back(arr_type);
+                stringstream strm;
+                switch (arr_type) {
+                    case 'c':
+                    case 'C':
+                    case 's':
+                    case 'S':
+                    case 'i':
+                    case 'I':
+                        for (uint32_t i = 0; i < arr_len; i++) {
+                            strm << "," << bam_auxB2i(aux, i);
+                        }
+                        tag_string.append(strm.str());
+                        break;
+                    case 'f':
+                        strm << setprecision(8); // lossless for 32-bit float
+                        for (uint32_t i = 0; i < arr_len; i++) {
+                            strm << "," << bam_auxB2f(aux, i);
+                        }
+                        tag_string.append(strm.str());
+                        break;
+                    default:
+                        cerr << "error: invalid BAM array type '" << arr_type << "' (" << (int)arr_type << ") for 'B' type tag '" << tag[0] << tag[1] << "'" << endl;
+                        exit(1);
+                        break;
+                }
+                break;
+            }
+            default:
+                cerr << "error: invalid BAM tag type '" << type << "' (" << (int)type << ") for tag '" << tag[0] << tag[1] << "'" << endl;
+                exit(1);
+                break;
+        }
+    }
+    return tag_strings;
+}
+
 Alignment bam_to_alignment(const bam1_t *b,
                            const map<string, string>& rg_sample,
                            const map<int, path_handle_t>& tid_path_handle,
                            const bam_hdr_t *bh,
-                           const PathPositionHandleGraph* graph) {
+                           const PathPositionHandleGraph* graph,
+                           bool set_missing_contig_to_unmapped) {
 
     Alignment alignment;
 
@@ -1210,18 +3040,6 @@ Alignment bam_to_alignment(const bam1_t *b,
     uint8_t* seqptr = bam_get_seq(b);
     for (int i = 0; i < lqseq; ++i) {
         sequence[i] = "=ACMGRSVTWYHKDBN"[bam_seqi(seqptr, i)];
-    }
-
-    // get the read group and sample name
-    uint8_t *rgptr = bam_aux_get(b, "RG");
-    string read_group;
-    string sname;
-    if (rgptr && !rg_sample.empty()) {
-        read_group = string((char*) (rgptr+1));
-        auto found = rg_sample.find(read_group);
-        if (found != rg_sample.end()) {
-            sname = found->second; 
-        }
     }
 
     // Now name the read after the scaffold
@@ -1257,25 +3075,81 @@ Alignment bam_to_alignment(const bam1_t *b,
         alignment.set_quality(quality);
         
     }
+    alignment.set_read_paired((b->core.flag & BAM_FPAIRED) != 0);
+
+    // Consult the One True Place in SAM for knowing if a read is aligned or not.
+    bool is_aligned = !(b->core.flag & BAM_FUNMAP);
     
-    if (graph != nullptr && bh != nullptr && b->core.tid >= 0) {
-        alignment.set_mapping_quality(b->core.qual);
+    if (is_aligned && graph != nullptr && bh != nullptr && b->core.tid >= 0) {
+        // We may be able to actually build the path for this read.
         // Look for the path handle this is against.
         auto found = tid_path_handle.find(b->core.tid);
         if (found == tid_path_handle.end()) {
-            cerr << "[vg::alignment.cpp] error: alignment references path not present in graph: "
-                 << bh->target_name[b->core.tid] << endl;
-            exit(1);
+            if (set_missing_contig_to_unmapped) {
+                // Pretend that it is unmapped.
+                is_aligned = false;
+            } else {
+                // We're not allowed to see nonexistent references.
+                cerr << "[vg::alignment.cpp] error: alignment references path not present in graph: "
+                        << bh->target_name[b->core.tid] << endl;
+                exit(1);
+            }
+        } else {
+            mapping_against_path(alignment, b, found->second, graph, b->core.flag & BAM_FREVERSE);
         }
-        mapping_against_path(alignment, b, found->second, graph, b->core.flag & BAM_FREVERSE);
+    }
+    // If we still consider it aligned
+    if (is_aligned) {
+        // Set the little-used GAM field that exists to represent this.
+        alignment.set_read_mapped(is_aligned);
+
+        // Use the MAPQ
+        alignment.set_mapping_quality(b->core.qual);
     }
     
     // TODO: htslib doesn't wrap this flag for some reason.
     alignment.set_is_secondary(b->core.flag & BAM_FSECONDARY);
-    if (!sname.empty()) {
-        alignment.set_sample_name(sname);
-        // We know the sample name came from a read group
-        alignment.set_read_group(read_group);
+    
+    // get the tags
+    auto tags = bam_tag_strings(b);
+    // handle the tags that are given special fields in GAM
+    size_t removed = 0;
+    for (size_t i = 0; i < tags.size(); ++i) {
+        auto& tag = tags[i];
+        auto tag_name = tag.substr(0, 2);
+        if (tag_name == "RG") {
+            string read_group = tag.substr(5, string::npos);
+            alignment.set_read_group(read_group);
+            auto it = rg_sample.find(read_group);
+            if (it != rg_sample.end()) {
+                alignment.set_sample_name(it->second);
+            }
+            ++removed;
+        }
+        else if (tag_name == "AS" && is_aligned) {
+            // Set the score, for aligned reads.
+            alignment.set_score(parse<int64_t>(tag.substr(5, string::npos)));
+            ++removed;
+        }
+        else if (removed != 0) {
+            tags[i - removed] = std::move(tag);
+        }
+    }
+    
+    if (removed != 0) {
+        tags.resize(tags.size() - removed);
+    }
+    
+    // save the other tags as an annotation
+    if (!tags.empty()) {
+        string joined_tags;
+        for (size_t i = 0; i < tags.size(); ++i) {
+            if (i) {
+                joined_tags.push_back('\t');
+            }
+            joined_tags.append(tags[i]);
+        }
+        set_annotation(alignment, "tags", joined_tags);
     }
 
     return alignment;
@@ -1370,7 +3244,68 @@ Alignment alignment_middle(const Alignment& aln, int len) {
     return strip_from_start(strip_from_end(aln, trim), trim);
 }
 
-vector<Alignment> reverse_complement_alignments(const vector<Alignment>& alns, const function<int64_t(int64_t)>& node_length) {
+std::vector<Alignment> alignment_pieces_within(const Alignment& aln, const std::function<bool(nid_t)>& node_in_set) {
+
+    std::vector<Alignment> pieces;
+
+    Path piece_path;
+    std::stringstream piece_seq;
+    std::stringstream piece_qual;
+
+    auto emit_piece = [&]() {
+         // Emit the partial alignment.
+        pieces.emplace_back();
+        
+        *pieces.back().mutable_path() = std::move(piece_path);
+        piece_path.clear_mapping();
+        
+        pieces.back().set_sequence(piece_seq.str());
+        // Reset the stringstream.
+        // Don't bother with clear() since we aren't reading from it.
+        // See <https://stackoverflow.com/a/20792>
+        piece_seq.str(std::string());
+
+        if (!aln.quality().empty()) {
+            pieces.back().set_quality(piece_qual.str());
+            piece_qual.str(std::string());
+        }
+        
+        // Preserve name and MAPQ, but discard everything else.
+        pieces.back().set_name(aln.name());
+        pieces.back().set_mapping_quality(aln.mapping_quality());
+    };
+
+    size_t to_offset = 0;
+    for (size_t i = 0; i < aln.path().mapping_size(); i++) {
+        const Mapping& here = aln.path().mapping(i);
+        nid_t node_id = here.position().node_id();
+        auto to_length = mapping_to_length(here);
+        if (node_in_set(node_id)) {
+            // This node is still in the set, so extend the current alignment
+            piece_seq << aln.sequence().substr(to_offset, to_length);
+            if (!aln.quality().empty()) {
+                piece_qual << aln.quality().substr(to_offset, to_length);
+            }
+            *piece_path.add_mapping() = here;
+        } else if (piece_path.mapping_size() > 0) {
+            // We have left the set just now.
+            emit_piece();
+        }
+        to_offset += to_length;
+    }
+
+    if (pieces.size() == 0 && piece_path.mapping_size() == aln.path().mapping_size()) {
+        // We never left the target region, so just emit the full input alignment wiht all its annotations.
+        pieces.emplace_back(aln);
+    } else if (piece_path.mapping_size() > 0) {
+        // Emit the last partial piece
+        emit_piece();
+    }
+
+    return pieces;
+}
+
+vector<Alignment> reverse_complement_alignments(const vector<Alignment>& alns, const function<int64_t(nid_t)>& node_length) {
     vector<Alignment> revalns;
     for (auto& aln : alns) {
         revalns.push_back(reverse_complement_alignment(aln, node_length));
@@ -1379,7 +3314,7 @@ vector<Alignment> reverse_complement_alignments(const vector<Alignment>& alns, c
 }
 
 Alignment reverse_complement_alignment(const Alignment& aln,
-                                       const function<int64_t(id_t)>& node_length) {
+                                       const function<int64_t(nid_t)>& node_length) {
     // We're going to reverse the alignment and all its mappings.
     // TODO: should we/can we do this in place?
     
@@ -1401,7 +3336,7 @@ Alignment reverse_complement_alignment(const Alignment& aln,
 }
     
 void reverse_complement_alignment_in_place(Alignment* aln,
-                                           const function<int64_t(id_t)>& node_length) {
+                                           const function<int64_t(nid_t)>& node_length) {
 
     reverse_complement_in_place(*aln->mutable_sequence());
     string* quality = aln->mutable_quality();
@@ -1479,7 +3414,7 @@ Alignment merge_alignments(const Alignment& a1, const Alignment& a2, bool debug)
     return a3;
 }
 
-void translate_nodes(Alignment& a, const unordered_map<id_t, pair<id_t, bool> >& ids, const std::function<size_t(int64_t)>& node_length) {
+void translate_nodes(Alignment& a, const unordered_map<nid_t, pair<nid_t, bool> >& ids, const std::function<size_t(int64_t)>& node_length) {
     Path* path = a.mutable_path();
     for(size_t i = 0; i < path->mapping_size(); i++) {
         // Grab each mapping (includes its position)
@@ -1541,27 +3476,11 @@ int non_match_end(const Alignment& alignment) {
 }
 
 int softclip_start(const Alignment& alignment) {
-    if (alignment.path().mapping_size() > 0) {
-        auto& path = alignment.path();
-        auto& first_mapping = path.mapping(0);
-        auto& first_edit = first_mapping.edit(0);
-        if (first_edit.from_length() == 0 && first_edit.to_length() > 0) {
-            return first_edit.to_length();
-        }
-    }
-    return 0;
+    return softclip_start(alignment.path());
 }
 
 int softclip_end(const Alignment& alignment) {
-    if (alignment.path().mapping_size() > 0) {
-        auto& path = alignment.path();
-        auto& last_mapping = path.mapping(path.mapping_size()-1);
-        auto& last_edit = last_mapping.edit(last_mapping.edit_size()-1);
-        if (last_edit.from_length() == 0 && last_edit.to_length() > 0) {
-            return last_edit.to_length();
-        }
-    }
-    return 0;
+    return softclip_end(alignment.path());
 }
 
 int softclip_trim(Alignment& alignment) {
@@ -1577,6 +3496,94 @@ int softclip_trim(Alignment& alignment) {
     // Trim the path
     *alignment.mutable_path() = trim_hanging_ends(alignment.path());
     return cut_start + cut_end;
+}
+
+bool is_perfect(const Alignment& alignment) {
+    // Non-aligned paths can't be perfect
+    if (!is_mapped(alignment)) return false;
+
+    // Check that the path is perfect
+    for (size_t i = 0; i < alignment.path().mapping_size(); ++i) {
+        auto& mapping = alignment.path().mapping(i);
+        if (!mapping_is_match(mapping)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_supplementary(const Alignment& alignment) {
+    if (!has_annotation(alignment, "supplementary")) {
+        return false;
+    }
+    else {
+        return get_annotation<bool>(alignment, "supplementary");
+    }
+}
+
+pair<int64_t, int64_t> aligned_interval(const Alignment& aln) {
+    return pair<int64_t, int64_t>(softclip_start(aln), aln.sequence().size() - softclip_end(aln));
+}
+
+
+string mate_info(const string& path, int32_t pos, bool rev_strand, bool is_read1) {
+    subrange_t subrange;
+    string path_name = Paths::strip_subrange(path, &subrange);
+    if (subrange != PathMetadata::NO_SUBRANGE) {
+        pos += subrange.first;
+    }
+    string info;
+    info.append(path_name);
+    info.push_back('\t');
+    info.append(to_string(pos));
+    info.push_back('\t');
+    info.push_back(rev_strand ? '1' : '0');
+    info.push_back(is_read1 ? '1' : '0');
+    return info;
+}
+
+tuple<string, int32_t, bool, bool> parse_mate_info(const string& info) {
+    tuple<string, int64_t, bool, bool> parsed;
+    size_t i = 0;
+    while (info[i] != '\t') {
+        ++i;
+    }
+    get<0>(parsed) = info.substr(0, i);
+    ++i;
+    size_t j = i;
+    while (info[j] != '\t') {
+        ++j;
+    }
+    get<1>(parsed) = stoi(info.substr(i, j - i));
+    get<2>(parsed) = info[j + 1] == '1';
+    get<3>(parsed) = info[j + 2] == '1';
+    return parsed;
+}
+
+bool is_mapped(const Alignment& alignment) {
+    if (alignment.read_mapped()) {
+        // The flag for being mapped is set.
+        return true;
+    }
+
+    // Otherwise it's not set, but we don't consistently set it in vg. (SAM
+    // uses an *un*mapped flag so you don't forget to set it on mapped reads
+    // ever.) So second-guess the flag and up on round-tripping SAM with
+    // alignment fields set for unmapped reads.
+    
+    if (alignment.path().mapping_size() > 0) {
+        // If an alignment path is filled in, it is mapped.
+        return true;
+    }
+
+    if (alignment.score() > 0) {
+        // If there's no alignment actually there but anonzero score, we
+        // represent a mapped read, we're just not sure where to.
+        return true;
+    }
+
+    // If there's no evidence of being mapped, we're unmapped.
+    return false;
 }
 
 int query_overlap(const Alignment& aln1, const Alignment& aln2) {
@@ -1852,8 +3859,8 @@ void convert_Ts_to_Us(Alignment& alignment) {
     convert_alignment_char(alignment, 'T', 'U');
 }
 
-map<id_t, int> alignment_quality_per_node(const Alignment& aln) {
-    map<id_t, int> quals;
+map<nid_t, int> alignment_quality_per_node(const Alignment& aln) {
+    map<nid_t, int> quals;
     int to_pos = 0; // offset in quals
     for (size_t i = 0; i < aln.path().mapping_size(); ++i) {
         auto& mapping = aln.path().mapping(i);
@@ -2538,9 +4545,34 @@ void alignment_set_distance_to_correct(Alignment& aln, const map<string ,vector<
     }
 }
 
+void check_quality_length(const Alignment& aln) {
+    size_t quality_length = aln.quality().length();
+    if (quality_length == 0 || quality_length == aln.sequence().length()) {
+        // This length is acceptable.
+        return;
+    }
+
+    bool too_short = quality_length < aln.sequence().length();
+
+    std::stringstream ss;
+    ss << "Read " << aln.name() << " has " << aln.sequence().length() << " bases of sequence but ";
+    if (too_short) {
+        ss << "only ";
+    }
+    ss << quality_length << " base quality values.";
+    if (too_short) {
+        ss << " Was the quality information truncated?";
+    }
+    
+    #pragma omp critical (cerr)
+    std::cerr << "error [vg::alignment.cpp]: " << ss.str() << std::endl;
+    exit(1);
+}
+
 AlignmentValidity alignment_is_valid(const Alignment& aln, const HandleGraph* hgraph, bool check_sequence) {
     size_t read_idx = 0;
     for (size_t i = 0; i < aln.path().mapping_size(); ++i) {
+        // Make sure the node exists
         const Mapping& mapping = aln.path().mapping(i);
         if (!hgraph->has_node(mapping.position().node_id())) {
             std::stringstream ss;
@@ -2548,47 +4580,97 @@ AlignmentValidity alignment_is_valid(const Alignment& aln, const HandleGraph* hg
             return {
                 AlignmentValidity::NODE_MISSING,
                 i,
+                0,
+                read_idx,
                 ss.str()
             };
         }
-        size_t node_len = hgraph->get_length(hgraph->get_handle(mapping.position().node_id()));
-        if (mapping_from_length(mapping) + mapping.position().offset() > node_len) {
-            std::stringstream ss;
-            ss << "Length of node "
-               << mapping.position().node_id() << " (" << node_len << ") exceeded by Mapping with offset "
-               << mapping.position().offset() << " and from-length " << mapping_from_length(mapping);
-            return {
-                AlignmentValidity::NODE_TOO_SHORT,
-                i,
-                ss.str()
-            };
-        }
+        // Make sure the Mapping stays inside the node
+        auto node_handle = hgraph->get_handle(mapping.position().node_id(), mapping.position().is_reverse());
+        size_t node_idx = mapping.position().offset();
+        std::string node_seq;
+        size_t node_len;
         if (check_sequence) {
-            size_t node_idx = mapping.position().offset();
-            auto node_seq = hgraph->get_sequence(hgraph->get_handle(mapping.position().node_id(),
-                                                                    mapping.position().is_reverse()));
-            for (size_t j = 0; j < mapping.edit_size(); ++j) {
-                const auto& edit = mapping.edit(j);
+            node_seq = hgraph->get_sequence(hgraph->get_handle(mapping.position().node_id(),
+                                                               mapping.position().is_reverse()));
+            node_len = node_seq.size();
+        } else {
+            node_len = hgraph->get_length(node_handle);
+        }
+        for (size_t j = 0; j < mapping.edit_size(); ++j) {
+            const auto& edit = mapping.edit(j);
+
+            // We always check for node length overruns even if we don't check the sequence.
+            if (node_idx + edit.from_length() > node_len) {
+                std::stringstream ss;
+                ss << "Length of node "
+                   << mapping.position().node_id() << " (" << node_len << ") exceeded by Mapping with offset "
+                   << mapping.position().offset() << " and from-length " << mapping_from_length(mapping);
+                return {
+                    AlignmentValidity::NODE_TOO_SHORT,
+                    i,
+                    j,
+                    read_idx,
+                    ss.str()
+                };
+            }
+
+            if (check_sequence) {
+
+                if (read_idx + edit.to_length() > aln.sequence().size()) {
+                    std::stringstream ss;
+                    ss << "Length of read sequence (" << aln.sequence().size()
+                       << ") exceeded by Mapping with to-length " << mapping_to_length(mapping);
+                    return {
+                        AlignmentValidity::READ_TOO_SHORT,
+                        i,
+                        j,
+                        read_idx,
+                        ss.str()
+                    };
+                }
+
                 if (edit.to_length() == edit.from_length() && edit.from_length() != 0) {
-                    assert(edit.sequence().size() == edit.to_length() || edit.sequence().empty());
+                    if (edit.sequence().size() != edit.to_length() && !edit.sequence().empty()) {
+                        std::stringstream ss;
+                        ss << "Edit has sequence \"" << edit.sequence()
+                           << "\" of length " << edit.sequence().size() << " but a to length of "
+                           << edit.to_length();
+                        return {
+                            AlignmentValidity::BAD_EDIT,
+                            i,
+                            j,
+                            read_idx,
+                            ss.str()
+                        };
+                    }
                     for (size_t k = 0; k < edit.to_length(); ++k) {
                         // check match/mismatch state between read and ref
                         if ((aln.sequence()[read_idx + k] == node_seq[node_idx + k]) != edit.sequence().empty()) {
                             std::stringstream ss;
-                            ss << "Edit erroneously claims " << (edit.sequence().empty() ? "match" : "mismatch") << " on node " << mapping.position().node_id() << " between node position " << (node_idx + k) << " and edit " << j << ", position " << k << " on " << (mapping.position().is_reverse() ? "reverse" : "forward") << " strand";
+                            ss << "Edit erroneously claims " << (edit.sequence().empty() ? "match" : "mismatch")
+                               << " on node " << mapping.position().node_id() << " between node position "
+                               << (node_idx + k) << " and edit " << j << ", position " << k << " on "
+                               << (mapping.position().is_reverse() ? "reverse" : "forward") << " strand";
                             return {
                                 AlignmentValidity::SEQ_DOES_NOT_MATCH,
                                 i,
+                                j,
+                                read_idx + k,
                                 ss.str()
                             };
                         }
                         if (!edit.sequence().empty() && edit.sequence()[k] != aln.sequence()[read_idx + k]) {
                             // compare mismatched sequence to the read
                             std::stringstream ss;
-                            ss << "Edit sequence (" << edit.sequence() << ") at position " << k << " does not match read sequence (" << aln.sequence() << ") at position " << (read_idx + k);
+                            ss << "Edit sequence (" << edit.sequence() << ") at position " << k
+                               << " does not match read sequence (" << aln.sequence() << ") at position "
+                               << (read_idx + k);
                             return {
                                 AlignmentValidity::SEQ_DOES_NOT_MATCH,
                                 i,
+                                j,
+                                read_idx + k,
                                 ss.str()
                             };
                         }
@@ -2596,26 +4678,54 @@ AlignmentValidity alignment_is_valid(const Alignment& aln, const HandleGraph* hg
                 }
                 else if (edit.from_length() == 0 && edit.to_length() != 0) {
                     // compare inserted sequence to read
-                    assert(edit.sequence().size() == edit.to_length());
+                    if (edit.sequence().size() != edit.to_length()) {
+                        std::stringstream ss;
+                        ss << "Edit has sequence \"" << edit.sequence()
+                           << "\" of length " << edit.sequence().size() << " but a to length of "
+                           << edit.to_length();
+                        return {
+                            AlignmentValidity::BAD_EDIT,
+                            i,
+                            j,
+                            read_idx,
+                            ss.str()
+                        };
+                    }
                     for (size_t k = 0; k < edit.to_length(); ++k) {
                         if (edit.sequence()[k] != aln.sequence()[read_idx + k]) {
                             std::stringstream ss;
-                            ss << "Read sequence (" << aln.sequence() << ") at position " << (read_idx + k) << " does not match insert sequence of edit (" << edit.sequence() << ") at position " << k;
+                            ss << "Read sequence (" << aln.sequence() << ") at position " << (read_idx + k)
+                               << " does not match insert sequence of edit (" << edit.sequence()
+                               << ") at position " << k;
                             return {
                                 AlignmentValidity::SEQ_DOES_NOT_MATCH,
                                 i,
+                                j,
+                                read_idx + k,
                                 ss.str()
                             };
                         }
                     }
                 }
                 else {
-                    assert(edit.from_length() != 0 && edit.to_length() == 0);
+                    if (edit.from_length() == 0 || edit.to_length() != 0) {
+                        std::stringstream ss;
+                        ss << "Edit has sequence \"" << edit.sequence()
+                           << "\" of length " << edit.sequence().size() << " and unacceptable combination of to length "
+                           << edit.to_length() << " and from length " << edit.from_length();
+                        return {
+                            AlignmentValidity::BAD_EDIT,
+                            i,
+                            j,
+                            read_idx,
+                            ss.str()
+                        };
+                    }
                 }
-                
-                node_idx += edit.from_length();
-                read_idx += edit.to_length();
             }
+            
+            node_idx += edit.from_length();
+            read_idx += edit.to_length();
         }
     }
     return {AlignmentValidity::OK};
@@ -2627,28 +4737,43 @@ Alignment target_alignment(const PathPositionHandleGraph* graph, const path_hand
     
     // How long is the path?
     auto path_len = graph->get_path_length(path);
+
+#ifdef debug
+    #pragma omp critical (cerr)
+    std::cerr << "Target alignment from " << pos1 << " to " << pos2 << std::endl;
+#endif
     
     if (pos2 < pos1) {
         // Looks like we want to span the origin of a circular path
         if (!graph->get_is_circular(path)) {
             // But the path isn't circular, which is a problem
-            throw runtime_error("Cannot extract Alignment from " + to_string(pos1) +
-                                " to " + to_string(pos2) + " across the junction of non-circular path " +
-                                graph->get_path_name(path));
+            throw AlignmentEmbeddingError(
+                "Cannot produce Alignment of '" + feature +
+                "' from 1-based positions " + to_string(pos1 + 1) +
+                " through " + to_string(pos2) +
+                " across the junction of non-circular path '" +
+                graph->get_path_name(path) + "'."
+            );
         }
         
         if (pos1 >= path_len) {
             // We want to start off the end of the path, which is no good.
-            throw runtime_error("Cannot extract Alignment starting at " + to_string(pos1) +
-                                " which is past end " + to_string(path_len) + " of path " +
-                                graph->get_path_name(path));
+            throw AlignmentEmbeddingError(
+                "Cannot produce Alignment of '" + feature +
+                "' starting at 1-based position " + to_string(pos1 + 1) +
+                " which is past 1-based inclusive end position " + to_string(path_len) + " of path '" +
+                graph->get_path_name(path) + "'."
+            );
         }
         
         if (pos2 > path_len) {
             // We want to end off the end of the path, which is no good either.
-            throw runtime_error("Cannot extract Alignment ending at " + to_string(pos2) +
-                                " which is past end " + to_string(path_len) + " of path " +
-                                graph->get_path_name(path));
+            throw AlignmentEmbeddingError(
+                "Cannot produce Alignment of '" + feature +
+                "' ending at 1-based inclusive position " + to_string(pos2) +
+                " which is past 1-based inclusive end position " + to_string(path_len) + " of path '" +
+                graph->get_path_name(path) + "'."
+            );
         }
         
         // Split the provided Mapping of edits at the path end/start junction
@@ -2672,14 +4797,20 @@ Alignment target_alignment(const PathPositionHandleGraph* graph, const path_hand
     // Otherwise, the base case is that we don't go over the circular path junction
     
     if (pos1 >= path_len) {
-        throw runtime_error("Cannot extract Alignment starting at " + to_string(pos1) +
-                            " which is past end " + to_string(path_len) + " of path " +
-                            graph->get_path_name(path));
+        throw AlignmentEmbeddingError(
+            "Cannot produce Alignment of '" + feature +
+            "' starting at 1-based position " + to_string(pos1 + 1) +
+            " which is past 1-based inclusive end position " + to_string(path_len) + " of path '" +
+            graph->get_path_name(path) + "'."
+        );
     }
     if (pos2 > path_len) {
-        throw runtime_error("Cannot extract Alignment ending at " + to_string(pos2) +
-                            " which is past end " + to_string(path_len) + " of path " +
-                            graph->get_path_name(path));
+        throw AlignmentEmbeddingError(
+            "Cannot produce Alignment of '" + feature +
+            "' ending at 1-based inclusive position " + to_string(pos2) +
+            " which is past 1-based inclusive end position " + to_string(path_len) + " of path '" +
+            graph->get_path_name(path) + "'."
+        );
     }
     
     step_handle_t step = graph->get_step_at_position(path, pos1);
@@ -2700,10 +4831,14 @@ Alignment target_alignment(const PathPositionHandleGraph* graph, const path_hand
                 continue;
             } else {
                 // We've gone off the end of the contig with something other than a softclip
-                throw std::runtime_error("Reached unexpected end of path " + graph->get_path_name(path) +
-                                         " at edit " + std::to_string(edit_idx) +
-                                         "/" + std::to_string(cigar_mapping.edit_size()) +
-                                         " for alignment of feature " + feature);
+                throw AlignmentEmbeddingError(
+                    "Reached unexpected end of path '" + graph->get_path_name(path) +
+                    "' which has 1-based inclusive end position " + std::to_string(graph->get_path_length(path)) +
+                    ", at edit " + std::to_string(edit_idx) +
+                    "/" + std::to_string(cigar_mapping.edit_size()) +
+                    " for alignment of '" + feature + 
+                    "'; are you sure the alignment doesn't go off the end of the path?"
+                );
             }
         }
         handle_t h = graph->get_handle_of_step(step);
@@ -2778,7 +4913,7 @@ Alignment target_alignment(const PathPositionHandleGraph* graph, const path_hand
     
     aln.set_name(feature);
     if (is_reverse) {
-        reverse_complement_alignment_in_place(&aln, [&](vg::id_t node_id) { return graph->get_length(graph->get_handle(node_id)); });
+        reverse_complement_alignment_in_place(&aln, [&](vg::nid_t node_id) { return graph->get_length(graph->get_handle(node_id)); });
     }
     return aln;
 }
@@ -2792,9 +4927,13 @@ Alignment target_alignment(const PathPositionHandleGraph* graph, const path_hand
         // Looks like we want to span the origin of a circular path
         if (!graph->get_is_circular(path)) {
             // But the path isn't circular, which is a problem
-            throw runtime_error("Cannot extract Alignment from " + to_string(pos1) +
-                                " to " + to_string(pos2) + " across the junction of non-circular path " +
-                                graph->get_path_name(path));
+            throw AlignmentEmbeddingError(
+                "Cannot produce Alignment of '" + feature +
+                "' from 1-based positions " + to_string(pos1 + 1) +
+                " through " + to_string(pos2) +
+                " across the junction of non-circular path '" +
+                graph->get_path_name(path) + "'."
+            );
         }
         
         // How long is the path?
@@ -2802,16 +4941,22 @@ Alignment target_alignment(const PathPositionHandleGraph* graph, const path_hand
         
         if (pos1 >= path_len) {
             // We want to start off the end of the path, which is no good.
-            throw runtime_error("Cannot extract Alignment starting at " + to_string(pos1) +
-                                " which is past end " + to_string(path_len) + " of path " +
-                                graph->get_path_name(path));
+            throw AlignmentEmbeddingError(
+                "Cannot produce Alignment of '" + feature +
+                "' starting at 1-based position " + to_string(pos1 + 1) +
+                " which is past 1-based inclusive end position " + to_string(path_len) + " of path '" +
+                graph->get_path_name(path) + "'."
+            );
         }
         
         if (pos2 > path_len) {
             // We want to end off the end of the path, which is no good either.
-            throw runtime_error("Cannot extract Alignment ending at " + to_string(pos2) +
-                                " which is past end " + to_string(path_len) + " of path " +
-                                graph->get_path_name(path));
+            throw AlignmentEmbeddingError(
+                "Cannot produce Alignment of '" + feature +
+                "' ending at 1-based inclusive position " + to_string(pos2) +
+                " which is past 1-based inclusive end position " + to_string(path_len) + " of path '" +
+                graph->get_path_name(path) + "'."
+            );
         }
         
         // We extract from pos1 to the end
@@ -2868,8 +5013,10 @@ Alignment target_alignment(const PathPositionHandleGraph* graph, const path_hand
     
     aln.set_name(feature);
     if (is_reverse) {
-        reverse_complement_alignment_in_place(&aln, [&](vg::id_t node_id) { return graph->get_length(graph->get_handle(node_id)); });
+        reverse_complement_alignment_in_place(&aln, [&](vg::nid_t node_id) { return graph->get_length(graph->get_handle(node_id)); });
     }
     return aln;
 }
+
+
 }

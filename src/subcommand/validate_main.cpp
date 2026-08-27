@@ -25,14 +25,16 @@ void help_validate(char** argv) {
          << "Validate the graph." << endl
          << endl
          << "options:" << endl
-         << "    default: check all aspects of the graph, if options are specified do only those" << endl
-         << "    -o, --orphans    verify that all nodes have edges" << endl
-         << "    -a, --gam FILE   verify that edits in the alignment fit on nodes in the graph" << endl
-         << "    -A, --gam-only   do not verify the graph itself, only the alignment" << endl
-         << "    -c, --check-seq  check that the edits in the alignment correctly report matches" << endl;
+         << "default: check all aspects of the graph; if options are specified do only those" << endl
+         << "  -o, --orphans    verify that all nodes have edges" << endl
+         << "  -a, --gam FILE   verify that edits in the alignment fit on nodes in the graph" << endl
+         << "  -A, --gam-only   do not verify the graph itself, only the alignment" << endl
+         << "  -c, --check-seq  check that the edits in alignment correctly report matches" << endl
+         << "  -h, --help       print this help message to stderr and exit" << endl;
 }
 
 int main_validate(int argc, char** argv) {
+    Logger logger("vg validate");
 
     if (argc <= 2) {
         help_validate(argv);
@@ -58,8 +60,8 @@ int main_validate(int argc, char** argv) {
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hoa:Ac",
-                long_options, &option_index);
+        c = getopt_long (argc, argv, "h?oa:Ac",
+                         long_options, &option_index);
 
         // Detect the end of the options.
         if (c == -1)
@@ -72,7 +74,7 @@ int main_validate(int argc, char** argv) {
                 break;
 
             case 'a':
-                gam_path = optarg;
+                gam_path = require_exists(logger, optarg);
                 break;
                 
             case 'A':
@@ -107,10 +109,27 @@ int main_validate(int argc, char** argv) {
                         AlignmentValidity validity = alignment_is_valid(aln, graph.get(), check_sequence);
                         if (!validity) {
                             // Complain about this alignment
-                            cerr << "Invalid Alignment:\n" << pb2json(aln) << "\n" << validity.message;
+                            cerr << "Invalid Alignment:" << std::endl;;
+                            if (aln.sequence().size() < 1000) {
+                                cerr << pb2json(aln) << std::endl;
+                            }
+                            cerr << std::endl << validity.message;
                             if (validity.problem == AlignmentValidity::NODE_TOO_SHORT) {
                                 // If a node is too short, report the whole mapping again.
-                                cerr << ":\n" << pb2json(aln.path().mapping(validity.bad_mapping_index));
+                                cerr << ":" << std::endl << pb2json(aln.path().mapping(validity.bad_mapping_index));
+                            }
+                            if (validity.problem == AlignmentValidity::READ_TOO_SHORT ||
+                                validity.problem == AlignmentValidity::BAD_EDIT ||
+                                validity.problem == AlignmentValidity::SEQ_DOES_NOT_MATCH) {
+                                // If there's something wrong with an edit or the read,
+                                // report the edit and the position in the read
+                                if (validity.bad_mapping_index < aln.path().mapping_size() &&
+                                    validity.bad_edit_index < aln.path().mapping(validity.bad_mapping_index).edit_size()) {
+                                    cerr << ":" << std::endl << pb2json(aln.path().mapping(
+                                        validity.bad_mapping_index).edit(validity.bad_edit_index));
+                                }
+                                cerr << ": at mapping " << validity.bad_mapping_index << " edit " 
+                                     << validity.bad_edit_index << " vs. read base " << validity.bad_read_position;
                             }
                             cerr << endl;
                             valid_aln = false;
@@ -125,7 +144,7 @@ int main_validate(int argc, char** argv) {
     if (!gam_only) {
         VG* vg_graph = dynamic_cast<VG*>(graph.get());
         if (vg_graph != nullptr) {
-            if (!vg_graph->is_valid(true, true, check_orphans, true)) {
+            if (!vg_graph->is_valid(true, true, true, check_orphans)) {
                 valid_graph = false;
             }
         }
@@ -204,5 +223,5 @@ int main_validate(int argc, char** argv) {
 }
 
 // Register subcommand
-static Subcommand vg_validate("validate", "validate the semantics of a graph or gam", DEVELOPMENT, main_validate);
+static Subcommand vg_validate("validate", "validate the semantics of a graph or GAM", DEVELOPMENT, main_validate);
 

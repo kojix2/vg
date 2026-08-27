@@ -577,19 +577,11 @@ bool VG::for_each_step_on_handle_impl(const handle_t& handle, const function<boo
 }
 
 handle_t VG::create_handle(const string& sequence) {
-    if (sequence.empty()) {
-        throw std::runtime_error("error:[vg::VG] tried to create an empty node");
-    }
-    
     Node* node = create_node(sequence);
     return get_handle(node->id(), false);
 }
 
 handle_t VG::create_handle(const string& sequence, const nid_t& id) {
-    if (sequence.empty()) {
-        throw std::runtime_error("error:[vg::VG] tried to create an empty node with ID " + std::to_string(id));
-    }
-    
     if (id <= 0) {
         throw std::runtime_error("error:[vg::VG] tried to create a node with non-positive ID " + std::to_string(id));
     }
@@ -631,6 +623,7 @@ void VG::destroy_edge(const handle_t& left, const handle_t& right) {
 }
     
 void VG::clear() {
+    clear_paths();
     graph.mutable_node()->Clear();
     graph.mutable_edge()->Clear();
     clear_indexes();
@@ -3026,7 +3019,7 @@ void VG::unindex_edge_by_node_sides(Edge* edge) {
 
         //cerr << "Removed " << edge->from() << "-start to " << edge->to() << " orientation " << relative_orientation << endl;
     } else {
-        // The edge is on the end of the from node, do remove it form the end of the from node.
+        // The edge is on the end of the from node, do remove it from the end of the from node.
         std::pair<nid_t, bool> to_remove {edge->to(), relative_orientation};
         swap_remove(edges_end(edge->from()), to_remove);
         if (edges_on_end[edge->from()].empty()) edges_on_end.erase(edge->from());
@@ -3350,11 +3343,11 @@ void VG::remove_orphan_edges(void) {
     }
 }
 
-void VG::keep_paths(const set<string>& path_names, set<string>& kept_names) {
+void VG::keep_paths(const set<string>& path_names, set<string>& kept_names, bool invert) {
 
     set<nid_t> to_keep;
     paths.for_each([&](const Path& path) {
-            if (path_names.count(path.name())) {
+            if (path_names.count(path.name()) != invert) {
                 kept_names.insert(path.name());
                 for (int i = 0; i < path.mapping_size(); ++i) {
                     to_keep.insert(path.mapping(i).position().node_id());
@@ -3377,7 +3370,7 @@ void VG::keep_paths(const set<string>& path_names, set<string>& kept_names) {
     remove_orphan_edges();
 
     // Throw out all the paths data for paths we don't want to keep.
-    paths.keep_paths(path_names);
+    paths.keep_paths(kept_names);
 }
 
 void VG::keep_path(const string& path_name) {
@@ -4887,51 +4880,6 @@ void VG::connect_nodes_to_node(vector<NodeTraversal>& nodes, NodeTraversal node)
     }
 }
 
-// join all subgraphs together to a "null" head node
-Node* VG::join_heads(void) {
-    // Find the head nodes
-    vector<Node*> heads;
-    head_nodes(heads);
-
-    // Then create the new node (so it isn't picked up as a head)
-    current_id = max_node_id()+1;
-    Node* root = create_node("N");
-
-    // Wire it to all the heads and return
-    connect_node_to_nodes(root, heads);
-    return root;
-}
-
-void VG::join_heads(Node* node, bool from_start) {
-    vector<Node*> heads;
-    head_nodes(heads);
-
-    // If the node we have been given shows up as a head, remove it.
-    for(auto i = heads.begin(); i != heads.end(); ++i) {
-        if(*i == node) {
-            heads.erase(i);
-            break;
-        }
-    }
-
-    connect_node_to_nodes(node, heads, from_start);
-}
-
-void VG::join_tails(Node* node, bool to_end) {
-    vector<Node*> tails;
-    tail_nodes(tails);
-
-    // If the node we have been given shows up as a tail, remove it.
-    for(auto i = tails.begin(); i != tails.end(); ++i) {
-        if(*i == node) {
-            tails.erase(i);
-            break;
-        }
-    }
-
-    connect_nodes_to_node(tails, node, to_end);
-}
-
 void VG::add_start_end_markers(int length,
                                char start_char, char end_char,
                                Node*& start_node, Node*& end_node,
@@ -5479,7 +5427,7 @@ int VG::path_end_node_offset(list<NodeTraversal>& path, int32_t offset, int path
     // Now back out the last node we just took.
     l += (*--pitr).node->sequence().size();
 
-    // Measure form the far end of the last node.
+    // Measure from the far end of the last node.
     l = (*pitr).node->sequence().size() - l - 1;
 
     return l;
@@ -5945,7 +5893,7 @@ VG VG::dagify(uint32_t expand_scc_steps,
         for (auto node_id : component) {
             comp.insert(node_id);
         }
-        strong_components.emplace(move(comp));
+        strong_components.emplace(std::move(comp));
     }
     // map from component root id to a translation
     // that maps the unrolled id to the original node and whether we've inverted or not
@@ -6040,7 +5988,7 @@ VG VG::dagify(uint32_t expand_scc_steps,
                 for (Edge* e : edges_of(get_node(id))) {
                     // We may have to modify the edge, so make a place to hold
                     // a modified copy. This lets us work as if all edges are
-                    // end to start wehn working on their from and to later.
+                    // end to start when working on their from and to later.
                     unique_ptr<Edge> clone;
                     if (e->from_start() && e->to_end()) {
                         // Flip doubly-reversing edges from the input, which
@@ -6123,7 +6071,7 @@ VG VG::dagify(uint32_t expand_scc_steps,
                     }
                 }
             }
-            // update the minimum minimim return length
+            // update the minimum minimum return length
             min_min_return_length = curr_min_min_return_length;
             // finish if we've reached our target min walk length
             if (target_min_walk_length &&

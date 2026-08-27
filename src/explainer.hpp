@@ -27,25 +27,113 @@ namespace vg {
 
 /**
  * Base explainer class. Handles making sure each explanation has a different unique number.
+ * Also provides support for organizing explanations into per-read directories.
  */
 class Explainer {
 public:
     /// Determine if explanations should be generated.
+    ///
+    /// Should be set once at the start of the program; should not be toggled
+    /// while explanations are being saved or other system state (like
+    /// contexts) are being used.
     static bool save_explanations;
 
     /// Construct an Explainer that will save to one or more files
-    Explainer();
-    
+    Explainer(bool enabled);
+
     /// Close out the files being explained to
     virtual ~Explainer();
+
+    /// Conversion to bool so you can use an explainer as a condition on code
+    /// to write to it.
+    inline operator bool() const {
+        return explaining();
+    }
+
+    /// Set a per-thread context for organizing explanations.
+    /// Within a context, explanations are numbed from 0 (so contexts may not
+    /// be re-used, or collisions will occur).
+    /// The context may not be empty.
+    static void set_context(const std::string& context);
+
+    /// Clear the current per-thread context
+    static void clear_context();
 
 protected:
     /// What number explanation are we? Distinguishes different objects.
     size_t explanation_number;
-    
+
+    /// Determines if this explainer should generate explanations.
+    bool enabled;
+
     /// Counter used to give different explanations their own unique filenames.
     static std::atomic<size_t> next_explanation_number;
+    
+    /// Counter used to give different explanations their own unique filenames
+    /// within a per-thread context.
+    static thread_local size_t next_context_explanation_number;
+
+    /// Current thing (possibly a read name) being explained (for organizing into directories)
+    static thread_local std::string current_context;
+
+    /// Function to check if we should be explaining.
+    inline bool explaining() const {
+        return this->enabled && Explainer::save_explanations;
+    }
+
+    /// Helper to get a new explanation number, either from the global counter,
+    /// or within a thread-local context.
+    static size_t get_new_explanation_number();
+
+    /// Helper to create a filename accounting for any assigned per-thread
+    /// context.
+    ///
+    /// If current_context is set, ensures there is a directory for that
+    /// context, and puts the file there.
+    /// 
+    /// Returns the full path to use for opening the file.
+    static std::string make_filename(const std::string& base_name, const std::string& extension);
 };
+
+/**
+ * Widget to log a TSV of data as an explanation.
+ */
+class TSVExplainer : public Explainer {
+public:
+    /// Construct a TSVExplainer that will save a table to a file.
+    /// Uses the current read context from Explainer::set_context() if set.
+    TSVExplainer(bool enabled, const std::string& name = "data");
+    /// Close out the file being explained to
+    ~TSVExplainer();
+
+    /// Start a new line. Must call this before field().
+    void line();
+
+    /// Add a field with any value that can be <<'d into a stream.
+    template<typename T>
+    void field(const T& value);
+
+protected:
+    /// Stream being written to
+    ofstream out;
+    /// Whether we need a tab befroe the next value
+    bool need_tab = false;
+    /// Whether we need a newline before the next line
+    bool need_line = false;
+};
+
+template<typename T>
+void TSVExplainer::field(const T& value) {
+    if (!explaining()) {
+        return;
+    }
+    if (need_tab) {
+        out << "\t";
+    }
+    out << value;
+    // Next value on the line needs a leading tab
+    need_tab = true;
+}
 
 /**
  * Widget to serialize somewhat structured logs.
@@ -53,7 +141,7 @@ protected:
 class ProblemDumpExplainer : public Explainer {
 public:
     /// Construct a ProblemDumpExplainer that will save a dump of a problem to a file.
-    ProblemDumpExplainer(const std::string& name = "problem");
+    ProblemDumpExplainer(bool enabled, const std::string& name = "problem");
     /// Close out the file being explained to
     ~ProblemDumpExplainer();
     
@@ -118,7 +206,7 @@ public:
     using annotation_t = std::vector<std::pair<std::string, std::string>>;
 
     /// Construct a DiagramExplainer that will save a diagram to one or more files.
-    DiagramExplainer();
+    DiagramExplainer(bool enabled);
     /// Close out the files being explained to
     ~DiagramExplainer();
     
@@ -197,19 +285,34 @@ template<typename T>
 class DotDumpExplainer : public Explainer {
 public:
     /// Construct a DotDumpExplainer that will save a diagram to a file
-    DotDumpExplainer(const T& to_dump);
+    DotDumpExplainer(bool enabled, const T& to_dump);
 };
 
 template<typename T>
-DotDumpExplainer<T>::DotDumpExplainer(const T& to_dump) : Explainer() {
-    if (!Explainer::save_explanations) {
+DotDumpExplainer<T>::DotDumpExplainer(bool enabled, const T& to_dump) : Explainer(enabled) {
+    if (!explaining()) {
         return;
     }
-    // Open the dot file
-    std::ofstream out("dotdump" + std::to_string(explanation_number) + ".dot");
+    // Open the dot file using the per-read directory system
+    std::string base_name = "dotdump" + std::to_string(explanation_number);
+    std::string filename = make_filename(base_name, ".dot");
+    std::ofstream out(filename);
     // And dump to it
     to_dump.to_dot(out);
 }
+
+/**
+ * Explainer that can dump a handle graph.
+ */
+class SubgraphExplainer: public Explainer {
+public:
+
+    /// Construct an explainer that will save a single graph.
+    SubgraphExplainer(bool enabled);
+
+    /// Write out a subgraph.
+    void subgraph(const HandleGraph& graph);
+};
 
 
 }

@@ -12,33 +12,40 @@
 using namespace std;
 using namespace vg;
 using namespace vg::subcommand;
+
+const string DEFAULT_TRAVERSAL_FINDER = "adaptive";
+
 void help_genotype(char** argv) {
     cerr << "usage: " << argv[0] << " genotype [options] <graph.vg> alignments.gam > <calls.vcf>" << endl
          << "Compute genotypes from a graph and a collection of reads" << endl
+         << "DEPRECATED: please use vg call instead" << endl
          << endl
          << "options:" << endl
-         << "    -j, --json              output in JSON" << endl
-         << "    -v, --vcf               output in VCF" << endl
-         << "    -V, --recall-vcf VCF    recall variants in a specific VCF file." << endl
-         << "    -F, --fasta  FASTA" << endl
-         << "    -I, --insertions INS" << endl
-         << "    -r, --ref PATH          use the given path name as the reference path" << endl
-         << "    -c, --contig NAME       use the given name as the VCF contig name" << endl
-         << "    -s, --sample NAME       name the sample in the VCF with the given name" << endl
-         << "    -o, --offset INT        offset variant positions by this amount" << endl
-         << "    -l, --length INT        override total sequence length" << endl
-         << "    -a, --augmented FILE    dump augmented graph to FILE" << endl
-         << "    -Q, --ignore_mapq       do not use mapping qualities" << endl
-         << "    -A, --no_indel_realign  disable indel realignment" << endl
-         << "    -d, --het_prior_denom   denominator for prior probability of heterozygousness" << endl
-         << "    -P, --min_per_strand    min unique reads per strand for a called allele to accept a call" << endl
-         << "    -E, --no_embed          don't embed gam edits into graph" << endl
-         << "    -T, --traversal         traversal finder to use {reads, exhaustive, representative, adaptive} (adaptive)" << endl
-         << "    -p, --progress          show progress" << endl
-         << "    -t, --threads N         number of threads to use" << endl;
+         << "  -j, --json                   output in JSON" << endl
+         << "  -v, --vcf                    output in VCF" << endl
+         << "  -V, --recall-vcf FILE        recall variants in a specific VCF file." << endl
+         << "  -F, --fasta FILE             use this linear reference" << endl
+         << "  -I, --insertions FILE        use reference insertions in this FASTA file" << endl
+         << "  -r, --ref PATH               use the given path name as the reference path" << endl
+         << "  -c, --contig NAME            use the given name as the VCF contig name" << endl
+         << "  -s, --sample NAME            name the sample in the VCF with the given name" << endl
+         << "  -o, --offset INT             offset variant positions by this amount" << endl
+         << "  -l, --length INT             override total sequence length" << endl
+         << "  -a, --augmented FILE         dump augmented graph to FILE" << endl
+         << "  -Q, --ignore-mapq            do not use mapping qualities" << endl
+         << "  -A, --no-indel-realign       disable indel realignment" << endl
+         << "  -d, --het-prior-denom FLOAT  denominator for prior prob of heterozygousness" << endl
+         << "  -P, --min-per-strand INT     min unique reads per strand for a called allele" << endl
+         << "  -E, --no-embed               don't embed GAM edits into graph" << endl
+         << "  -T, --traversal STR          traversal finder to use [" << DEFAULT_TRAVERSAL_FINDER << "]" << endl 
+         << "                               {reads, exhaustive, representative, adaptive}" << endl
+         << "  -p, --progress               show progress" << endl
+         << "  -t, --threads N              number of threads to use" << endl
+         << "  -h, --help                   print this help message to stderr and exit" << endl;
 }
 
 int main_genotype(int argc, char** argv) {
+    Logger logger("vg genotype");
 
     if (argc <= 2) {
         help_genotype(argv);
@@ -50,8 +57,6 @@ int main_genotype(int argc, char** argv) {
     bool output_vcf = false;
     // Should we show progress with a progress bar?
     bool show_progress = false;
-    // How many threads should we use?
-    int thread_count = 0;
 
     // What reference path should we use
     string ref_path_name;
@@ -63,10 +68,10 @@ int main_genotype(int argc, char** argv) {
     int64_t variant_offset = 0;
     // What length override should we use
     int64_t length_override = 0;
-    // Should we embed gam edits (for debugging as we move to further decouple augmentation and calling)
+    // Should we embed GAM edits (for debugging as we move to further decouple augmentation and calling)
     bool embed_gam_edits = true;
     // Which traversal finder should we use
-    string traversal_finder = "adaptive";
+    string traversal_finder = DEFAULT_TRAVERSAL_FINDER;
 
     // Should we we just do a quick variant recall,
     // based on this VCF and GAM, then exit?
@@ -88,12 +93,12 @@ int main_genotype(int argc, char** argv) {
     // At least how many reads must be unique support for a called allele per strand for a call?
     size_t min_unique_per_strand = 2;
 
-    bool just_call = false;
     int c;
     optind = 2; // force optind past command positional arguments
     while (true) {
         static struct option long_options[] =
             {
+                {"help", no_argument, 0, 'h'},
                 {"json", no_argument, 0, 'j'},
                 {"vcf", no_argument, 0, 'v'},
                 {"ref", required_argument, 0, 'r'},
@@ -102,23 +107,22 @@ int main_genotype(int argc, char** argv) {
                 {"offset", required_argument, 0, 'o'},
                 {"length", required_argument, 0, 'l'},
                 {"augmented", required_argument, 0, 'a'},
-                {"ignore_mapq", no_argument, 0, 'Q'},
-                {"no_indel_realign", no_argument, 0, 'A'},
-                {"het_prior_denom", required_argument, 0, 'd'},
-                {"min_per_strand", required_argument, 0, 'P'},
+                {"ignore-mapq", no_argument, 0, 'Q'},
+                {"no-indel-realign", no_argument, 0, 'A'},
+                {"het-prior-denom", required_argument, 0, 'd'},
+                {"min-per-strand", required_argument, 0, 'P'},
                 {"progress", no_argument, 0, 'p'},
                 {"threads", required_argument, 0, 't'},
                 {"recall-vcf", required_argument, 0, 'V'},
                 {"fasta", required_argument, 0, 'F'},
                 {"insertions", required_argument, 0, 'I'},
-                {"call", no_argument, 0, 'z'},
-                {"no_embed", no_argument, 0, 'E'},
+                {"no-embed", no_argument, 0, 'E'},
                 {"traversal", required_argument, 0, 'T'},
                 {0, 0, 0, 0}
             };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hjvr:c:s:o:l:a:QAd:P:pt:V:I:F:zET:",
+        c = getopt_long (argc, argv, "h?jvr:c:s:o:l:a:QAd:P:pt:V:I:F:ET:",
                          long_options, &option_index);
 
         /* Detect the end of the options. */
@@ -155,14 +159,11 @@ int main_genotype(int argc, char** argv) {
             break;
         case 'a':
             // Dump augmented graph
-            augmented_file_name = optarg;
+            augmented_file_name = ensure_writable(logger, optarg);
             break;
         case 'Q':
             // Ignore mapping qualities
             use_mapq = false;
-            break;
-        case 'z':
-            just_call = true;
             break;
         case 'A':
             // Don't do indel realignment
@@ -180,16 +181,16 @@ int main_genotype(int argc, char** argv) {
             show_progress = true;
             break;
         case 't':
-            thread_count = parse<int>(optarg);
+            set_thread_count(logger, optarg);
             break;
         case 'V':
-            recall_vcf = optarg;
+            recall_vcf = require_exists(logger, optarg);
             break;
         case 'I':
-            insertions_file = optarg;
+            insertions_file = require_exists(logger, optarg);
             break;
         case 'F':
-            fasta = optarg;
+            fasta = require_exists(logger, optarg);
             break;
         case 'E':
             embed_gam_edits = false;
@@ -208,10 +209,6 @@ int main_genotype(int argc, char** argv) {
         }
     }
 
-    if(thread_count > 0) {
-        omp_set_num_threads(thread_count);
-    }
-
     // read the graph
     if (optind >= argc) {
         help_genotype(argv);
@@ -219,7 +216,7 @@ int main_genotype(int argc, char** argv) {
     }
 
     if (show_progress) {
-        cerr << "Reading input graph..." << endl;
+        logger.info() << "Reading input graph..." << endl;
     }
     VG* graph;
     get_input_file(optind, argc, argv, [&](istream& in) {
@@ -229,17 +226,8 @@ int main_genotype(int argc, char** argv) {
     // get GAM
     if (optind < argc){
         gam_file = get_input_file_name(optind, argc, argv);
-        
     } else {
-        cerr << "[vg genotype] GAM file must be specified as positional argument" << endl;
-        return 1;
-    }
-
-    if (just_call){
-        string gamfi(gam_file);
-        string rstr(ref_path_name);
-        genotype_svs(graph, gamfi, rstr);
-        exit(0);
+        logger.error() << "GAM file must be specified as positional argument" << endl;
     }
 
     // Build the set of all the node IDs to operate on
@@ -269,8 +257,8 @@ int main_genotype(int argc, char** argv) {
     // Load all the reads matching the graph into memory
     vector<Alignment> alignments;
 
-    if(show_progress) {
-        cerr << "Loading reads..." << endl;
+    if (show_progress) {
+        logger.info() << "Loading reads..." << endl;
     }
 
     function<bool(const Alignment&)> alignment_contained = [&graph](const Alignment& alignment) {
@@ -283,21 +271,17 @@ int main_genotype(int argc, char** argv) {
     };
 
     // load in all reads (activated by passing GAM directly with -G).
-    // This is used by, ex., toil-vg, which has already used the gam index
+    // This is used by, ex., toil-vg, which has already used the GAM index
     // to extract relevant reads
     ifstream gam_reads(gam_file.c_str());
-    if (!gam_reads) {
-        cerr << "[vg genotype] Error opening gam: " << gam_file << endl;
-        return 1;
-    }
     vg::io::for_each<Alignment>(gam_reads, [&alignments, &alignment_contained](Alignment& alignment) {
         if (alignment_contained(alignment)) {
             alignments.push_back(alignment);
         }
     });
     
-    if(show_progress) {
-        cerr << "Loaded " << alignments.size() << " alignments" << endl;
+    if (show_progress) {
+        logger.info() << "Loaded " << alignments.size() << " alignments" << endl;
     }
     
     // Make a Genotyper to do the genotyping
@@ -317,9 +301,8 @@ int main_genotype(int argc, char** argv) {
     } else if (traversal_finder == "adaptive") {
       genotyper.traversal_alg = Genotyper::TraversalAlg::Adaptive;
     } else {
-        cerr << "Invalid value for traversal finder: " << traversal_finder
-             << ".  Must be in {reads, representative, exhaustive, adaptive}" << endl;
-        return 1;
+        logger.error() << "Invalid value for traversal finder: " << traversal_finder
+                       << ". Must be in {reads, representative, exhaustive, adaptive}" << endl;
     }
     genotyper.show_progress = show_progress;
 
@@ -363,4 +346,4 @@ int main_genotype(int argc, char** argv) {
 }
 
 
-static Subcommand vg_genotype("genotype", "Genotype (or type) graphs, GAMS, and VCFs.", main_genotype);
+static Subcommand vg_genotype("genotype", "genotype (or type) graphs, GAMS, and VCFs", DEPRECATED, main_genotype);

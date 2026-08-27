@@ -26,21 +26,22 @@ void help_gampcompare(char** argv) {
     cerr << "usage: " << argv[0] << " gampcompare [options] alngraph.xg aln.gamp truth.gam > output.tsv" << endl
          << endl
          << "options:" << endl
-         << "    -G, --gam                alignments are in GAM format rather than GAMP" << endl
-         << "    -r, --range N            distance within which to consider reads correct [100]" << endl
-         << "    -a, --aligner STR        aligner name for TSV output [\"vg\"]" << endl
-         << "    -d, --distance           report minimum distance along a path rather than correctness" << endl
-         << "    -t, --threads N          number of threads to use [1]" << endl;
+         << "  -G, --gam          alignments are in GAM format rather than GAMP" << endl
+         << "  -r, --range N      distance within which to consider reads correct [100]" << endl
+         << "  -a, --aligner STR  aligner name for TSV output [\"vg\"]" << endl
+         << "  -d, --distance     report minimum distance along path rather than correctness" << endl
+         << "  -t, --threads N    number of threads to use [1]" << endl
+         << "  -h, --help         print this help message to stderr and exit" << endl;
 }
 
 int main_gampcompare(int argc, char** argv) {
+    Logger logger("vg gampcompare");
 
     if (argc == 2) {
         help_gampcompare(argv);
         exit(1);
     }
 
-    int threads = 1;
     int64_t range = 100;
     string aligner_name = "vg";
     int buffer_size = 10000;
@@ -56,13 +57,13 @@ int main_gampcompare(int argc, char** argv) {
             {"range", required_argument, 0, 'r'},
             {"gam", no_argument, 0, 'G'},
             {"aligner", required_argument, 0, 'a'},
-            {"distance", required_argument, 0, 'd'},
+            {"distance", no_argument, 0, 'd'},
             {"threads", required_argument, 0, 't'},
             {0, 0, 0, 0}
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hr:a:t:Gd",
+        c = getopt_long (argc, argv, "h?r:a:t:Gd",
                          long_options, &option_index);
 
         // Detect the end of the options.
@@ -84,8 +85,7 @@ int main_gampcompare(int argc, char** argv) {
             break;
 
         case 't':
-            threads = parse<int>(optarg);
-            omp_set_num_threads(threads);
+            set_thread_count(logger, optarg);
             break;
                 
         case 'G':
@@ -109,8 +109,7 @@ int main_gampcompare(int argc, char** argv) {
     string truth_file_name = get_input_file_name(optind, argc, argv);
 
     if ((truth_file_name == "-") + (test_file_name == "-") + (graph_file_name == "-") > 1) {
-        cerr << "error[vg gampcompare]: Standard input can only be used for one input file" << endl;
-        exit(1);
+        logger.error() << "Standard input can only be used for one input file" << endl;
     }
     
     // Load the graph we mapped to
@@ -121,28 +120,23 @@ int main_gampcompare(int argc, char** argv) {
     else {
         ifstream graph_stream(graph_file_name);
         if (!graph_stream) {
-            cerr << "error:[vg mpmap] Cannot open graph file " << graph_file_name << endl;
-            exit(1);
+            logger.error() << "Cannot open graph file " << graph_file_name << endl;
         }
         path_handle_graph = vg::io::VPKG::load_one<PathHandleGraph>(graph_stream);
     }
-    
-    bdsg::PathPositionOverlayHelper overlay_helper;
-    PathPositionHandleGraph* path_position_handle_graph = overlay_helper.apply(path_handle_graph.get());
-    
+     
     // We will collect all the truth positions
     string_hash_map<string, map<string ,vector<pair<size_t, bool> > > > true_positions;
     function<void(Alignment&)> record_truth = [&true_positions](Alignment& aln) {
         auto val = alignment_refpos_to_path_offsets(aln);
 #pragma omp critical (truth_table)
-        true_positions[move(*aln.mutable_name())] = move(val);
+        true_positions[std::move(*aln.mutable_name())] = std::move(val);
     };
     
     if (truth_file_name == "-") {
         // Read truth fropm standard input, if it looks good.
         if (!std::cin) {
-            cerr << "error[vg gampcompare]: Unable to read standard input when looking for true reads" << endl;
-            exit(1);
+            logger.error() << "Unable to read standard input when looking for true reads" << endl;
         }
         vg::io::for_each_parallel(std::cin, record_truth);
     }
@@ -150,11 +144,25 @@ int main_gampcompare(int argc, char** argv) {
         // Read truth from this file, if it looks good.
         ifstream truth_file_in(truth_file_name);
         if (!truth_file_in) {
-            cerr << "error[vg gampcompare]: Unable to read " << truth_file_name << " when looking for true reads" << endl;
-            exit(1);
+            logger.error() << "Unable to read " << truth_file_name
+                           << " when looking for true reads" << endl;
         }
         vg::io::for_each_parallel(truth_file_in, record_truth);
     }
+
+    // Once we know the truth positions we know the paths we need to index
+    std::unordered_set<std::string> truth_paths;
+    for (auto& aln_positions : true_positions) {
+        for (auto& path_and_positions : aln_positions.second) {
+            truth_paths.insert(path_and_positions.first);
+        }
+    }
+
+
+    bdsg::PathPositionOverlayHelper overlay_helper;
+    // Index the reference and generic paths, plus any paths that positions are on, for position queries.
+    // TODO: Can we actually end up using any non-reference/non-generic paths in the comparison?
+    PathPositionHandleGraph* path_position_handle_graph = overlay_helper.apply(path_handle_graph.get(), truth_paths);
     
     // A buffer we use for the TSV output
     vector<vector<tuple<int64_t, bool, int64_t, int64_t, string>>> buffers(get_thread_count());
@@ -183,7 +191,8 @@ int main_gampcompare(int argc, char** argv) {
             else {
                 cout << (get<0>(result) <= range);
             }
-            cout << '\t' << get<1>(result) << '\t' << get<2>(result) << '\t' << get<3>(result) << '\t' << aligner_name << '\t' << get<4>(result) << endl;
+            cout << '\t' << get<1>(result) << '\t' << get<2>(result) << '\t' << get<3>(result) << '\t' 
+                 << aligner_name << '\t' << get<4>(result) << endl;
         }
         buffer.clear();
     };
@@ -217,8 +226,13 @@ int main_gampcompare(int argc, char** argv) {
                         for (size_t j = 0; j < path_mapped_positions.size(); ++j) {
                             if (path_true_positions[i].second == path_mapped_positions[j].second) {
                                 // there is a pair of positions on the same strand of the same path
-                                abs_dist = min<int64_t>(abs_dist,
-                                                        abs<int64_t>(path_true_positions[i].first - path_mapped_positions[j].first));
+                                abs_dist = min<int64_t>(
+                                    abs_dist,
+                                    std::abs(
+                                        static_cast<int64_t>(path_true_positions[i].first) - 
+                                        static_cast<int64_t>(path_mapped_positions[j].first)
+                                    )
+                                );
                             }
                         }
                     }
@@ -238,7 +252,8 @@ int main_gampcompare(int argc, char** argv) {
         
         // put the result on the IO buffer
         auto& buffer = buffers[omp_get_thread_num()];
-        buffer.emplace_back(abs_dist, proto_mp_aln.subpath_size() > 0, proto_mp_aln.mapping_quality(), group_mapq, move(*proto_mp_aln.mutable_name()));
+        buffer.emplace_back(abs_dist, proto_mp_aln.subpath_size() > 0, proto_mp_aln.mapping_quality(), 
+                            group_mapq, std::move(*proto_mp_aln.mutable_name()));
         if (buffer.size() > buffer_size) {
 #pragma omp critical
             flush_buffer(buffer);
@@ -259,8 +274,7 @@ int main_gampcompare(int argc, char** argv) {
 
     if (test_file_name == "-") {
         if (!std::cin) {
-            cerr << "error[vg gampcompare]: Unable to read standard input when looking for mapped reads" << endl;
-            exit(1);
+            logger.error() << "Unable to read standard input when looking for mapped reads" << endl;
         }
         if (gam_input) {
             vg::io::for_each_parallel(std::cin, evaluate_gam_correctness);
@@ -271,8 +285,7 @@ int main_gampcompare(int argc, char** argv) {
     } else {
         ifstream test_file_in(test_file_name);
         if (!test_file_in) {
-            cerr << "error[vg gampcompare]: Unable to read " << test_file_name << " when looking for mapped reads" << endl;
-            exit(1);
+            logger.error() << "Unable to read " << test_file_name << " when looking for mapped reads" << endl;
         }
         if (gam_input) {
             vg::io::for_each_parallel(test_file_in, evaluate_gam_correctness);

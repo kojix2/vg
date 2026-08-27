@@ -3,11 +3,14 @@
 /// unit tests for the minimizer mapper
 
 #include <iostream>
-#include "vg/io/json2pb.h"
+#include "../io/json2graph.hpp"
+#include <bdsg/hash_graph.hpp>
 #include <vg/vg.pb.h>
 #include "../minimizer_mapper.hpp"
 #include "../build_index.hpp"
 #include "../integrated_snarl_finder.hpp"
+#include "../gbwt_extender.hpp"
+#include "../gbwt_helper.hpp"
 #include "xg.hpp"
 #include "vg.hpp"
 #include "catch.hpp"
@@ -23,13 +26,17 @@ public:
         gbwtgraph::DefaultMinimizerIndex minimizer_index,
         SnarlDistanceIndex* distance_index,
         PathPositionHandleGraph* handle_graph) 
-        : MinimizerMapper(gbwt_graph, minimizer_index, distance_index, handle_graph){};
+        : MinimizerMapper(gbwt_graph, minimizer_index, distance_index, nullptr, handle_graph){};
     using MinimizerMapper::MinimizerMapper;
     using MinimizerMapper::Minimizer;
     using MinimizerMapper::fragment_length_distr;
     using MinimizerMapper::faster_cap;
     using MinimizerMapper::with_dagified_local_graph;
+    using MinimizerMapper::longest_detectable_gap_in_range;
     using MinimizerMapper::align_sequence_between;
+    using MinimizerMapper::align_sequence_between_consistently;
+    using MinimizerMapper::connect_consistently;
+    using MinimizerMapper::to_anchor;
     using MinimizerMapper::fix_dozeu_end_deletions;
 };
 
@@ -85,7 +92,7 @@ TEST_CASE("Fragment length distribution gets reasonable value", "[giraffe][mappi
         gbwtgraph::GBWTGraph gbwt_graph;
         gbwt::GBWT gbwt;
         gbwt_graph.set_gbwt(gbwt);
-        gbwtgraph::DefaultMinimizerIndex minimizer_index;
+        gbwtgraph::DefaultMinimizerIndex minimizer_index(2);
         SnarlDistanceIndex distance_index;
         PathPositionHandleGraph* handle_graph;
         TestMinimizerMapper test_mapper (gbwt_graph, minimizer_index, &distance_index, handle_graph);
@@ -136,9 +143,9 @@ static void cover_in_minimizers(const std::string sequence, int core_width, int 
         m.value.is_reverse = false;
         m.length = core_width;
         
-        // We knowe the occurrences won't be used.
-        m.occs = nullptr;
-        m.hits = 1;
+        // We know the occurrences won't be used.
+        m.occs.first = nullptr;
+        m.occs.second = 1;
         m.score = 1;
     }
 
@@ -179,9 +186,9 @@ TEST_CASE("Mapping quality cap cannot be confused by fuzzing with high base qual
     TestMinimizerMapper::Minimizer minimizer_template;
     minimizer_template.value.is_reverse = false;
     
-    minimizer_template.hits = 229;
-    // We knowe the occurrences won't be used.
-    minimizer_template.occs = nullptr;
+    minimizer_template.occs.second = 229;
+    // We know the occurrences won't be used.
+    minimizer_template.occs.first = nullptr;
     minimizer_template.score = 1;
     
     for (size_t try_number = 0; try_number < 100000; try_number++) {
@@ -230,9 +237,9 @@ TEST_CASE("Mapping quality cap cannot be confused by fuzzing with high base qual
             m.value.is_reverse = false;
             m.length = core_width;
             
-            m.hits = 229;
-            // We knowe the occurrences won't be used.
-            m.occs = nullptr;
+            m.occs.second = 229;
+            // We know the occurrences won't be used.
+            m.occs.first = nullptr;
             m.score = 1;
         }
         
@@ -271,7 +278,7 @@ TEST_CASE("MinimizerMapper can map against subgraphs between points", "[giraffe]
         // Right anchor should be past end
         pos_t right_anchor {graph.get_id(h3), true, 2};
         
-        TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, &graph, &aligner, aln);
+        TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
         
         // Make sure we get the right alignment
         REQUIRE(aln.path().mapping_size() == 3);
@@ -284,6 +291,141 @@ TEST_CASE("MinimizerMapper can map against subgraphs between points", "[giraffe]
         REQUIRE(aln.path().mapping(2).position().node_id() == graph.get_id(h3));
         REQUIRE(aln.path().mapping(2).position().is_reverse() == !graph.get_is_reverse(h3));
         REQUIRE(aln.path().mapping(2).position().offset() == 0);
+}
+
+TEST_CASE("MinimizerMapper can map against subgraphs between abutting points", "[giraffe][mapping]") {
+
+        Aligner aligner;
+        HashGraph graph;
+        
+        // We have a big node
+        auto h1 = graph.create_handle("AAAAGAT");
+        auto h2 = graph.create_handle("TG");
+        graph.create_edge(h1, h2);
+        
+        Alignment aln;
+        aln.set_sequence("A");
+        
+        SECTION("Abutting points on same node") {
+            // Left anchor should be on start
+            pos_t left_anchor {graph.get_id(h1), false, 3};
+            // Right anchor should be past end
+            pos_t right_anchor {graph.get_id(h1), false, 3};
+            
+            TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
+            
+            // Make sure we get the right alignment
+            REQUIRE(aln.path().mapping_size() == 1);
+            REQUIRE(aln.path().mapping(0).position().node_id() == graph.get_id(h1));
+            REQUIRE(aln.path().mapping(0).position().is_reverse() == graph.get_is_reverse(h1));
+            REQUIRE(aln.path().mapping(0).position().offset() == offset(left_anchor));
+            REQUIRE(aln.path().mapping(0).edit_size() == 1);
+            REQUIRE(aln.path().mapping(0).edit(0).from_length() == 0);
+            REQUIRE(aln.path().mapping(0).edit(0).to_length() == 1);
+            REQUIRE(aln.path().mapping(0).edit(0).sequence() == "A");
+        }
+        
+        SECTION("Abutting points on different nodes") {
+            // Left anchor should be on start
+            pos_t left_anchor {graph.get_id(h1), false, 7};
+            // Right anchor should be past end
+            pos_t right_anchor {graph.get_id(h2), false, 0};
+            
+            TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
+
+            std::cerr << pb2json(aln) << std::endl;
+            
+            // Make sure we get the right alignment
+            REQUIRE(aln.path().mapping_size() == 1);
+            REQUIRE(aln.path().mapping(0).position().node_id() == graph.get_id(h1));
+            REQUIRE(aln.path().mapping(0).position().is_reverse() == graph.get_is_reverse(h1));
+            REQUIRE(aln.path().mapping(0).position().offset() == offset(left_anchor));
+            REQUIRE(aln.path().mapping(0).edit_size() == 1);
+            REQUIRE(aln.path().mapping(0).edit(0).from_length() == 0);
+            REQUIRE(aln.path().mapping(0).edit(0).to_length() == 1);
+            REQUIRE(aln.path().mapping(0).edit(0).sequence() == "A");
+        }
+}
+
+
+TEST_CASE("MinimizerMapper can map against subgraphs within a node", "[giraffe][mapping]") {
+
+    Aligner aligner;
+    HashGraph graph;
+    
+    // We have a big node
+    auto h1 = graph.create_handle("AAAAGATTG");
+    
+    Alignment aln;
+    aln.set_sequence("AGAT");
+    
+    // Left anchor should be on start
+    pos_t left_anchor {graph.get_id(h1), false, 3};
+    // Right anchor should be past end
+    pos_t right_anchor {graph.get_id(h1), false, 7};
+    
+    TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
+
+    // Make sure we get the right alignment
+    REQUIRE(aln.path().mapping_size() == 1);
+    REQUIRE(aln.path().mapping(0).position().node_id() == graph.get_id(h1));
+    REQUIRE(aln.path().mapping(0).position().is_reverse() == graph.get_is_reverse(h1));
+    REQUIRE(aln.path().mapping(0).position().offset() == offset(left_anchor));
+    REQUIRE(aln.path().mapping(0).edit_size() == 1);
+    REQUIRE(aln.path().mapping(0).edit(0).from_length() == 4);
+    REQUIRE(aln.path().mapping(0).edit(0).to_length() == 4);
+    REQUIRE(aln.path().mapping(0).edit(0).sequence() == "");
+
+}
+
+TEST_CASE("MinimizerMapper can find mappings where the alignment turns around from the right", "[giraffe][mapping]") {
+
+    Aligner aligner;
+    HashGraph graph;
+    
+    auto h1 = graph.create_handle("AAAAGAT");
+    auto h_in = graph.create_handle("G");
+    graph.create_edge(h_in, h1);
+    graph.create_edge(graph.flip(h_in), h1);
+    
+    Alignment aln;
+    aln.set_sequence("TTTTGAAAAGA");
+    
+    // Left anchor is empty
+    pos_t left_anchor;
+    // Right anchor is at past-end
+    pos_t right_anchor {graph.get_id(h1), false, 6};
+    
+    TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
+
+    // Make sure we get the right alignment
+    REQUIRE(aln.path().mapping_size() == 3);
+    REQUIRE(aln.path().mapping(0).position().node_id() == graph.get_id(h1));
+    REQUIRE(aln.path().mapping(0).position().is_reverse() == !graph.get_is_reverse(h1));
+    REQUIRE(aln.path().mapping(0).position().offset() == 3);
+    REQUIRE(aln.path().mapping(0).edit_size() == 1);
+    REQUIRE(aln.path().mapping(0).edit(0).from_length() == 4);
+    REQUIRE(aln.path().mapping(0).edit(0).to_length() == 4);
+    REQUIRE(aln.path().mapping(0).edit(0).sequence() == "");
+    REQUIRE(aln.path().mapping(1).position().node_id() == graph.get_id(h_in));
+    REQUIRE(aln.path().mapping(1).position().is_reverse() == graph.get_is_reverse(h_in));
+    REQUIRE(aln.path().mapping(1).position().offset() == 0);
+    REQUIRE(aln.path().mapping(1).edit_size() == 1);
+    REQUIRE(aln.path().mapping(1).edit(0).from_length() == 1);
+    REQUIRE(aln.path().mapping(1).edit(0).to_length() == 1);
+    REQUIRE(aln.path().mapping(1).edit(0).sequence() == "");
+    REQUIRE(aln.path().mapping(2).position().node_id() == graph.get_id(h1));
+    REQUIRE(aln.path().mapping(2).position().is_reverse() == graph.get_is_reverse(h1));
+    REQUIRE(aln.path().mapping(2).position().offset() == 0);
+    REQUIRE(aln.path().mapping(2).edit_size() == 1);
+    REQUIRE(aln.path().mapping(2).edit(0).from_length() == 6);
+    REQUIRE(aln.path().mapping(2).edit(0).to_length() == 6);
+    REQUIRE(aln.path().mapping(2).edit(0).sequence() == "");
+
+    // TODO: We can't find the same alignment from the left because we'd need
+    // to see more of the anchor node than we anchored on.
+    
+    // TODO: We can't handle a hairpin directly inside the anchor node.
 }
 
 TEST_CASE("MinimizerMapper can map an empty string between odd points", "[giraffe][mapping]") {
@@ -308,19 +450,17 @@ TEST_CASE("MinimizerMapper can map an empty string between odd points", "[giraff
                 {"id": "55511925", "sequence": "CTTCCTTCC"}
             ]
         })";
-        
-        // TODO: Write a json_to_handle_graph
-        vg::Graph proto_graph;
-        json2pb(proto_graph, graph_json.c_str(), graph_json.size());
-        auto graph = vg::VG(proto_graph);
-        
+
+        bdsg::HashGraph graph;
+        vg::io::json2graph(graph_json, &graph);
+
         Alignment aln;
         aln.set_sequence("");
-        
+
         pos_t left_anchor {55511921, false, 5}; // This is on the final base of the node
         pos_t right_anchor {55511925, false, 6};
         
-        TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, &graph, &aligner, aln);
+        TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
         
         // Make sure we get the right alignment. We should see the last base of '21 and go '21 to '24 to '25 and delete everything
         REQUIRE(aln.path().mapping_size() == 3);
@@ -333,6 +473,352 @@ TEST_CASE("MinimizerMapper can map an empty string between odd points", "[giraff
         REQUIRE(aln.path().mapping(2).position().node_id() == 55511925);
         REQUIRE(aln.path().mapping(2).position().is_reverse() == false);
         REQUIRE(aln.path().mapping(2).position().offset() == 0);
+}
+
+TEST_CASE("MinimizerMapper can map with an initial deletion", "[giraffe][mapping][right_tail]") {
+
+        Aligner aligner;
+
+        string graph_json = R"({
+            "edge": [
+                {"from": "1", "to": "2"},
+                {"from": "1", "to": "3"}
+            ],
+            "node": [
+                {"id": "1", "sequence": "T"},
+                {"id": "2", "sequence": "GATTACA"},
+                {"id": "3", "sequence": "CATTAG"}
+            ]
+        })";
+
+        bdsg::HashGraph graph;
+        vg::io::json2graph(graph_json, &graph);
+
+        Alignment aln;
+        aln.set_sequence("CATTAG");
+        
+        pos_t left_anchor {1, false, 0}; // This includes the base on node 1
+        pos_t right_anchor = empty_pos_t();
+        
+        TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
+
+        // Make sure we get the right alignment. We should have a 1bp deletion and then the matching node.
+        REQUIRE(aln.path().mapping_size() == 2);
+        REQUIRE(aln.path().mapping(0).position().node_id() == 1);
+        REQUIRE(aln.path().mapping(0).position().is_reverse() == false);
+        REQUIRE(aln.path().mapping(0).position().offset() == 0);
+        REQUIRE(aln.path().mapping(0).edit_size() == 1);
+        REQUIRE(aln.path().mapping(0).edit(0).from_length() == 1);
+        REQUIRE(aln.path().mapping(0).edit(0).to_length() == 0);
+        REQUIRE(aln.path().mapping(0).edit(0).sequence().empty());
+        REQUIRE(aln.path().mapping(1).position().node_id() == 3);
+        REQUIRE(aln.path().mapping(1).position().is_reverse() == false);
+        REQUIRE(aln.path().mapping(1).position().offset() == 0);
+        REQUIRE(aln.path().mapping(1).edit_size() == 1);
+        REQUIRE(aln.path().mapping(1).edit(0).from_length() == 6);
+        REQUIRE(aln.path().mapping(1).edit(0).to_length() == 6);
+        REQUIRE(aln.path().mapping(1).edit(0).sequence().empty());
+}
+
+TEST_CASE("MinimizerMapper can map with an initial deletion on a multi-base node", "[giraffe][mapping][right_tail]") {
+
+        Aligner aligner;
+
+        string graph_json = R"({
+            "edge": [
+                {"from": "1", "to": "2"},
+                {"from": "1", "to": "3"}
+            ],
+            "node": [
+                {"id": "1", "sequence": "TATA"},
+                {"id": "2", "sequence": "GATTACA"},
+                {"id": "3", "sequence": "CATTAG"}
+            ]
+        })";
+
+        bdsg::HashGraph graph;
+        vg::io::json2graph(graph_json, &graph);
+
+        Alignment aln;
+        aln.set_sequence("CATTAG");
+        
+        pos_t left_anchor {1, false, 3}; // This includes the last base on node 1
+        pos_t right_anchor = empty_pos_t();
+        
+        TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
+
+        // Make sure we get the right alignment. We should have a 1bp deletion and then the matching node.
+        REQUIRE(aln.path().mapping_size() == 2);
+        REQUIRE(aln.path().mapping(0).position().node_id() == 1);
+        REQUIRE(aln.path().mapping(0).position().is_reverse() == false);
+        REQUIRE(aln.path().mapping(0).position().offset() == 3);
+        REQUIRE(aln.path().mapping(0).edit_size() == 1);
+        REQUIRE(aln.path().mapping(0).edit(0).from_length() == 1);
+        REQUIRE(aln.path().mapping(0).edit(0).to_length() == 0);
+        REQUIRE(aln.path().mapping(0).edit(0).sequence().empty());
+        REQUIRE(aln.path().mapping(1).position().node_id() == 3);
+        REQUIRE(aln.path().mapping(1).position().is_reverse() == false);
+        REQUIRE(aln.path().mapping(1).position().offset() == 0);
+        REQUIRE(aln.path().mapping(1).edit_size() == 1);
+        REQUIRE(aln.path().mapping(1).edit(0).from_length() == 6);
+        REQUIRE(aln.path().mapping(1).edit(0).to_length() == 6);
+        REQUIRE(aln.path().mapping(1).edit(0).sequence().empty());
+}
+
+TEST_CASE("MinimizerMapper can map right off the past-the-end base", "[giraffe][mapping][right_tail]") {
+
+        Aligner aligner;
+
+        string graph_json = R"({
+            "edge": [
+                {"from": "1", "to": "2"},
+                {"from": "1", "to": "3"}
+            ],
+            "node": [
+                {"id": "1", "sequence": "T"},
+                {"id": "2", "sequence": "GATTACA"},
+                {"id": "3", "sequence": "CATTAG"}
+            ]
+        })";
+
+        bdsg::HashGraph graph;
+        vg::io::json2graph(graph_json, &graph);
+
+        Alignment aln;
+        aln.set_sequence("CATTAG");
+
+        pos_t left_anchor {1, false, 1}; // This is the past-end position
+        pos_t right_anchor = empty_pos_t();
+        
+        TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
+
+        // Make sure we get the right alignment. We should pick the matching node and use it. 
+        REQUIRE(aln.path().mapping_size() == 1);
+        REQUIRE(aln.path().mapping(0).position().node_id() == 3);
+        REQUIRE(aln.path().mapping(0).position().is_reverse() == false);
+        REQUIRE(aln.path().mapping(0).position().offset() == 0);
+        REQUIRE(aln.path().mapping(0).edit_size() == 1);
+        REQUIRE(aln.path().mapping(0).edit(0).from_length() == 6);
+        REQUIRE(aln.path().mapping(0).edit(0).to_length() == 6);
+        REQUIRE(aln.path().mapping(0).edit(0).sequence().empty());
+}
+
+TEST_CASE("MinimizerMapper can compute longest detectable gap in range", "[giraffe][mapping]") {
+    Alignment aln;
+    aln.set_sequence("GATTACACATTAGGATTACACATTAG");
+    Aligner aligner;
+
+    size_t whole_sequence_gap = TestMinimizerMapper::longest_detectable_gap_in_range(aln, aln.sequence().begin(), aln.sequence().end(), &aligner);
+    size_t first_base_gap = TestMinimizerMapper::longest_detectable_gap_in_range(aln, aln.sequence().begin(), aln.sequence().begin() + 1, &aligner);
+    size_t last_base_gap = TestMinimizerMapper::longest_detectable_gap_in_range(aln, aln.sequence().end() - 1, aln.sequence().end(), &aligner);
+    size_t left_subrange_gap = TestMinimizerMapper::longest_detectable_gap_in_range(aln, aln.sequence().begin() + 4,aln.sequence().begin() + 7, &aligner);
+    size_t right_subrange_gap = TestMinimizerMapper::longest_detectable_gap_in_range(aln, aln.sequence().end() - 7, aln.sequence().end() - 4, &aligner);
+
+    // Having the whole sequence should give you the longest gap
+    REQUIRE(whole_sequence_gap > left_subrange_gap);
+    // Subranges equal distances from the ends should have equal gaps
+    REQUIRE(left_subrange_gap == right_subrange_gap);
+    // Being right at the end should have the smallest gap
+    REQUIRE(left_subrange_gap > first_base_gap);
+    // The end bases as subranges should have equal gaps
+    REQUIRE(first_base_gap == last_base_gap);
+}
+
+TEST_CASE("MinimizerMapper can find a significant indel instead of a tempting softclip", "[giraffe][mapping][left_tail]") {
+
+        Aligner aligner;
+
+        string graph_json = R"({
+            "edge": [{"from": "30788083", "to": "30788088"}, {"from": "30788083", "to": "30788084"}, {"from": "30788074", "to": "30788075"}, {"from": "30788074", "to": "30788076"}, {"from": "30788079", "to": "30788080"}, {"from": "30788079", "to": "30788081"}, {"from": "30788086", "to": "30788088"}, {"from": "30788086", "to": "30788087", "to_end": true}, {"from": "30788075", "to": "30788077"}, {"from": "30788073", "to": "30788074"}, {"from": "30788078", "to": "30788079"}, {"from": "30788077", "to": "30788078"}, {"from": "30788084", "to": "30788088"}, {"from": "30788084", "to": "30788085"}, {"from": "30788076", "to": "30788077"}, {"from": "30788087", "from_start": true, "to": "30788088"}, {"from": "30788081", "to": "30788082"}, {"from": "30788080", "to": "30788082"}, {"from": "30788082", "to": "30788088"}, {"from": "30788082", "to": "30788083"}, {"from": "30788085", "to": "30788086"}], "node": [{"id": "30788083", "sequence": "AAA"}, {"id": "30788074", "sequence": "AAAAAAAATACAAAAAATTAGC"}, {"id": "30788079", "sequence": "CGCCACTGCACTCCAGCCTGGGC"}, {"id": "30788086", "sequence": "AAAAAAA"}, {"id": "30788075", "sequence": "T"}, {"id": "30788073", "sequence": "GAAAGAGAGTTGTTTAAATTCCATAGTTAGGGCCGGGCGCGGTGGCTCACGCCTGTAATCCCAGCACTTTGGGAGGCCGAGGCGGGCGGATCACGAGGTCAGGAGATCGAGACCATCCTGGCTAACACGGTGAAACCCCGTCTCTACTA"}, {"id": "30788078", "sequence": "G"}, {"id": "30788077", "sequence": "GGGCGTGGTAGCGGGCGCCTGTAGTCCCAGCTACTCGGGAGGCTGAGGCAGGAGAATGGCGTGAACCCGGGAGGCGGAGCTTGCAGTGAGCCGAGATC"}, {"id": "30788084", "sequence": "A"}, {"id": "30788088", "sequence": "AATTCCATAGTTAGAAAAATAAGACATATCAGGTTTTCAAAAAGTGTAGCCATTTTCTGTTTCTAAAAGGGACACTTAAAGTGAAA"}, {"id": "30788076", "sequence": "C"}, {"id": "30788087", "sequence": "T"}, {"id": "30788081", "sequence": "A"}, {"id": "30788080", "sequence": "G"}, {"id": "30788082", "sequence": "ACAGAGCGAGACTCCGTCTCAAAAAAAAAAAAAA"}, {"id": "30788085", "sequence": "AA"}]
+        })";
+
+        bdsg::HashGraph graph;
+        vg::io::json2graph(graph_json, &graph);
+        
+        Alignment aln;
+        aln.set_sequence("TTGAAAACCTGATATGTCTTATTTTTCTAACTATGGAATTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTGAGACGGAGTCTCGCTCTGTCGCCCAGGCTGGAGTGCAGTGGCGCGATCTCGGCTCACTGCAAGCTCCGCCTCCCGGGTTCACGCCATTCTCCTGCCTCAGCCTCCCGAGTAGCTGGGACTACAGGCGCCCGCTACCACGCCCGGCTAATTTTTTGTATTTTTTTT");
+        
+        pos_t left_anchor = empty_pos_t();
+        pos_t right_anchor = {30788073, true, 0};
+        
+        // The case that prompted this unit test was caused by
+        // misunderestimating the longest detectable gap length when the tail
+        // is nearly all of the read. So do the max gap length estimation.
+        size_t max_gap_length = TestMinimizerMapper::longest_detectable_gap_in_range(aln, aln.sequence().begin(), aln.sequence().end(), &aligner);
+        TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, aln.sequence().size() + max_gap_length, max_gap_length, &graph, &aligner, aln);
+
+        // First edit shouldn't be a softclip
+        REQUIRE(aln.path().mapping_size() > 0);
+        REQUIRE(aln.path().mapping(0).edit_size() > 0);
+        REQUIRE(aln.path().mapping(0).edit(0).sequence().empty());
+}
+
+TEST_CASE("MinimizerMapper can align a reverse strand string to the middle of a node", "[giraffe][mapping]") {
+
+        Aligner aligner;
+        
+        string graph_json = R"({
+            "node": [
+                {"id": "48732576", "sequence": "GACAGCTTGTGGCCTTCGTTGGAAACGGGATTTCTTCATACTATGCTAGACAGAAGAATACTCAGTAACTTCCTTGTGTTGTGTGTATTCAACTCACAGAGTTGAACGATGGTTTACACAGAGCAGATTTGAAACACTCTTTTTGTGGAATTAGCAAGTGGAGATTTCAGCCGCTTTGAGGTCAATGGTAGAAAAGGAAATATCTTCGTATAAAAACTAGACAGAATGATTCTCAGAAACTCCTTTGTGATGTGTGCGTTCAACTCACAGAGTTTAACCTTTCTTTTCATAGAGCAGTTAGGAAACACTCTGTTTGTAAAGTCTGCAAGTGGATATTCAGACCTCTTTGAGGCCTTCGTTGGAAACGGGTTTTTTTCATATAAGGCTAGACAGAAGAATTCCTAGTAATTTCCTTGTGTTGTGTGTGTTCAACTCACAGAGTTGAACTTTCATTTACACAGAGCAGATTTGAAACACTCTTTTTGTGGAATTTGCAAGTGGAGATTTCAAGCGCTTTGAGACCAAAGGCAGAAAAGGATATATCTTCGTATAAAAACTAGACAGAATCATTCTCAGAAAATGCTCTGCGATGTGTGCGTTCAACTCTCAGAGTTTAACTTTTCTTTTCATTCAGCAGTTTGGAAACAATCTGTTTGTAAAGTCTGCACGTGGATAATTTGACCACTTAGAGGCCTTCGTTGGAAACGGGTTTTTTTCATGTAAGGCTAGACACAATTCTCAGTAACTTCCTTGTGTTGTGTGTATTCAACTCACAGAGTTGAACGATCCTTTACACAGAGCATACTTGGAACACTCTTTTTGTGGAAGTTGCAAGTGGAGATTTCAGCCGCTTTGAAGTCAAAGGTAGAAAAGGAAATATCTTCCTATAAAAACTAGACAGAATGATTCTCAGAAACTCCTTTGTGATGTGTGCATTCAACTCACAGAGTTTAACCTTTCTTTTCATAGAGCAGTTAGGAAACACTCTGTTTGTAAAGTCTGCAAGTGGATATTCAGACCTCTT"}
+            ]
+        })";
+        
+        vg::VG graph;
+        vg::io::json2graph(graph_json, &graph);
+        
+        Alignment aln;
+        aln.set_sequence("CAAATTCCACAAAAAGAGTGTTACAAGTCTGCTCTGTGTAAAGGATCGTTCAACTCTGGGAGTTGAATACACACAACACGCGGAAGTTACTGAGAATTCTTCTGTCTAGCCTTACATGAAAAAAACCCGTTTCCAACGAAGGCCTCAAAGAGGTCAAAATATCCACTTGCAGACTTTACAAACAGAGTGTTTCCTAACTACTCTATGAATAGAAAGGTTAAACTCTGTGAGATGAACACACACATCACAAAGGAGTTTCTGAGAATCATTCTGTCTAGTTTTTATAGGAAGATATTTCCTTTTCTACCATTGACCTCAAAGCGGCTGAAATCTCCACTTGCAAATTCCTCAAAAAGAGTGTTTCAAGTCTGCTCTGTGTAAAGGATCGTCAACTCTGTGAGTTGAATACACACAACACGCGGAAGTTACTGAGAATTCTTCTGTCTAGCATAGTATGAAGAAATCCCGTTTCCAACGAAGGCCTCAAAGAGGTCTGAATATCCACTTGCAGAGTTTACAAACAGAGTGTTTCCTAACTGCTCTATGAAAAGAAAGGTTAAACTCTGTGAGTTGAACGCACACATCACAAAGAAGTTTCTGAGAATCATCTGTCTAGTTTTTATACGAAGATATTTCCTTTTCTACCATTGACCTCAAAGCGGCTGAAATCTCCACTTGCAAATTCCACAAAAAGAGTGTTT");
+
+
+        pos_t left_anchor {48732576, true, 193};
+        pos_t right_anchor {48732576, true, 893};
+        
+        TestMinimizerMapper::align_sequence_between(left_anchor, right_anchor, 800, 50, &graph, &aligner, aln);
+
+        // We demand a positive-score alignment
+        REQUIRE(aln.score() > 0);
+}
+
+TEST_CASE("MinimizerMapper can align a long tail", "[giraffe][mapping]") {
+
+        Aligner aligner;
+        
+        string graph_json = R"(
+            {"edge": [{"from": "28131", "to": "28132"}, {"from": "28132", "to": "28133"}, {"from": "28130", "to": "28131"}, {"from": "28129", "to": "28130"}, {"from": "28128", "to": "28129"}], "node": [{"id": "28131", "sequence": "GAATTATGATCAAATGGAATCGAATGTAATCATCATCAAATGGAATCAAAAATAACCATCATCAATTGGTATTGAATGGAATTGTCATCAAATGGAATTCAAAGGAATCATCATCAAATGGAACCGAATGGAATCCTCATTGAATGGAAATGAAAGGGGTCATCATCTAATGGAATCGCATGGAATCATCATCAAATGGAATCGAATGGAATCATCATCAAATGGAATCTAATGGAATCATTGAACAGAATTGAATGGAATCGTCATCGAATGAATTGAATGCAATCATCGAATGGTCTCGAATGGAATCATCTTCTAATGGAAAGGAATGGAATCATCGCATAGAATCGAATGGAATTATCATCGAATGGAATCGAATGGTATCAACACCAAACGGAAAAAAACGGAATTATCGAATGGAATCGAAGAGAATCTTCGAACGGACCCGAATGGAATCATCTAATGGAATGGAATGGAATAATCCATGGACTCGAATGCAATCATCATCGAATGGAATCGAATGGAATCATCGAATGGACTCGAATGGAATAATCATTGAACGGAATCGAATGGAATCATCATCGGATGGAAACGAATGGAATCATCATCGAATGGAAATGAAAGGAGTCATCATCTAATGGAATTGCATGGAATCATCATAAAATGGAATCGAATGGAATCAACATCAAATGGAATCAAATGGAATCATTGAACGGAATTGAATGGAATCGTCATCGAATGAATTGACTGCAATCATCGAATGGTCTCGAATGGAATCATCTTCAAATGGAATGGAATGGAATCATCGCATAGAATCGAATGGAATTATCATCGAATGGAATCGAATGGAATCAACATCAAACGGAAAAAAACAGAATTATCGTATGGAATCGAAGAGAATCATCGAGTGGACCCGAATGGAATCATCTAATGGAATGGAATGGAATAATCCATGGACTCGAATGCAATCATCATCGAATGGAATCGAATGGAATCATCGAATGGACTCGAATGGAATAATCAT"}, {"id": "28132", "sequence": "TGAACGGAATCGAATGGAATCATCATCGGATGGAAATGAATGGAATCATCATCGAATGGAATCGAATAGAATTATGGAATGAAATCCAGTGTGATCATCATCGAATGGACCCGAATGGAATCATCATCCAACGGAAGCTAATGGAATCAACATCGAATGAATCGAATGGAAACACCATCGAATTGAAACGAATGGAATTATCATGAAATTGAAATGGATGGACTCATCATCGAATGGATTCGAATGGAATCATCGAATAAAATTGATTGAAATCATCATCCAATGGAATCGAATGGTATCATTGAATGGAATCGAATGGAATCATCATCAGATGGAAATGAATGGAATCGTCATAGAATGGAATCGAATGGATTCATTGAATGGAATCAGATGGAATCATCGAATGGACTGGAATGGAATCATTGAATGGACTCGAAAGGGATCATGATTGAATGGAATTGAATGGAATCATCGAATGGTCTCGATTGGAATCATTATCAAATGGAATCGAATGGAATCATCGAATAGAATCGAATGGAACAATCATCGAATGTACTCAAATGGAATTATCCTCAAATGGAATCGAATGGAATTATCGAATGCAATCGAATGGAATTATCGAATGCAATCGAATAGAATCATCGAATGGACTCGAATGGAATCATCGAATGGAATGGAATGGAACAGTCAATGAACACGAATGGAATCATCATTGAATGGAATCTAATGGAATCATCGAGTGGAATCGAATGGAATTATGATCAAATGGAATCGAATGTAATCATCATCAAATGGAATCAAAAATAACCATCATCAATTGCTATTGAATGGAATTGTCATCAAATGGAATTCAAAGGAATCATCATCAAATGGAACCGAATGGAATCCTCATTGAATGGAAATGAAAGGGGTCATCATCTAATGGAATCGCATGGAATCATCATCAAATGGAATCGAATGGAATCATCATCAAATGGAATCTAATGGAATCATTGAACAGAATTGAATGGAATCGTCATCGAAT"}, {"id": "28133", "sequence": "GAATTGAATGCAATCATCGAATGGTCTCGAATGGAATCATCTTCTAATGGAAAGGAATGGAATCATCGCATAGAATCGAATGGAATTATCATCGAATGGAATCGAATGGTATCAACACCAAACGGAAAAAAACGGAATTATCGAATGGAATCGAAGAGAATCTTCGAACGGACCCGAATGGAATCATCTAATGGAATGGAATGGAATAATCCATGGACTCGAATGCAATCATCATCGAATGGAATCGAATGGAATCATCGAATGGACTCGAATGGAATAATCATTGAACGGAATCGAATGGAATCATCATCGGATGGAAACGAATGGAATCATCATCGAATGGAAATGAAAGGAGTCATCATCTAATGCAATTGCATGGAATCATCATCAAATAGAATCGAATGGAATCAACATCAAATGGAATCTAATGGAATCATTGAACAGAATTGAATGGAATCGTCATCGAATGAATTGACTGCAATCATCGAATGGTCTCGAATGGAATCATCTTCAAATGGAATGGAATGGAATCATCGCATAGAATCGAATGGAATTATCATCGAATGGAATCGAATGGAATCAACAACAAACGGAAAAAAACGGAATTATCGAATGGAATCGAAGAGAATCATCGAATGGACCCGAATGGAATCATCTAATGGAATGGAATGGAATAATCCATGGACTCGAATGCAATCATCATCGAATGGAATCGAATGGAATCATCGAATGGACTCGAATGGAATAATCATTGAACGGAATCGAATGGAATCATCATCGGATGGAAATGAATGGAATCATCATCGAATGGAATCGAATAGAATTATGGAATGAAATCCAGTGTGGTCATCATCGAATGGACCCGAATGGAATCATCATCCAACGGAAGCTAATGGAATCAACATCGAATGAATCAAATGGAAACACCATCGAATTGAAACGAATGGAATTATCATGAAATTGAAACGGATGGACTCATCATCGAATGGATTCGAATGGAATCATCGAATAAAATTGATTGAAA"}, {"id": "28130", "sequence": "ATCATCGAATGGTCTCGAATGGAATCATCTTCTAATGGAAAGGAATGGAATCATCGCATAGAATCGAATGGAATTATCATCGAATGGAATCGAATGGTATCAACACCAAACGGAAAAAAACGGAATTATCGAAAGGAATCGAAGAGAATCTTCGAACGGACCCGAATGGAATCATCTAATGGAATGGAATGGAATAATCCATGGACTCGAATGCAATCATCATCGAATGGAATCGAATGGAATCATCGAATGGACTCGAATGGAATAATCATTGAACGGAATCGAATGGAATCATCATCGGATGGAAATGAATGGAATCATCATCGAATGGAATCGAATAGAATTATGGAATGAAATCCAGTGTGATCATCATCGAATGGACCCGAATGGAATCATCATCCAACAGAAGCTAATGGAATCAACATCGAATGAATCGAATGGAAACACCATCGAATTCAAACGAATGGAATTACCATGAAATTGAAATGGATGGACTCATCATCGAATGGATTCGGATGGAATCATCGAATAAAATTGATTGAAATCATCATCGAATGGAATCGAATGGTATCATTGAATGGAATCGAATGGAATCATCATCAGATGGAAATGAATGGAATCGTCATAGAATGGAATCGAATGGATTCATTGAATGGAATCAGATGGAATCATCGAATGGACTGGAATGGAATCATTGAATGGACTCGAAAGGGATCATGATTGAATGGAATTGAATGGAATCATCGAATGGTCTCGATTGGAATCATTATGAAATGGAATCGAATGGAATCACCGAATAGAATCGAATGGAACAATCATCGAATGGACTCAAATGGAATTATCCTCAAATGGAATCGAATGGAATTATCAAATGCAATCGAATGGAATTATCGAATGCAATCGAATAGAATCATCGAATGGACTCGAATGGAATCATCGAATGGAATGGAATGGAACAGTCAATGAACTCGAATGGAATCATCATTGAATGGAATCGAATGTAATCATCCAGTGGAATCGAATG"}, {"id": "28129", "sequence": "CTCGATTGGAATCATTATCAAATGGAATCGAATGGAATCACCGAATAGAATCGAATGGAACAATCATCGAATGGACTCAAATGGAATTATCCTCAAATGGAATCGAATGGAATTATCGAATGCAATCGAATGGAATTATCGAATGCAATCGAATAGAATCATCGAATGGACTCGAATGGAATCATCGAATGGAATGGAATGGAACAGTCAATGAACACGAATGGAATCATCATTGAATGGAATCGAATGGAATCATCGAGTGGAATCGAATGGAATTATGATCAAATGGAATCGAATGTAATCATCATCAAATGGAATCAAAAATAACCATCATCAATTGGTATTGAATGGAATTGTCATCAAATGGAATTCAAAGGAATCATCATCAAATGGAACCGAATGGAATCCTCATTGAATGGAAATGAAAGGGGTCATCATCTAATGGAATCGCATGGAATCATCACCAAATGGAATCGAATGGAATCATCATCAAATGGAATCTAATGGAATCATTGAACAGAATTGAATGGAATCGTCATCGAATGAATTGAATGCAATCATCGAATGGTCTCGAATGGAATCATCTTCTAATGGAAAGGAATGGAATCATCGCATAGAATCGAATGGAATTATCATCGAATGGAATCGAATGGTATCAACACCAAACGGAAAAAAACGGAATTATCGAATGGAATCGAAGAGAATCTTCGAACGGACCCGAATGGAATCATCTAATGGAATGGAATGGAATAATCCATGGACTCGAATGCAATCATCATCGAATGGAATCGAATGGAATCATCGAATGGACTCGAATGGAATAATCATTGAACGGAATCGAATGGAATCATCATCGGATGGAAACGAATGGAATCATCATCGAATGGAAATGAAAGGAGTCATCATCTAATGCAATTGCATGGAATCATCATCAAATGGAATCGAATGGAATCAACATCAAATGGAATCTAATGGAATCATTGAACAGAATTGAATGGAATCGTCATCGAATGAATTGACTGCA"}, {"id": "28128", "sequence": "ATCCATGGACTCGAATGCAATCATCATCGAATGGAATCGAATGGAATCATCAAATGGACTCGAATGGAATAATCATTGAACGGAATCGAATGGAATCATCATCGGATGGAAACGAATGGAATCATCATCGAATGGAAATGAAAGGAGTCATCATCTAATGGAATTGCATGGAATCATCATAAAATGGAATCGAATGGAATCAATATCAAATGGAATCAAATGGAATCATTGAACGGAATTGAATGGAATCGTCATCGAATGAATTGACTGCAATCATCGAATGGTCTCGAATGGAATCATCTTCAAATGGAATGGAATGGAATCATCGCATAGAATCGAATGGAATTATCATCGAATGGAATCGAATGGAATCAACATCAAACGGAAAAAAACGGAATTATCGAATGGAATCGAAGAGAATCATCGAATGGACCCGAATGGAATCATCTAATGGAATGGAATGGAATAATCCATGGACTCGAATGCAATCATCATCGAATGGAATCGAATGGAATCATCGAATGGACTCGAATGGAATAATCATTGAACGGAATCGAATGGAATCATCATCGGATGGAAATGAATGGAATCATCATCGAATGGAATCGAATAGAATTATGGAATGAAATCCAGTGTGATCATCATCGAATGGACCCGAATGGAATCATCATCCAACGGAAGCTAATGGAATCAACATCGAATGAATCGAATGGAAACACCATCGAATTGAAACGAATGGAATTATCATGAAATTGAAATGGATGGACTCATCATCGAATGGATTCGAATGGAATCATCGAATAAAATTGATTGAAATCATCATCGAATGGAATCGAATGGTATCATTGAATGGAATCGAATGGAATCATCATCAGATGGAAATGAATGGAATCGTCATAGAATGGAATCGAATGGATTCATTGAATGGAATCAGATGGAATCATCGAATGGACTGGAATGGAATCATTGAATGGACTCGAAAGGGATCATGATTGAATGGAATTGAATGGAATCATCGAATGGT"}]}
+        )";
+        
+        vg::VG graph;
+        vg::io::json2graph(graph_json, &graph);
+        
+        Alignment aln;
+        aln.set_sequence("TGGATGATGATTCCATTTGGGTCCATTCGATGATGATCACACTGGATTTCATTCCATAATTCTATTCGATTCCATTCGATGATGATTCCATACATTTCCATCCGATGATGATTCCATTCGATTCCGTTCAATGATTATTCCATTCGAGTCCATTCGATGATTCCATTCGATTCCATTCGATGATGATTGCATTCGAGTCCATGGATTATTCCATTCCATTCCATTAGGTGATTCCATTCGGGTCCGTTCGAAGATTCTCTTCGATTCCATTCGATAATTCCGTTTTTTTCCGTTTGATGTTGATTCCATTCGACTCCATTCGATGATAATTCCACTCGATTCTATGCGATGATTCCATTCCATTCCATTTGAAGATGATTCCATTCGAGACCATTCGATGATTGCATTCAATTCATTCGATGACGATTCCATTCAATTCCGTTCAATGATTCCATTTGATTCCATTTGATGTTGATTCCATTCGATTCCATTTTATGATGATTCCATGCAATTCCATTAGATGATGACTCCTTTCATTTCCATTCGATGATGATTCCATTCGGTTCCATTTGATGATGATTCCTTTGAATTCCGTTTGATGACAATTCCATTCAATACCAATTGATGATGGTTATTTTTGATTCCATTTGATGAGGATTACATTCGATTCCATTGGATCATAATTCCATTCGATTCCACTCGATGATTCCATTCGATTCCATTCAATGATGATTCCATTCGAGTTCATTGACTGTTCCATTCCATTCCATTCGATGATTCCATTCGAGTCCATTCGATGATTCTATTCGATTGCATTCGATAATTCCATTCGATTGCATTCGATAATTCCCTTCGATTCCATTTGAGGATAATTCCATTTGAGTCCATTCGATGATTGTTCCATTCGATTCTATTCGGTGATTCCATTCGATTCCATTTGATAATGATTCCAATCGAGACCATTCGATGATTCCATTCAATTCCATTCAACAATGATTCCATTCGAGTCCATTCAATGATTCCATTCCAGTCCATTCGATGATTCCATCTGACTCCATTCAATGAATCCATTCGATTCCATTCTATGACGATTCCATTCATTTCCATCTGATGATGATTCCATTCGATCCCATCCAATGACACCATTCGATTCCATTCGATGATGATTTCAATCAATTTTATTCGATGATTCCATTCGAATCCATTCGATGATGGGTCCATCCATTTCAATTTCATGATAATTCCATTCGTTTCAATTCGATGGTTTTTCCATTCGATTCATTCGATGTTGATTCCATTAGCTTCCGTTGGATGATGATTCCATTCGGGTCCATTCGATGATGATCACACTGGATTTCATTCCATAATTCTATTCGATTCCATTCGATGATGATTCCATTCATTTCCATCCGATGATGATTCCATTCGATTCCGTTCAATGATTATTCCATTCGAGTCCATTCGATGATTCCATTCGATTCCATTCGATGATGATTGCATTCGAGTCCATGGATTATTCCATTCCATTCCATTAGATGATTCCATTCGGGTCCGTTCGAAGATTCTCTTCGATTCCATTCGATAATCCCGTTTTTTTCCGTTTGATATTGATACCATTCGATTCCATTCAATGATAATTCCATTCGATTCTATGCGATGATTCCATTCCATTCCATTGGAAGATGATTCCATTCGAGACCATTCGATGATTGCATTCAATTCATTCGATGACGATTCCATTCAATTCCGTTCAATGATTCCATTTGATTCCATTTGATGTTGATTCCATTCGATTCCATTTGATGATGATTCCATGCAATTCCATTAGATGATGACTCCTTTCATTTCCATTCGATGATGATTCCATTCGTTTCCATCCGAAGATGATTCCATTCGATTCCGTTCAATGATTATTCCATTCGAGTCCATTCGATGATTCCATTCGATTCTATACGATGATGATTGCATTCGAGTCCGTGGATCATTCCATTCAATTCCATTAGATTATTCCATTCGAGTCCATTCGATGATTCTCTTCGATTACATTCGACGATGATTGCATTCGAGTCCATGGATTATTCCATTCCATTCCATTAGATGATTCCATTCGGGTCCATTCGATGATTCTCTTCGATTCCATTCGATAATTCCGTTTTTTTCCGTTTGATGTTGATTCCATTCGATTCCATTCGATGATAATTCCATTCGATTCTATGCGATGATTCCATTCCATTCCATTTGAAGATGATTCCATTCGAGACCATTCGATGATTGCATTCAATTCATTCGATGACGATTCCATTCAATTCCGTTCAATGATTCCATTTGATTCCATTTGATGTTGATTCCATTCGATTCCATTTTATGATGATTCAATGCAATTCCATTAGATGATGACTCCTTTCATTTACATTCGATGATGATTCCATTCGTTTCCATCCGATGATGATTCCATTCGATTCTCTTCAATGCTTATTCCATTCGAGTCCATTCGATGATTCCATTCGATTCCATTCGATGATGATTGCATTCGAGTCCATGGATTATTCCATTCAATTCCATTAGATGATTCCATTCGGGTCCGTTCGAAGATTCTCTTCGATTCCATTCGATAATTCCGTTTTTCTCCGTTTGGTGTTGATACCATTCGATTCCATTCGATGATAATTCCTTTCGATTCTATGCGATGATTCCATTCCTTTCCATTAGAAGACGATTCCATTCGAGACCATTCGATGATTGCATTCAATTCATTCGATGACGATTCCATTCAATTCTGTTCAATGATTCCATCAGATTCCATTTGATGATGATTCCATTCGATTCCATTTGATGATGATTCCATGCGATTCCATTAGATGATGACCCCTTTCATTTCCATTCAATGAGGATTCCATTCGGTTCCATTTCATGATGTTTCCTTTGAATTCCATTTGATGACAATTCCATTCAATACCAATTGATGATGGTTATTTTTGATTCCATTTGATGATGATTACATTCGATTCCATTTGATCATAATTCCATTCGATTCCACTCGATGATTCCATTCGATTCCATTCAATGATGATTCCATTCGAGTTCATTGACTGTTCCATTCCATTCCATTCGATGATTCCATTCGAGTCCATTCGATGATTCTATTCGATTGCATTCGATAATTCCATTCGATTGCATTCGATAATTCCATTCGATTCCATTGGAGGATAATTCCATTTGAGTCCATTCGATGATTGTTCCATTCGATTCTATTCGGTGATTCCATTCGATTCCATTTGATAATGATTCCAATCGAGACCATTCGATGATTCCATTCAATTCCATTCAATAATGATCCCTTTCGAGTCCATTCAATGATTCCATTCCAGTCCATTCGATGATTCCATCTGATTCCATTCAATGAATCCATTCGATTCCATTCTATGACGATTCCATTCATTTCCATCTGATGATGATTACATTCGATCCCATTCAATGACACCATTAGATTCCATTCGATGATGATTTCAATCAATTTTATTCGATGATTCCATTCGAATCCATTCGATGATGGGTCCATCCATTTCAATTTCATGATAATTCCATTCGTTTCAATTCGATGGTGTTTCCATTCGATTCATTCGATGTTGATTCCATTAGCTTCCGTTGGATGATGATTCCATTCGGGTACATTCGATGATGATCACACTGGATTTCATTCCATAATTCTATTCGATTCCATTCGATGATGATTCCATTCATTTCCATCCGATGATGATTCCATTCGATTCCGTTCAATGATTATTCCATTCGAGTCCATTCGATGATTCCATTCGATTCCATTCGATGATGATTGCATTCGAGTCCATGGATTATTCCATTCCATTCCATTAGATGATTCCATTCGGGTCCGTTCGAAGATTCTCTTCGATTCCATTCGATAATTCCGTTTTTTTCCGTTTGATGTTGATACCATTCGATTCCATTCGATGATAATTC");
+
+
+        pos_t left_anchor {28132, true, 892};
+        
+        TestMinimizerMapper::align_sequence_between(left_anchor, empty_pos_t(), 5000, 500, &graph, &aligner, aln);
+
+        // We demand a positive-score alignment
+        REQUIRE(aln.score() > 0);
+        // We demand not having a very long softclip at the end
+        REQUIRE(aln.path().mapping_size() > 0);
+        auto& last_mapping = aln.path().mapping(aln.path().mapping_size() - 1);
+        REQUIRE(last_mapping.edit_size() > 0);
+        auto& last_edit = last_mapping.edit(last_mapping.edit_size() - 1);
+        REQUIRE(last_edit.to_length() <= std::max(10, last_edit.from_length()));
+}
+
+/// REQUIRE that two Alignments are equal
+static void require_alignments_equal(const Alignment& flipped_aln, const Alignment& aln) {
+    REQUIRE(flipped_aln.path().mapping_size() == aln.path().mapping_size());
+    for (size_t i = 0; i < aln.path().mapping_size(); i++) {
+        const Mapping& flipped_mapping = flipped_aln.path().mapping(i);
+        const Mapping& mapping = aln.path().mapping(i);
+        REQUIRE(flipped_mapping.position().node_id() == mapping.position().node_id());
+        REQUIRE(flipped_mapping.position().offset() == mapping.position().offset());
+        REQUIRE(flipped_mapping.edit_size() == mapping.edit_size());
+        for (size_t j = 0; j < mapping.edit_size(); j++) {
+            const Edit& flipped_edit = flipped_mapping.edit(j);
+            const Edit& edit = mapping.edit(j);
+            REQUIRE(flipped_edit.from_length() == edit.from_length());
+            REQUIRE(flipped_edit.to_length() == edit.to_length());
+            REQUIRE(flipped_edit.sequence() == edit.sequence());
+        }
+    }
+}
+
+TEST_CASE("MinimizerMapper can produce connecting alignments that are consistent independent of sequence orientation", "[giraffe][mapping]") {
+
+    Aligner aligner;
+    HashGraph graph;
+    
+    // Make the graph
+    auto h1 = graph.create_handle("GAT");
+    auto h2 = graph.create_handle("TTTTTTTTT");
+    auto h3 = graph.create_handle("TACA");
+    graph.create_edge(h1, h2);
+    graph.create_edge(h2, h3);
+
+    // Left anchor should be on start
+    pos_t left_anchor {graph.get_id(h1), false, 1};
+    // Right anchor should be past end
+    pos_t right_anchor {graph.get_id(h3), false, 3};
+    
+    // Make the reverse strand versions of these
+    pos_t rev_left_anchor {graph.get_id(h3), true, 1};
+    pos_t rev_right_anchor {graph.get_id(h1), true, 2};
+
+    // Make the GBWT
+    std::vector<gbwt::vector_type> paths;
+    paths.emplace_back();
+    paths.back().push_back(gbwt::Node::encode(graph.get_id(h1), false));
+    paths.back().push_back(gbwt::Node::encode(graph.get_id(h2), false));
+    paths.back().push_back(gbwt::Node::encode(graph.get_id(h3), false));
+    gbwt::GBWT index = get_gbwt(paths);
+
+    // And the GBWTGraph
+    gbwtgraph::NaiveGraph source;
+    graph.for_each_handle([&](const handle_t& h) {
+        source.create_node(graph.get_id(h), graph.get_sequence(h));    
+    });
+    gbwtgraph::GBWTGraph gbwt_graph = gbwtgraph::GBWTGraph(index, source);
+
+    // And the extender against it
+    WFAExtender extender(gbwt_graph, aligner);
+
+    std::vector<std::string> test_seqs {"ATTTTTTTTCTTTAC", "ATTTTTTTTTTTTAC", "ATTTTTTTTCTTTTAC", "ATTTTTTTTTTTTTAC", "ATTTTTTCTTAC"};
+
+    SECTION("align_sequence_between_consistently is consistent") {
+        for (const std::string& test_seq : test_seqs) {
+
+            Alignment aln;
+            aln.set_sequence(test_seq);
+
+            Alignment rev_aln;
+            rev_aln.set_sequence(reverse_complement(aln.sequence()));
+        
+            TestMinimizerMapper::align_sequence_between_consistently(left_anchor, right_anchor, 100, 20, &graph, &aligner, aln);
+            TestMinimizerMapper::align_sequence_between_consistently(rev_left_anchor, rev_right_anchor, 100, 20, &graph, &aligner, rev_aln);
+
+            // When we flip the reverse-complement alignment forward
+            Alignment flipped_aln = reverse_complement_alignment(rev_aln, [&](id_t node_id) -> int64_t {
+                return graph.get_length(graph.get_handle(node_id));
+            });
+
+            // It should be the same alignment
+            require_alignments_equal(flipped_aln, aln);
+        }
+    }
+
+    SECTION("connect_consistently is consistent") {
+        for (const std::string& test_seq : test_seqs) {
+
+            Alignment aln;
+            aln.set_sequence(test_seq);
+
+            Alignment rev_aln;
+            rev_aln.set_sequence(reverse_complement(aln.sequence()));
+
+            // WFA needs a left anchor that starts 1 base earlier
+            pos_t wfa_left_anchor = left_anchor;
+            get_offset(wfa_left_anchor)--;
+            pos_t wfa_rev_left_anchor = rev_left_anchor;
+            get_offset(wfa_rev_left_anchor)--;
+
+            WFAAlignment wfa_aln = TestMinimizerMapper::connect_consistently(aln.sequence(), wfa_left_anchor, right_anchor, extender);
+            *aln.mutable_path() = wfa_aln.to_path(gbwt_graph, aln.sequence());
+            WFAAlignment rev_wfa_aln = TestMinimizerMapper::connect_consistently(rev_aln.sequence(), wfa_rev_left_anchor, rev_right_anchor, extender);
+            *rev_aln.mutable_path() = rev_wfa_aln.to_path(gbwt_graph, rev_aln.sequence());
+
+            // When we flip the reverse-complement alignment forward
+            Alignment flipped_aln = reverse_complement_alignment(rev_aln, [&](id_t node_id) -> int64_t {
+                return graph.get_length(graph.get_handle(node_id));
+            });
+
+            // It should be the same alignment
+            require_alignments_equal(flipped_aln, aln);
+        }
+    }
 }
 
 TEST_CASE("MinimizerMapper can extract a strand-split dagified local graph without extraneous tips", "[giraffe][mapping]") {
@@ -358,14 +844,17 @@ TEST_CASE("MinimizerMapper can extract a strand-split dagified local graph witho
                      {"id": "60245278", "sequence": "GATTACAGATTACA"}]
         }
     )";
-    vg::Graph graph_chunk;
-    json2pb(graph_chunk, graph_json.c_str(), graph_json.size());
-    vg::VG graph(graph_chunk);
+    bdsg::HashGraph graph;
+    vg::io::json2graph(graph_json, &graph);
     
-    TestMinimizerMapper::with_dagified_local_graph(make_pos_t(60245283, false, 10), empty_pos_t(), 50, graph, [&](DeletableHandleGraph& dagified_graph, const std::function<std::pair<nid_t, bool>(const handle_t&)>& dagified_handle_to_base) {
+    TestMinimizerMapper::with_dagified_local_graph(make_pos_t(60245283, false, 10), empty_pos_t(), 50, graph, [&](DeletableHandleGraph& dagified_graph, const handle_t& left_anchor_handle, const handle_t& right_anchor_handle, const std::function<std::pair<nid_t, bool>(const handle_t&)>& dagified_handle_to_base) {
         // The graph started as a stick
         // We strand-split it to two disconnected sticks, and then dagify from the one start node in the one orientation, so it should go back to being one stick, with 2 tips.
         auto tip_handles = handlegraph::algorithms::find_tips(&dagified_graph);
+        std::unordered_set<handle_t> tip_handle_set;
+        for (auto& h : tip_handles) {
+            tip_handle_set.insert(h);
+        }
 #ifdef debug
         for (auto& h : tip_handles) {
             // Dump all the tips for debugging
@@ -383,16 +872,267 @@ TEST_CASE("MinimizerMapper can extract a strand-split dagified local graph witho
         }
         // There should be that head and also some tail where we ran out of search bases.
         REQUIRE(tip_handles.size() == 2);
+
+        // We should have been passed a head handle for the 4-base remainder of the left anchor node.
+        REQUIRE(tip_handle_set.count(left_anchor_handle));
+        REQUIRE(dagified_graph.get_length(left_anchor_handle) == 4);
     });
 }
 
+TEST_CASE("MinimizerMapper can make correct anchors from minimizers and their zip codes", "[giraffe][mapping]") {
+    Alignment aln;
+    aln.set_sequence("AAAAAAAAAA"); // 10 bp
+
+    // I only need a linear graph to test translation (ignoring running off the ends).
+    // TODO: Test trimmign back from node ends.
+    VG graph;
+
+    Node* n1 = graph.create_node("AAAAAAAAAA");
+
+    IntegratedSnarlFinder snarl_finder(graph);
+    SnarlDistanceIndex distance_index;
+    fill_in_distance_index(&distance_index, &graph, &snarl_finder);
+
+    for (bool graph_reverse_strand : {false, true}) {
+        // Try the read running both forward and backward along the graph.
+        
+        for (bool anchor_a_reverse : {false, true}) {
+            for (bool anchor_b_reverse : {false, true}) {
+                // Try all combinations of first and second hit minimizer
+                // orientations relative to the read.
+        
+                // These are graph positions for each minimizer hit. They are first read
+                // bases for forward-read-strand minimizers, and last read bases for
+                // reverse-read-strand minimizers, and they always point in the read's
+                // forward direction.
+                std::vector<pos_t> graph_positions;
+
+                // These are read positions for each minimizer hit, in the form of an
+                // anchoring base on the read's forward strand, and an orientation from
+                // that anchoring base for the minimizer sequence's orientation/where the
+                // rest of the minimizer sequence falls in the read. 
+                //
+                // False is read forward (minimizer occurrence is here and to the right),
+                // true is read reverse (minimizer occurrence is here and to the left,
+                // minimal sequence is from the read's reverse strand).
+                std::vector<std::pair<size_t, bool>> read_positions;
+
+                // These are the minimizer lengths
+                std::vector<size_t> lengths;
+
+                if (anchor_a_reverse) {
+                    // Have a 3bp hit at the start of the read and graph. It is anchored at its
+                    // final location in the read.
+                    graph_positions.emplace_back(1, graph_reverse_strand, 2);
+                    read_positions.emplace_back(2, true);
+                    lengths.emplace_back(3);
+                } else {
+                    // Have a 3bp hit at the start of the read and graph. It is anchored at its
+                    // start location in the read.
+                    graph_positions.emplace_back(1, graph_reverse_strand, 0);
+                    read_positions.emplace_back(0, false);
+                    lengths.emplace_back(3);
+                }
+                
+                if (anchor_b_reverse) {
+                    // Have another 3bp hit at the end, with the graph and read still going in
+                    // the same direction, but with the minimizer on the other strand of the
+                    // read.
+                    //
+                    // It is anchored at its final location in the read, but the position is
+                    // still on the forward strand of the graph, since the read is still going
+                    // forward along the graph node. 
+                    graph_positions.emplace_back(1, graph_reverse_strand, 9);
+                    read_positions.emplace_back(9, true);
+                    lengths.emplace_back(3);
+                } else {
+                    // Have another 3bp hit at the end, anchored at its start location in the read.
+                    graph_positions.emplace_back(1, graph_reverse_strand, 7);
+                    read_positions.emplace_back(7, false);
+                    lengths.emplace_back(3);
+                }
+
+                // Add a middle anchor overlapping the left one
+                graph_positions.emplace_back(1, graph_reverse_strand, 1);
+                read_positions.emplace_back(1, false);
+                lengths.emplace_back(3);
+
+                // Add a middle anchor actually in the middle, abutting the left one, and shorter
+                graph_positions.emplace_back(1, graph_reverse_strand, 3);
+                read_positions.emplace_back(3, false);
+                lengths.emplace_back(2);
+
+
+                vector<MinimizerMapper::Minimizer> minimizers;
+                vector<SnarlDistanceIndexClusterer::Seed> seeds;
+                for (size_t i = 0; i < read_positions.size(); i++) {
+                    // Make a minimizer
+                    minimizers.emplace_back();
+                    minimizers.back().length = lengths.at(i);
+                    minimizers.back().value.offset = read_positions.at(i).first;
+                    minimizers.back().value.is_reverse = read_positions.at(i).second;
+
+                    // Make a zipcode for its graph position
+                    ZipCode zipcode;
+                    zipcode.fill_in_zipcode_from_pos(distance_index, graph_positions.at(i));
+
+                    // Make a seed attaching that graph position to its minimizer.
+                    seeds.push_back({ graph_positions.at(i), i, zipcode});
+                }
+
+                // Make and check the zip code tree
+                ZipCodeForest zip_forest;
+                zip_forest.fill_in_forest(seeds, distance_index, 10);
+                REQUIRE(zip_forest.trees.size() == 1);
+
+                // Make an aligner for scoring
+                Aligner aligner;
+
+                // Make the anchors
+                std::vector<algorithms::Anchor> anchors;
+                for (size_t i = 0; i < seeds.size(); i++) {
+#ifdef debug
+                    std::cerr << "Anchor " << i << ":" << std::endl;
+#endif
+                    anchors.push_back(TestMinimizerMapper::to_anchor(aln, minimizers, seeds, i, graph, &aligner));
+
+                    // Make sure the anchor is right.
+                    // It needs to start at the right place in the read.
+                    REQUIRE(anchors.back().read_start() == minimizers.at(seeds.at(i).source).forward_offset());
+                    // Since the minimizers are all within single nodes here, the anchor should be as long as the minimizer.
+                    REQUIRE(anchors.back().length() == minimizers.at(seeds.at(i).source).length);
+                }
+
+                // For each from anchor and to anchor, remember the indel distances.
+                std::unordered_map<std::pair<size_t, size_t>, size_t> all_transitions;
+
+                // Set up to get all the transitions between anchors in the zip code tree
+                auto transition_iterator = algorithms::zip_tree_transition_iterator(seeds, zip_forest.trees.at(0), std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max());
+                // And get them
+                transition_iterator(anchors, distance_index, graph, std::numeric_limits<size_t>::max(), [&](const vg::algorithms::transition_info& transition) {
+                    // And for each of them, remember them
+#ifdef debug
+                    std::cerr << "From anchor " << transition.from_anchor << " to anchor " << transition.to_anchor
+                              << " we cross " << transition.read_distance << " bp of read and " << transition.graph_distance << " bp of graph" << std::endl;
+#endif
+                    all_transitions.emplace(std::make_pair(transition.from_anchor, transition.to_anchor), 
+                                            transition.indel_size);
+                });
+
+                // Make sure we got the right transitions for these anchors
+                // AAAAAAAAAA
+                // XXX----YYY
+                //   01234
+                REQUIRE(all_transitions.at(std::make_pair(0, 1)) == 0);
+
+                // AAAAAAAAAA
+                // -XXX---YYY
+                //    0123
+                REQUIRE(all_transitions.at(std::make_pair(2, 1)) == 0);
+
+                // AAAAAAAAAA
+                // ---XX--YYY
+                //     012
+                REQUIRE(all_transitions.at(std::make_pair(3, 1)) == 0);
+
+                // AAAAAAAAAA
+                // XXXYY-----
+                //   0
+                REQUIRE(all_transitions.at(std::make_pair(0, 3)) == 0);
+
+                // We shouldn't see any extra transitions, like between overlapping anchors.
+                REQUIRE(all_transitions.size() == 4);
+            }
+        }
+    }
+}
+
+TEST_CASE("MinimizerMapper scores anchors the same regardless of node structure", "[giraffe][mapping]") {
+
+    std::string stick_sequence = "GATTACACATTAG";
+
+    // Make an aligner for scoring
+    Aligner aligner;
+
+    for (int node_size : {1, 2, 10}) {
+#ifdef debug
+        std::cerr << "Node size: " << node_size << std::endl;
+#endif
+
+        bdsg::HashGraph graph;
+
+        // This has the pos_t of every position along the forward strand of the graph.
+        std::vector<pos_t> graph_forward_strand;
+        graph_forward_strand.reserve(stick_sequence.size());
+
+        handle_t last;
+        for (size_t node_start = 0; node_start < stick_sequence.size(); node_start += node_size) {
+            // Build a stick of this size of node
+            std::string node_seq = stick_sequence.substr(node_start, node_size);
+
+            handle_t here = graph.create_handle(node_seq);
+            if (node_start != 0) {
+                graph.create_edge(last, here);
+            }
+
+            for (size_t i = 0; i < node_seq.size(); i++) {
+                // Record the positions
+                graph_forward_strand.emplace_back(graph.get_id(here), false, i);
+            }
+
+            last = here;
+        }
+
+        IntegratedSnarlFinder snarl_finder(graph);
+        SnarlDistanceIndex distance_index;
+        fill_in_distance_index(&distance_index, &graph, &snarl_finder);
+
+        Alignment aln;
+        aln.set_sequence(stick_sequence);
+        
+        // Try 5 base minimizers
+        size_t min_length = 5;
+
+        for (size_t min_start = 0; min_start + min_length < stick_sequence.size(); min_start++) {
+#ifdef debug
+            std::cerr << "Minimizer start: " << min_start << std::endl;
+#endif
+            for (bool min_reverse : {false, true}) {
+                // Consider just one minimizer and one seed at a time, in its own collection.
+                vector<MinimizerMapper::Minimizer> minimizers;
+                vector<SnarlDistanceIndexClusterer::Seed> seeds;
+
+                // Start a minimizer at this start position, on this read strand.
+                minimizers.emplace_back();
+                minimizers.back().length = min_length;
+                minimizers.back().value.offset = min_reverse ? min_start + min_length - 1 : min_start;
+                minimizers.back().value.is_reverse = min_reverse;
+
+                // Find the anchor point in the graph
+                pos_t graph_pos = graph_forward_strand.at(min_reverse ? min_start + min_length - 1 : min_start);
+
+                // Give it a seed, but ignore zipcodes.
+                seeds.push_back({ graph_pos, minimizers.size() - 1, {}});
+                
+                // Make an anchor
+                algorithms::Anchor anchor = TestMinimizerMapper::to_anchor(aln, minimizers, seeds, seeds.size() - 1, graph, &aligner);
+
+#ifdef debug
+                std::cerr << "Made minimizer at read " << minimizers.back().value.offset << " orientation " << minimizers.back().value.is_reverse << " at graph position " << graph_pos << " and anchor " << anchor << " score " << anchor.score() << std::endl;
+#endif
+
+                REQUIRE(anchor.score() == min_length);
+            }
+        }
+    }
+}
 
 TEST_CASE("MinimizerMapper can fix up alignments with deletions on the ends", "[giraffe][mapping]") {
     
     gbwtgraph::GBWTGraph gbwt_graph;
     gbwt::GBWT gbwt;
     gbwt_graph.set_gbwt(gbwt);
-    gbwtgraph::DefaultMinimizerIndex minimizer_index;
+    gbwtgraph::DefaultMinimizerIndex minimizer_index(2);
     SnarlDistanceIndex distance_index;
     PathPositionHandleGraph* handle_graph;
     TestMinimizerMapper test_mapper (gbwt_graph, minimizer_index, &distance_index, handle_graph);

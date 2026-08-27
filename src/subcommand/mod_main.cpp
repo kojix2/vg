@@ -31,59 +31,69 @@ void help_mod(char** argv) {
          << "Modifies graph, outputs modified on stdout." << endl
          << endl
          << "options:" << endl
-         << "    -P, --label-paths       don't edit with -i alignments, just use them for labeling the graph" << endl
-         << "    -c, --compact-ids       should we sort and compact the id space? (default false)" << endl
-         << "    -b, --break-cycles      use an approximate topological sort to break cycles in the graph" << endl
-         << "    -n, --normalize         normalize the graph so that edges are always non-redundant" << endl
-         << "                            (nodes have unique starting and ending bases relative to neighbors," << endl
-         << "                            and edges that do not introduce new paths are removed and neighboring" << endl
-         << "                            nodes are merged)" << endl
-         << "    -U, --until-normal N    iterate normalization until convergence, or at most N times" << endl
-         << "    -z, --nomerge-pre STR   do not let normalize (-n, -U) zip up any pair of nodes that both belong to path with prefix STR" << endl
-         << "    -E, --unreverse-edges   flip doubly-reversing edges so that they are represented on the" << endl
-         << "                            forward strand of the graph" << endl
-         << "    -s, --simplify          remove redundancy from the graph that will not change its path space" << endl
-         << "    -d, --dagify-step N     copy strongly connected components of the graph N times, forwarding" << endl
-         << "                            edges from old to new copies to convert the graph into a DAG" << endl
-         << "    -w, --dagify-to N       copy strongly connected components of the graph forwarding" << endl
-         << "                            edges from old to new copies to convert the graph into a DAG" << endl
-         << "                            until the shortest path through each SCC is N bases long" << endl
-         << "    -L, --dagify-len-max N  stop a dagification step if the unrolling component has this much sequence" << endl
-         << "    -f, --unfold N          represent inversions accessible up to N from the forward" << endl
-         << "                            component of the graph" << endl
-         << "    -O, --orient-forward    orient the nodes in the graph forward" << endl
-         << "    -N, --remove-non-path   keep only nodes and edges which are part of paths" << endl
-         << "    -A, --remove-path       keep only nodes and edges which are not part of any path" << endl
-         << "    -k, --keep-path NAME    keep only nodes and edges in the path" << endl
-         << "    -R, --remove-null       removes nodes that have no sequence, forwarding their edges" << endl
-         << "    -g, --subgraph ID       gets the subgraph rooted at node ID, multiple allowed" << endl
-         << "    -x, --context N         steps the subgraph out by N steps (default: 1)" << endl
-         << "    -p, --prune-complex     remove nodes that are reached by paths of --length which" << endl
-         << "                            cross more than --edge-max edges" << endl
-         << "    -S, --prune-subgraphs   remove subgraphs which are shorter than --length" << endl
-         << "    -l, --length N          for pruning complex regions and short subgraphs" << endl
-         << "    -X, --chop N            chop nodes in the graph so they are not more than N bp long" << endl
-         << "    -u, --unchop            where two nodes are only connected to each other and by one edge" << endl
-         << "                            replace the pair with a single node that is the concatenation of their labels" << endl
-         << "    -e, --edge-max N        only consider paths which make edge choices at <= this many points" << endl
-         << "    -M, --max-degree N      unlink nodes that have edge degree greater than N" << endl
-         << "    -m, --markers           join all head and tails nodes to marker nodes" << endl
-         << "                            ('###' starts and '$$$' ends) of --length, for debugging" << endl
-         << "    -y, --destroy-node ID   remove node with given id" << endl
-         << "    -a, --cactus            convert to cactus graph representation" << endl
-         << "    -v, --sample-vcf FILE   for a graph with allele paths, compute the sample graph from the given VCF" << endl
-         << "    -G, --sample-graph FILE subset an augmented graph to a sample graph using a Locus file" << endl
-         << "    -t, --threads N         for tasks that can be done in parallel, use this many threads" << endl;
+         << "  -c, --compact-ids        should we sort and compact the ID space? (default no)" << endl
+         << "  -b, --break-cycles       break graph cycles with approximate topological sort" << endl
+         << "  -n, --normalize          normalize graph so edges are always non-redundant" << endl
+         << "                           (nodes have unique starting and ending bases relative" << endl
+         << "                           to neighbors, edges that do not introduce new paths" << endl
+         << "                           are removed, and neighboring nodes are merged)" << endl
+         << "  -U, --until-normal N     iterate normalization at most N times" << endl
+         << "  -z, --nomerge-pre STR    do not let normalize (-n/-U) zip up any pair of nodes" << endl
+         << "                           that both belong to path with prefix STR" << endl
+         << "  -E, --unreverse-edges    flip doubly-reversing edges so that they are" << endl
+         << "                           represented on the forward strand of the graph" << endl
+         << "  -s, --simplify           remove redundancy from the graph" << endl
+         << "                           that will not change its path space" << endl
+         << "  -d, --dagify-step N      copy strongly connected components of graph N times," << endl
+         << "                           forwording edges from old to new copies" << endl 
+         << "                           to convert the graph into a DAG" << endl
+         << "  -w, --dagify-to N        copy strongly connected components of the graph," << endl
+         << "                           forwarding edges from old to new copies" << endl 
+         << "                           to convert the graph into a DAG" << endl
+         << "                           until shortest path through each SCC is N bases long" << endl
+         << "  -L, --dagify-len-max N   stop a dagification step if the unrolling component" << endl
+         << "                           has this much sequence" << endl
+         << "  -f, --unfold N           represent inversions accessible up to N from" << endl
+         << "                           the forward component of the graph" << endl
+         << "  -O, --orient-forward     orient the nodes in the graph forward" << endl
+         << "  -N, --remove-non-path    keep only nodes and edges which are part of paths" << endl
+         << "  -A, --remove-path        keep only nodes and edges which aren't part of a path" << endl
+         << "  -k, --keep-path NAME     keep only nodes and edges in the path (may repeat)" << endl
+         << "  -V, --invert-keep-path   keep only nodes and edges in paths not passed to -k" << endl
+         << "  -R, --remove-null        remove nodes with no sequence, forwarding their edges" << endl
+         << "  -g, --subgraph ID        gets the subgraph rooted at node ID (may repeat)" << endl
+         << "  -x, --context N          steps the subgraph out by N steps [1]" << endl
+         << "  -p, --prune-complex      remove nodes that are reached by paths of --length" << endl
+         << "                           which cross more than --edge-max edges" << endl
+         << "  -S, --prune-subgraphs    remove subgraphs which are shorter than --length" << endl
+         << "  -l, --length N           for pruning complex regions and short subgraphs" << endl
+         << "  -X, --chop N             chop nodes in the graph so they are <=N bp long" << endl
+         << "  -u, --unchop             where two nodes are only connected to each other and" << endl
+         << "                           by only one edge, replace the pair with a single node" << endl
+         << "                           that is the concatenation of their labels" << endl
+         << "  -e, --edge-max N         consider paths which make edge choices at <= N points" << endl
+         << "  -M, --max-degree N       unlink nodes that have edge degree greater than N" << endl
+         << "  -m, --markers            join all head and tails nodes to marker nodes" << endl
+         << "                           (### starts and $$$ ends) of --length, for debugging" << endl
+         << "  -y, --destroy-node ID    remove node with given id" << endl
+         << "  -a, --cactus             convert to cactus graph representation" << endl
+         << "  -v, --sample-vcf FILE    for a graph with allele paths," << endl
+         << "                           compute the sample graph from the given VCF" << endl
+         << "  -G, --sample-graph FILE  subset augmented graph to sample graph via Locus file" << endl
+         << "  -t, --threads N          for parallel tasks, use this many threads" << endl
+         << "  -h, --help               print this help message to stderr and exit" << endl;
 }
 
 int main_mod(int argc, char** argv) {
+    Logger logger("vg mod");
 
     if (argc == 2) {
         help_mod(argv);
         return 1;
     }
 
-    string path_name;
+    set<string> path_names;
+    bool invert_keep_paths = false;
     bool label_paths = false;
     bool compact_ids = false;
     bool prune_complex = false;
@@ -97,7 +107,6 @@ int main_mod(int argc, char** argv) {
     bool normalize_graph = false;
     bool remove_non_path = false;
     bool remove_path = false;
-    bool compact_ranks = false;
     vector<nid_t> root_nodes;
     int32_t context_steps;
     bool remove_null = false;
@@ -127,8 +136,8 @@ int main_mod(int argc, char** argv) {
             {"include-loci", required_argument, 0, 'q'},
             {"include-gt", required_argument, 0, 'Q'},
             {"compact-ids", no_argument, 0, 'c'},
-            {"compact-ranks", no_argument, 0, 'C'},
             {"keep-path", required_argument, 0, 'k'},
+            {"invert-keep-path", no_argument, 0, 'V'},
             {"remove-orphans", no_argument, 0, 'o'},
             {"prune-complex", no_argument, 0, 'p'},
             {"prune-subgraphs", no_argument, 0, 'S'},
@@ -136,7 +145,7 @@ int main_mod(int argc, char** argv) {
             {"edge-max", required_argument, 0, 'e'},
             {"chop", required_argument, 0, 'X'},
             {"markers", no_argument, 0, 'm'},
-            {"threads", no_argument, 0, 't'},
+            {"threads", required_argument, 0, 't'},
             {"label-paths", no_argument, 0, 'P'},
             {"simplify", no_argument, 0, 's'},
             {"unchop", no_argument, 0, 'u'},
@@ -150,13 +159,13 @@ int main_mod(int argc, char** argv) {
             {"subgraph", required_argument, 0, 'g'},
             {"context", required_argument, 0, 'x'},
             {"remove-null", no_argument, 0, 'R'},
-            {"dagify-steps", required_argument, 0, 'd'},
+            {"dagify-step", required_argument, 0, 'd'},
             {"dagify-to", required_argument, 0, 'w'},
             {"dagify-len-max", required_argument, 0, 'L'},
             {"break-cycles", no_argument, 0, 'b'},
             {"destroy-node", required_argument, 0, 'y'},
             {"translation", required_argument, 0, 'Z'},
-            {"unreverse-edges", required_argument, 0, 'E'},
+            {"unreverse-edges", no_argument, 0, 'E'},
             {"cactus", no_argument, 0, 'a'},
             {"sample-vcf", required_argument, 0, 'v'},
             {"sample-graph", required_argument, 0, 'G'},
@@ -168,8 +177,8 @@ int main_mod(int argc, char** argv) {
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hk:oi:q:Q:cpl:e:mt:SX:KPsunz:NAf:Cg:x:RTU:Bbd:Ow:L:y:Z:Eav:G:M:Dr:I",
-                long_options, &option_index);
+        c = getopt_long (argc, argv, "h?k:Voi:q:Q:cpl:e:mt:SX:Psunz:NAf:g:x:RU:bd:Ow:L:y:Z:Eav:G:M:Dr:I",
+                         long_options, &option_index);
 
 
         // Detect the end of the options.
@@ -180,36 +189,31 @@ int main_mod(int argc, char** argv) {
         {
 
         case 'i':
-            cerr << "[vg mod] error: vg mod -i is deprecated.  please switch to vg augment" << endl;
-            exit(1);
+            logger.error() << "vg mod -i is deprecated.  please switch to vg augment" << endl;
+            break;
 
         case 'q':
-            cerr << "[vg mod] error: vg mod -q is deprecated.  please switch to vg augment -l" << endl;
-            exit(1);
+            logger.error() << "vg mod -q is deprecated.  please switch to vg augment -l" << endl;
+            break;
 
         case 'Q':
-            cerr << "[vg mod] error: vg mod -Q is deprecated.  please switch to vg augment -L" << endl;
-            exit(1);
+            logger.error() << "vg mod -Q is deprecated.  please switch to vg augment -L" << endl;
             break;
 
         case 'Z':
-            cerr << "[vg mod] error: vg mod -Z is deprecated.  please switch to vg augment -Z" << endl;
-            exit(1);
+            logger.error() << "vg mod -Z is deprecated.  please switch to vg augment -Z" << endl;
             break;
 
         case 'D':
-            cerr << "[vg mod] error: vg mod -D is deprecated.  please switch to vg paths -d" << endl;
-            exit(1);
+            logger.error() << "vg mod -D is deprecated.  please switch to vg paths -d" << endl;
             break;
 
         case 'r':
-            cerr << "[vg mod] error: vg mod -r is deprecated.  please switch to vg paths -r" << endl;
-            exit(1);
+            logger.error() << "vg mod -r is deprecated.  please switch to vg paths -r" << endl;
             break;
 
         case 'I':
-            cerr << "[vg mod] error: vg mod -I is deprecated.  please switch to vg paths -d" << endl;
-            exit(1);
+            logger.error() << "vg mod -I is deprecated.  please switch to vg paths -d" << endl;
             break;
 
         case 'c':
@@ -217,11 +221,15 @@ int main_mod(int argc, char** argv) {
             break;
 
         case 'k':
-            path_name = optarg;
+            path_names.emplace(optarg);
+            break;
+
+        case 'V':
+            invert_keep_paths = true;
             break;
 
         case 'o':
-            cerr << "warning[vg mod]: -o is deprecated. Dangling edges are now automatically removed." << endl;
+            logger.warn() << "-o is deprecated. Dangling edges are now automatically removed." << endl;
             break;
 
         case 'p':
@@ -257,7 +265,7 @@ int main_mod(int argc, char** argv) {
             break;
 
         case 't':
-            omp_set_num_threads(parse<int>(optarg));
+            set_thread_count(logger, optarg);
             break;
 
         case 'f':
@@ -269,7 +277,8 @@ int main_mod(int argc, char** argv) {
             break;
 
         case 'P':
-            cerr << "[vg mod] warning: vg mod -P is deprecated and will soon be removed.  please switch to vg augment -B" << endl;
+            logger.warn() << "vg mod -P is deprecated and will soon be removed. "
+                          << "please switch to vg augment -B" << endl;
             label_paths = true;
             break;
 
@@ -334,11 +343,11 @@ int main_mod(int argc, char** argv) {
             break;
 
         case 'v':
-            vcf_filename = optarg;
+            vcf_filename = require_exists(logger, optarg);
             break;
             
         case 'G':
-            loci_filename = optarg;
+            loci_filename = require_exists(logger, optarg);
             break;
 
         case 'M':
@@ -373,8 +382,7 @@ int main_mod(int argc, char** argv) {
         vcflib::VariantCallFile variant_file;
         variant_file.open(vcf_filename);
         if (!variant_file.is_open()) {
-            cerr << "error:[vg mod] could not open" << vcf_filename << endl;
-            return 1;
+            logger.error() << "could not open " << vcf_filename << endl;
         }
 
         // Now go through and prune down the varaints.
@@ -491,7 +499,8 @@ int main_mod(int argc, char** argv) {
                 // same path without this node.
                 paths_to_remove.emplace(graph->get_path_handle_of_step(s));
 #ifdef debug
-                cerr << "Node " << node_id << " was on path " << graph->get_path_name(graph->get_path_handle_of_step(s)) << endl;
+                info(context) << "Node " << node_id << " was on path "
+                              << graph->get_path_name(graph->get_path_handle_of_step(s)) << endl;
 #endif
             });
 
@@ -595,10 +604,19 @@ int main_mod(int argc, char** argv) {
         return vg_graph;
     };
     
-    if (!path_name.empty()) {
+    if (!path_names.empty()) {
         // TODO: turn into an algorithm or reimplement
         ensure_vg();
-        vg_graph->keep_path(path_name);
+        set<string> kept_paths;
+        vg_graph->keep_paths(path_names, kept_paths, invert_keep_paths);
+        if (path_names.size() != kept_paths.size() && !invert_keep_paths) {
+            logger.warn() << "some paths were not found in the graph, and will not be kept" << endl;
+            for (const auto& path_name : path_names) {
+                if (kept_paths.count(path_name) == 0) {
+                    cerr << "\t\t\t" << path_name << endl;
+                }
+            }
+        }
     }
 
     if (unchop) {
@@ -713,8 +731,7 @@ int main_mod(int argc, char** argv) {
 
     if (prune_complex) {
         if (!(path_length > 0 && edge_max > 0)) {
-            cerr << "[vg mod]: when pruning complex regions you must specify a --length and --edge-max" << endl;
-            return 1;
+            logger.error() << "when pruning complex regions you must specify a --length and --edge-max" << endl;
         }
         algorithms::prune_complex_with_head_tail(*graph, path_length, edge_max);
     }
@@ -742,8 +759,7 @@ int main_mod(int argc, char** argv) {
 
     if (add_start_and_end_markers) {
         if (!(path_length > 0)) {
-            cerr << "[vg mod]: when adding start and end markers you must provide a --length" << endl;
-            return 1;
+            logger.error() << "when adding start and end markers you must provide a --length" << endl;
         }
         // TODO: replace this with the SourceSinkOverlay, accounting somehow for its immutability.
         Node* head_node = NULL;

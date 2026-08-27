@@ -20,24 +20,36 @@ constexpr double GaplessExtender::OVERLAP_THRESHOLD;
 
 //------------------------------------------------------------------------------
 
-bool GaplessExtension::contains(const HandleGraph& graph, seed_type seed) const {
-    handle_t expected_handle = GaplessExtender::get_handle(seed);
-    size_t expected_node_offset = GaplessExtender::get_node_offset(seed);
-    size_t expected_read_offset = GaplessExtender::get_read_offset(seed);
-
+bool GaplessExtension::for_each_read_interval(const HandleGraph& graph, const std::function<bool(size_t, size_t, const seed_type&)>& iteratee) const {
+    // Track correspondign read and node offsets on the current node
     size_t read_offset = this->read_interval.first;
     size_t node_offset = this->offset;
-    for (handle_t handle : this->path) {
-        size_t len = graph.get_length(handle) - node_offset;
-        read_offset += len;
-        node_offset += len;
-        if (handle == expected_handle && read_offset - expected_read_offset == node_offset - expected_node_offset) {
-            return true;
+    for (const handle_t& handle : this->path) {
+        // For each node
+        
+        // How many bases of the node do we use? Either remaining node or remaining read if shorter.
+        size_t len = std::min(graph.get_length(handle) - node_offset, this->read_interval.second - read_offset);
+        if (!iteratee(read_offset, len, seed_type(handle, read_offset - node_offset))) {
+            return false;
         }
+        read_offset += len;
         node_offset = 0;
     }
+    return true;
+}
 
-    return false;
+bool GaplessExtension::contains(const HandleGraph& graph, const seed_type& seed) const {
+    // Scan all the seeds we represent to see if that one is one of them.
+    bool found = false;
+    for_each_read_interval(graph, [&](size_t read_offset, size_t len, const seed_type& our_seed) {
+        if (our_seed == seed) {
+            found = true;
+            return false;
+        }
+        return true;
+    });
+
+    return found;
 }
 
 Position GaplessExtension::starting_position(const HandleGraph& graph) const {
@@ -188,30 +200,30 @@ void in_place_subvector(std::vector<Element>& vec, size_t head, size_t tail) {
 // Compute the score based on read_interval, internal_score, left_full, and right_full.
 void set_score(GaplessExtension& extension, const Aligner* aligner) {
     // Assume that everything matches.
-    extension.score = static_cast<int32_t>((extension.read_interval.second - extension.read_interval.first) * aligner->match);
+    extension.score = static_cast<int32_t>((extension.read_interval.second - extension.read_interval.first) * aligner->scorer->match);
     // Handle the mismatches.
-    extension.score -= static_cast<int32_t>(extension.internal_score * (aligner->match + aligner->mismatch));
+    extension.score -= static_cast<int32_t>(extension.internal_score * (aligner->scorer->match + aligner->scorer->mismatch));
     // Handle full-length bonuses.
-    extension.score += static_cast<int32_t>(extension.left_full * aligner->full_length_bonus);
-    extension.score += static_cast<int32_t>(extension.right_full * aligner->full_length_bonus);
+    extension.score += static_cast<int32_t>(extension.left_full * aligner->scorer->full_length_bonus);
+    extension.score += static_cast<int32_t>(extension.right_full * aligner->scorer->full_length_bonus);
 }
 
 // Match the initial node, assuming that read_offset or node_offset is 0.
 // Updates internal_score and old_score; use set_score() to compute score.
-void match_initial(GaplessExtension& match, const std::string& seq, gbwtgraph::view_type target) {
+void match_initial(GaplessExtension& match, const std::string& seq, std::string_view target) {
     size_t node_offset = match.offset;
-    size_t left = std::min(seq.length() - match.read_interval.second, target.second - node_offset);
+    size_t left = std::min(seq.length() - match.read_interval.second, target.size() - node_offset);
     while (left > 0) {
         size_t len = std::min(left, sizeof(std::uint64_t));
         std::uint64_t a = 0, b = 0;
         std::memcpy(&a, seq.data() + match.read_interval.second, len);
-        std::memcpy(&b, target.first + node_offset, len);
+        std::memcpy(&b, target.data() + node_offset, len);
         if (a == b) {
             match.read_interval.second += len;
             node_offset += len;
         } else {
             for (size_t i = 0; i < len; i++) {
-                if (seq[match.read_interval.second] != target.first[node_offset]) {
+                if (seq[match.read_interval.second] != target[node_offset]) {
                     match.internal_score++;
                 }
                 match.read_interval.second++;
@@ -226,20 +238,20 @@ void match_initial(GaplessExtension& match, const std::string& seq, gbwtgraph::v
 // Match forward but stop before the mismatch count reaches the limit.
 // Updates internal_score; use set_score() to recompute score.
 // Returns the tail offset (the number of characters matched).
-size_t match_forward(GaplessExtension& match, const std::string& seq, gbwtgraph::view_type target, uint32_t mismatch_limit) {
+size_t match_forward(GaplessExtension& match, const std::string& seq, std::string_view target, uint32_t mismatch_limit) {
     size_t node_offset = 0;
-    size_t left = std::min(seq.length() - match.read_interval.second, target.second - node_offset);
+    size_t left = std::min(seq.length() - match.read_interval.second, target.size() - node_offset);
     while (left > 0) {
         size_t len = std::min(left, sizeof(std::uint64_t));
         std::uint64_t a = 0, b = 0;
         std::memcpy(&a, seq.data() + match.read_interval.second, len);
-        std::memcpy(&b, target.first + node_offset, len);
+        std::memcpy(&b, target.data() + node_offset, len);
         if (a == b) {
             match.read_interval.second += len;
             node_offset += len;
         } else {
             for (size_t i = 0; i < len; i++) {
-                if (seq[match.read_interval.second] != target.first[node_offset]) {
+                if (seq[match.read_interval.second] != target[node_offset]) {
                     if (match.internal_score + 1 >= mismatch_limit) {
                         return node_offset;
                     }
@@ -257,19 +269,19 @@ size_t match_forward(GaplessExtension& match, const std::string& seq, gbwtgraph:
 // Match forward but stop before the mismatch count reaches the limit.
 // Starts from the offset in the match and updates it.
 // Updates internal_score; use set_score() to recompute score.
-void match_backward(GaplessExtension& match, const std::string& seq, gbwtgraph::view_type target, uint32_t mismatch_limit) {
+void match_backward(GaplessExtension& match, const std::string& seq, std::string_view target, uint32_t mismatch_limit) {
     size_t left = std::min(match.read_interval.first, match.offset);
     while (left > 0) {
         size_t len = std::min(left, sizeof(std::uint64_t));
         std::uint64_t a = 0, b = 0;
         std::memcpy(&a, seq.data() + match.read_interval.first - len, len);
-        std::memcpy(&b, target.first + match.offset - len, len);
+        std::memcpy(&b, target.data() + match.offset - len, len);
         if (a == b) {
             match.read_interval.first -= len;
             match.offset -= len;
         } else {
             for (size_t i = 0; i < len; i++) {
-                if (seq[match.read_interval.first - 1] != target.first[match.offset - 1]) {
+                if (seq[match.read_interval.first - 1] != target[match.offset - 1]) {
                     if (match.internal_score + 1 >= mismatch_limit) {
                         return;
                     }
@@ -361,9 +373,9 @@ void find_mismatches(const std::string& seq, const gbwtgraph::CachedGBWTGraph& g
         extension.mismatch_positions.reserve(extension.internal_score);
         size_t node_offset = extension.offset, read_offset = extension.read_interval.first;
         for (const handle_t& handle : extension.path) {
-            gbwtgraph::view_type target = graph.get_sequence_view(handle);
-            while (node_offset < target.second && read_offset < extension.read_interval.second) {
-                if (target.first[node_offset] != seq[read_offset]) {
+            std::string_view target = graph.get_sequence_view(handle);
+            while (node_offset < target.size() && read_offset < extension.read_interval.second) {
+                if (target[node_offset] != seq[read_offset]) {
                     extension.mismatch_positions.push_back(read_offset);
                 }
                 node_offset++;
@@ -415,9 +427,9 @@ bool trim_mismatches(GaplessExtension& extension, const gbwtgraph::CachedGBWTGra
     // Start with the initial run of matches.
     auto mismatch = extension.mismatch_positions.begin();
     std::pair<size_t, size_t> current_interval(extension.read_interval.first, *mismatch);
-    int32_t current_score = interval_length(current_interval) * aligner.match;
+    int32_t current_score = interval_length(current_interval) * aligner.scorer->match;
     if (extension.left_full) {
-        current_score += aligner.full_length_bonus;
+        current_score += aligner.scorer->full_length_bonus;
     }
 
     // Process the alignment and keep track of the best interval we have seen so far.
@@ -425,9 +437,9 @@ bool trim_mismatches(GaplessExtension& extension, const gbwtgraph::CachedGBWTGra
     int32_t best_score = current_score;
     while (mismatch != extension.mismatch_positions.end()) {
         // See if we should start a new interval after the mismatch.
-        if (current_score >= aligner.mismatch) {
+        if (current_score >= aligner.scorer->mismatch) {
             current_interval.second++;
-            current_score -= aligner.mismatch;
+            current_score -= aligner.scorer->mismatch;
         } else {
             current_interval.first = current_interval.second = *mismatch + 1;
             current_score = 0;
@@ -438,14 +450,14 @@ bool trim_mismatches(GaplessExtension& extension, const gbwtgraph::CachedGBWTGra
         if (mismatch == extension.mismatch_positions.end()) {
             size_t length = extension.read_interval.second - current_interval.second;
             current_interval.second = extension.read_interval.second;
-            current_score += length * aligner.match;
+            current_score += length * aligner.scorer->match;
             if (extension.right_full) {
-                current_score += aligner.full_length_bonus;
+                current_score += aligner.scorer->full_length_bonus;
             }
         } else {
             size_t length = *mismatch - current_interval.second;
             current_interval.second = *mismatch;
-            current_score += length * aligner.match;
+            current_score += length * aligner.scorer->match;
         }
 
         // Update the best interval.
@@ -518,7 +530,7 @@ bool trim_mismatches(GaplessExtension& extension, const gbwtgraph::CachedGBWTGra
 
 //------------------------------------------------------------------------------
 
-std::vector<GaplessExtension> GaplessExtender::extend(cluster_type& cluster, std::string sequence, const gbwtgraph::CachedGBWTGraph* cache, size_t max_mismatches, double overlap_threshold) const {
+std::vector<GaplessExtension> GaplessExtender::extend(cluster_type& cluster, std::string sequence, const gbwtgraph::CachedGBWTGraph* cache, size_t max_mismatches, double overlap_threshold, bool trim) const {
 
     std::vector<GaplessExtension> result;
     if (this->graph == nullptr || this->aligner == nullptr || cluster.empty() || sequence.empty()) {
@@ -700,12 +712,18 @@ std::vector<GaplessExtension> GaplessExtender::extend(cluster_type& cluster, std
     else {
         remove_duplicates(result);
         find_mismatches(sequence, *cache, result);
-        bool trimmed = false;
-        for (GaplessExtension& extension : result) {
-            trimmed |= trim_mismatches(extension, *cache, *(this->aligner));
-        }
-        if (trimmed) {
-            remove_duplicates(result);
+        if (trim) {
+            // It's OK if out extensions don't include all matches between the
+            // read and each node that are in phase with our seeds. Trim back
+            // to maximize score.
+            bool trimmed = false;
+            for (GaplessExtension& extension : result) {
+                trimmed |= trim_mismatches(extension, *cache, *(this->aligner));
+            }
+            if (trimmed) {
+                remove_duplicates(result);
+    
+            }
         }
     }
 
@@ -1134,8 +1152,14 @@ std::ostream& WFAAlignment::print(std::ostream& out) const {
         out << " (" << as_integer(handle) << ")";
     }
     out << " ], edits = [ ";
-    for (auto edit : this->edits) {
+    // Print up to a manageable number of edits. Sometimes we can end up trying
+    // to print apparently infinite edits and make many GB of logs.
+    for (size_t i = 0; i < std::min((size_t) 100, this->edits.size()); i++) {
+        auto edit = this->edits.at(i);
         out << edit.second << edit.first;
+    }
+    if (this->edits.size() > 100) {
+        out << "...";
     }
     out << " ], node offset = " << this->node_offset;
     out << ", sequence range = [" << this->seq_offset << ", " << (this->seq_offset + this->length) << ")";
@@ -1229,10 +1253,10 @@ WFAExtender::WFAExtender(const gbwtgraph::GBWTGraph& graph, const Aligner& align
     graph(&graph), mask("ACGT"), aligner(&aligner), error_model(&error_model)
 {
     // Check that the scoring parameters are reasonable.
-    assert(this->aligner->match >= 0);
-    assert(this->aligner->mismatch > 0);
-    assert(this->aligner->gap_open >= this->aligner->gap_extension);
-    assert(this->aligner->gap_extension > 0);
+    assert(this->aligner->scorer->match >= 0);
+    assert(this->aligner->scorer->mismatch > 0);
+    assert(this->aligner->scorer->gap_open >= this->aligner->scorer->gap_extension);
+    assert(this->aligner->scorer->gap_extension > 0);
 
     // Check that the error model makes sense.
     for (auto& event : {
@@ -1354,12 +1378,12 @@ struct WFAPoint {
 
     // Returns the four-parameter alignment score.
     int32_t alignment_score(const Aligner& aligner) const {
-        return (static_cast<int32_t>(aligner.match) * (static_cast<int32_t>(this->seq_offset) + this->target_offset()) - this->score) / 2;
+        return (static_cast<int32_t>(aligner.scorer->match) * (static_cast<int32_t>(this->seq_offset) + this->target_offset()) - this->score) / 2;
     }
 
     // Returns the four-parameter alignment score with an implicit final insertion.
     int32_t alignment_score(const Aligner& aligner, uint32_t final_insertion) const {
-        return (static_cast<int32_t>(aligner.match) * (static_cast<int32_t>(this->seq_offset + final_insertion) + this->target_offset()) - this->score) / 2;
+        return (static_cast<int32_t>(aligner.scorer->match) * (static_cast<int32_t>(this->seq_offset + final_insertion) + this->target_offset()) - this->score) / 2;
     }
 
     // Converts the point to an alignment position with the given path.
@@ -1522,10 +1546,10 @@ private:
     bool append_node(const gbwtgraph::CachedGBWTGraph& graph, gbwt::SearchState next, pos_t target) {
         this->state = next;
         this->path.push_back(this->state.node);
-        gbwtgraph::view_type view = graph.get_sequence_view(gbwtgraph::GBWTGraph::node_to_handle(this->state.node));
-        this->node_sequence.append(view.first, view.second);
+        std::string_view view = graph.get_sequence_view(gbwtgraph::GBWTGraph::node_to_handle(this->state.node));
+        this->node_sequence.append(view.data(), view.size());
         if (gbwt::Node::encode(id(target), is_rev(target)) == this->state.node) {
-            this->target_offset = this->node_sequence.length() - (view.second - offset(target));
+            this->target_offset = this->node_sequence.length() - (view.size() - offset(target));
             return true;
         }
         return false;
@@ -1589,9 +1613,9 @@ public:
         graph(graph), sequence(sequence), from(from), to(to),
         nodes(),
         candidate_point({ std::numeric_limits<std::int32_t>::max(), 0, 0, 0 }), candidate_node(0),
-        mismatch(2 * (aligner.match + aligner.mismatch)),
-        gap_open(2 * (aligner.gap_open - aligner.gap_extension)),
-        gap_extend(2 * aligner.gap_extension + aligner.match),
+        mismatch(2 * (aligner.scorer->match + aligner.scorer->mismatch)),
+        gap_open(2 * (aligner.scorer->gap_open - aligner.scorer->gap_extension)),
+        gap_extend(2 * aligner.scorer->gap_extension + aligner.scorer->match),
         score_bound(0), max_distance(0), min_distance(0),
         possible_scores()
     {
@@ -2215,7 +2239,7 @@ WFAAlignment WFAExtender::suffix(const std::string& sequence, pos_t from) const 
 
     if (!result.edits.empty() && result.length == sequence.length() && (result.edits.back().first == WFAAlignment::match || result.edits.back().first == WFAAlignment::mismatch)) {
         // The alignment used all of the sequence and has a match/mismatch at the appropriate end
-        result.score += this->aligner->full_length_bonus; 
+        result.score += this->aligner->scorer->full_length_bonus; 
     }
 
     return result;
@@ -2232,7 +2256,7 @@ WFAAlignment WFAExtender::prefix(const std::string& sequence, pos_t to) const {
     result.flip(*(this->graph), sequence);
 
     if (!result.edits.empty() && result.length == sequence.length() && (result.edits.front().first == WFAAlignment::match || result.edits.front().first == WFAAlignment::mismatch)) {
-        result.score += this->aligner->full_length_bonus; 
+        result.score += this->aligner->scorer->full_length_bonus; 
     }
 
     return result;

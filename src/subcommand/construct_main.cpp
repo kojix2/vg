@@ -22,37 +22,44 @@ void help_construct(char** argv) {
     cerr << "usage: " << argv[0] << " construct [options] >new.vg" << endl
          << "options:" << endl
          << "construct from a reference and variant calls:" << endl
-         << "    -r, --reference FILE   input FASTA reference (may repeat)" << endl
-         << "    -v, --vcf FILE         input VCF (may repeat)" << endl
-         << "    -n, --rename V=F       match contig V in the VCFs to contig F in the FASTAs (may repeat)" << endl
-         << "    -a, --alt-paths        save paths for alts of variants by SHA1 hash" << endl
-         << "    -A, --alt-paths-plain  save paths for alts of variants by variant ID if possible, otherwise SHA1" << endl
-         << "                           (IDs must be unique across all input VCFs)" << endl
-         << "    -R, --region REGION    specify a VCF contig name or 1-based inclusive region (may repeat, if on different contigs)" << endl
-         << "    -C, --region-is-chrom  don't attempt to parse the regions (use when the reference" << endl
-         << "                           sequence name could be inadvertently parsed as a region)" << endl
-         << "    -z, --region-size N    variants per region to parallelize (default: 1024)" << endl
-         << "    -t, --threads N        use N threads to construct graph (defaults to numCPUs)" << endl
-         << "    -S, --handle-sv        include structural variants in construction of graph." << endl
-         << "    -I, --insertions FILE  a FASTA file containing insertion sequences "<< endl
-         << "                           (referred to in VCF) to add to graph." << endl
-         << "    -f, --flat-alts N      don't chop up alternate alleles from input VCF" << endl
-         << "    -l, --parse-max N      don't chop up alternate alleles from input VCF longer than N (default: 100)" << endl
-         << "    -i, --no-trim-indels   don't remove the 1bp reference base from alt alleles of indels." << endl
-         << "    -N, --in-memory        construct the entire graph in memory before outputting it." <<endl
+         << "  -r, --reference FILE   input FASTA reference (may repeat)" << endl
+         << "  -v, --vcf FILE         input VCF (may repeat)" << endl
+         << "  -n, --rename V=F       match contig V in the VCFs to contig F in the FASTAs" << endl
+         << "                         (may repeat)" << endl
+         << "  -a, --alt-paths        save paths for alts of variants by SHA1 hash" << endl
+         << "  -A, --alt-paths-plain  save paths for alts of variants by variant ID" << endl
+         << "                         if possible, otherwise SHA1" << endl
+         << "                         (IDs must be unique across all input VCFs)" << endl
+         << "  -R, --region REGION    specify a VCF contig name or 1-based inclusive region" << endl
+         << "                         (may repeat, if on different contigs)" << endl
+         << "  -C, --region-is-chrom  don't attempt to parse the regions (use when reference" << endl
+         << "                         sequence name could be parsed as a region)" << endl
+         << "  -z, --region-size N    variants per region to parallelize [1024]" << endl
+         << "  -t, --threads N        use N threads to construct graph [numCPUs]" << endl
+         << "  -S, --handle-sv        include structural variants in construction of graph." << endl
+         << "                         (implies --flat-alts)" << endl
+         << "  -I, --insertions FILE  a FASTA file containing insertion sequences "<< endl
+         << "                         (referred to in VCF) to add to graph." << endl
+         << "  -f, --flat-alts        don't chop up alternate alleles from input VCF" << endl
+         << "  -l, --parse-max N      don't chop up alternate alleles from input VCF" << endl
+         << "                         longer than N [100]" << endl
+         << "  -i, --no-trim-indels   don't remove the 1bp ref base from indel alt alleles" << endl
+         << "  -N, --in-memory        construct entire graph in memory before outputting it" <<endl
          << "construct from a multiple sequence alignment:" << endl
-         << "    -M, --msa FILE         input multiple sequence alignment" << endl
-         << "    -F, --msa-format       format of the MSA file (options: fasta, clustal; default fasta)" << endl
-         << "    -d, --drop-msa-paths   don't add paths for the MSA sequences into the graph" << endl
+         << "  -M, --msa FILE         input multiple sequence alignment" << endl
+         << "  -F, --msa-format STR   format of the MSA file {fasta, clustal} [fasta]" << endl
+         << "  -d, --drop-msa-paths   don't add paths for the MSA sequences into the graph" << endl
          << "shared construction options:" << endl
-         << "    -m, --node-max N       limit the maximum allowable node sequence size (default: 32)" << endl
-         << "                           nodes greater than this threshold will be divided" << endl
-         << "                           Note: nodes larger than ~1024 bp can't be GCSA2-indexed" << endl
-         << "    -p, --progress         show progress" << endl;
+         << "  -m, --node-max N       limit maximum allowable node sequence size [32]" << endl
+         << "                         nodes greater than this threshold will be divided" << endl
+         << "                         note: nodes larger than ~1024 bp can't be GCSA2-indexed" << endl
+         << "  -p, --progress         show progress" << endl
+         << "  -h, --help             print this help message to stderr and exit" << endl;
 
 }
 
 int main_construct(int argc, char** argv) {
+    Logger logger("vg construct");
 
     if (argc == 2) {
         help_construct(argv);
@@ -102,6 +109,7 @@ int main_construct(int argc, char** argv) {
                 {"parse-max", required_argument, 0, 'l'},
                 {"no-trim-indels", no_argument, 0, 'i'},
                 {"in-memory", no_argument, 0, 'N'},
+                {"help", no_argument, 0, 'h'},
                 {0, 0, 0, 0}
             };
 
@@ -116,15 +124,15 @@ int main_construct(int argc, char** argv) {
         switch (c)
         {
         case 'v':
-            vcf_filenames.push_back(optarg);
+            vcf_filenames.push_back(require_exists(logger, optarg));
             break;
 
         case 'M':
-            msa_filename = optarg;
+            msa_filename = require_exists(logger, optarg);
             break;
             
         case 'F':
-            msa_format = optarg;
+            msa_format = require_exists(logger, optarg);
             break;
             
         case 'd':
@@ -140,30 +148,23 @@ int main_construct(int argc, char** argv) {
             break;
 
         case 'r':
-            fasta_filenames.push_back(optarg);
+            fasta_filenames.push_back(require_exists(logger, optarg));
             break;
 
         case 'S':
             constructor.do_svs = true;
+            constructor.flat = true;
             break;
 
         case 'I':
-            insertion_filenames.push_back(optarg);
+            insertion_filenames.push_back(require_exists(logger, optarg));
             break;
 
             
         case 'n':
             {
-                // Parse the rename old=new
-                string key_value(optarg);
-                auto found = key_value.find('=');
-                if (found == string::npos || found == 0 || found + 1 == key_value.size()) {
-                    cerr << "error:[vg construct] could not parse rename " << key_value << endl;
-                    exit(1);
-                }
-                // Parse out the two parts
-                string vcf_contig = key_value.substr(0, found);
-                string fasta_contig = key_value.substr(found + 1);
+                string vcf_contig, fasta_contig;
+                tie(vcf_contig, fasta_contig) = parse_pair(logger, optarg, '=', "--rename");
                 // Add the name mapping
                 constructor.add_name_mapping(vcf_contig, fasta_contig);
             }
@@ -195,7 +196,7 @@ int main_construct(int argc, char** argv) {
             break;
 
         case 't':
-            omp_set_num_threads(parse<int>(optarg));
+            set_thread_count(logger, optarg);
             break;
 
         case 'm':
@@ -221,16 +222,14 @@ int main_construct(int argc, char** argv) {
             throw runtime_error("Not implemented: " + to_string(c));
         }
     }
-    
+
     if (max_node_size == 0) {
         // Make sure we can actually make nodes
-        cerr << "error:[vg construct] max node size cannot be 0" << endl;
-        exit(1);
+        logger.error() << "max node size cannot be 0" << endl;
     }
     
     if (!msa_filename.empty() && !fasta_filenames.empty()) {
-        cerr << "error:[vg construct] cannot construct from a reference/VCF and an MSA simultaneously" << endl;
-        exit(1);
+        logger.error() << "cannot construct from a reference/VCF and an MSA simultaneously" << endl;
     }
     
     if (!fasta_filenames.empty()) {
@@ -255,43 +254,36 @@ int main_construct(int argc, char** argv) {
                              stop_pos);
                              
                 if (used_region_contigs.count(seq_name)) {
-                    cerr << "error:[vg construct] cannot construct multiple regions of " << seq_name << endl;
-                    exit(1);
+                    logger.error() << "cannot construct multiple regions of " << seq_name << endl;
                 }
                 used_region_contigs.insert(seq_name);
                 
                 if (start_pos > 0 && stop_pos > 0) {
                     // These are 0-based, so if both are nonzero we got a real set of coordinates
                     if (constructor.show_progress) {
-                        cerr << "Restricting to " << seq_name << " from " << start_pos << " to " << stop_pos << endl;
+                        logger.info() << "Restricting to " << seq_name << " from " 
+                                      << start_pos << " to " << stop_pos << endl;
                     }
                     constructor.allowed_vcf_names.insert(seq_name);
                     // Make sure to correct the coordinates to 0-based exclusive-end, from 1-based inclusive-end
                     constructor.allowed_vcf_regions[seq_name] = make_pair(start_pos - 1, stop_pos);
                 } else if (start_pos < 0 && stop_pos < 0) {
                     // We just got a name
-                    cerr << "Restricting to " << seq_name << " from 1 to end" << endl;
+                    logger.info() << "Restricting to " << seq_name << " from 1 to end" << endl;
                     constructor.allowed_vcf_names.insert(seq_name);
                 } else {
                     // This doesn't make sense. Does it have like one coordinate?
-                    cerr << "error:[vg construct] could not parse " << region << endl;
-                    exit(1);
+                    logger.error() << "could not parse " << region << endl;
                 }
             } else {
                 // We have been told not to parse the region
-                cerr << "Restricting to " << region << " from 1 to end" << endl;
+                logger.info() << "Restricting to " << region << " from 1 to end" << endl;
                 constructor.allowed_vcf_names.insert(region);
             }
         }
         
-        
-        if (fasta_filenames.empty()) {
-            cerr << "error:[vg construct] a reference is required for graph construction" << endl;
-            return 1;
-        }
-        if (insertion_filenames.size() > 1){
-            cerr << "Error: only one insertion file may be provided." << endl;
-            exit(1);
+        if (insertion_filenames.size() > 1) {
+            logger.error() << "only one insertion file may be provided" << endl;
         }
         
         if (construct_in_memory) {
@@ -309,7 +301,8 @@ int main_construct(int argc, char** argv) {
             auto callback = [&](Graph& big_chunk) {
                 // Sort the nodes by ID so that the serialized chunks come out in sorted order
                 // TODO: We still interleave chunks from different threads working on different contigs
-                std::sort(big_chunk.mutable_node()->begin(), big_chunk.mutable_node()->end(), [](const Node& a, const Node& b) -> bool {
+                std::sort(big_chunk.mutable_node()->begin(), big_chunk.mutable_node()->end(), 
+                [](const Node& a, const Node& b) -> bool {
                     // Return true if a comes before b
                     return a.id() < b.id();
                 });
@@ -339,11 +332,6 @@ int main_construct(int argc, char** argv) {
     else if (!msa_filename.empty()) {
         
         ifstream msa_file(msa_filename);
-        if (!msa_file) {
-            cerr << "error:[vg construct] could not open MSA file " << msa_filename << endl;
-            exit(1);
-        }
-        
         MSAConverter msa_converter;
         msa_converter.show_progress = show_progress;
         
@@ -353,8 +341,7 @@ int main_construct(int argc, char** argv) {
         msa_graph.serialize_to_ostream(cout);
     }
     else {
-        cerr << "error:[vg construct] a reference or an MSA is required for construct" << endl;
-        exit(1);
+        logger.error() << "a reference or an MSA is required for graph construction" << endl;
     }
 
     return 0;

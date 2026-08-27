@@ -28,16 +28,19 @@ using namespace vg::subcommand;
 void help_add(char** argv) {
     cerr << "usage: " << argv[0] << " add [options] old.vg >new.vg" << endl
          << "options:" << endl
-         << "    -v, --vcf FILE         add in variants from the given VCF file (may repeat)" << endl
-         << "    -n, --rename V=G       rename contig V in the VCFs to contig G in the graph (may repeat)" << endl
-         << "    -i, --ignore-missing   ignore contigs in the VCF not found in the graph" << endl
-         << "    -r, --variant-range N  range in which to look for nearby variants to make a haplotype" << endl
-         << "    -f, --flank-range N    extra flanking sequence to use outside of found variants" << endl
-         << "    -p, --progress         show progress" << endl
-         << "    -t, --threads N        use N threads (defaults to numCPUs)" << endl;
+         << "  -v, --vcf FILE         add in variants from a VCF (may repeat)" << endl
+         << "  -n, --rename V=G       rename contig V in the VCFs to contig G in the graph" << endl
+         << "                         (may repeat)" << endl
+         << "  -i, --ignore-missing   ignore contigs in the VCF not found in the graph" << endl
+         << "  -r, --variant-range N  range to look for nearby variants to make a haplotype" << endl
+         << "  -f, --flank-range N    extra flanking sequence to use outside of variants" << endl
+         << "  -p, --progress         show progress" << endl
+         << "  -t, --threads N        use N threads [numCPUs]" << endl
+         << "  -h, --help             print this help message to stderr and exit" << endl;
 }
 
 int main_add(int argc, char** argv) {
+    Logger logger("vg add");
 
     if (argc == 2) {
         help_add(argv);
@@ -85,21 +88,13 @@ int main_add(int argc, char** argv) {
         {
 
         case 'v':
-            vcf_filenames.push_back(optarg);
+            vcf_filenames.push_back(require_exists(logger, optarg));
             break;
             
         case 'n':
             {
-                // Parse the rename old=new
-                string key_value(optarg);
-                auto found = key_value.find('=');
-                if (found == string::npos || found == 0 || found + 1 == key_value.size()) {
-                    cerr << "error:[vg add] could not parse rename " << key_value << endl;
-                    exit(1);
-                }
-                // Parse out the two parts
-                string vcf_contig = key_value.substr(0, found);
-                string graph_contig = key_value.substr(found + 1);
+                string vcf_contig, graph_contig;
+                tie(vcf_contig, graph_contig) = parse_pair(logger, optarg, '=', "--rename");
                 // Add the name mapping
                 renames.emplace_back(vcf_contig, graph_contig);
             }
@@ -122,7 +117,7 @@ int main_add(int argc, char** argv) {
             break;
             
         case 't':
-            omp_set_num_threads(parse<int>(optarg));
+            set_thread_count(logger, optarg);
             break;
 
         case 'h':
@@ -148,15 +143,12 @@ int main_add(int argc, char** argv) {
     vector<unique_ptr<vcflib::VariantCallFile>> vcfs;
     
     for (auto vcf_filename : vcf_filenames) {
-        // For each VCF filename
-        
-        // Open it
+        // Open each VCF file
         vcfs.emplace_back(new vcflib::VariantCallFile());
         auto& vcf = *vcfs.back();
         vcf.open(vcf_filename);
         if (!vcf.is_open()) {
-            cerr << "error:[vg add] could not open " << vcf_filename << endl;
-            return 1;
+            logger.error() << "could not open " << vcf_filename << endl;
         }
     }
     
@@ -188,8 +180,7 @@ int main_add(int argc, char** argv) {
     ensure_vg();
     
     if (vg_graph == nullptr) {
-        cerr << "error:[vg add]: Could not load graph" << endl;
-        exit(1);
+        logger.error() << "Could not load graph" << endl;
     }
     
     {

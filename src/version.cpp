@@ -6,6 +6,8 @@
 // Do the same for the build environment info
 #include "vg_environment_version.hpp"
 
+#include <htslib/hts.h>
+
 #include <iostream>
 #include <sstream>
 
@@ -32,6 +34,11 @@
     #define VG_STANDARD_LIBRARY_VERSION "unknown standard library"
 #endif
 
+// And the version of htslib
+#ifndef VG_HTSLIB_VERSION
+    #define VG_HTSLIB_VERSION STR(HTS_VERSION)
+#endif
+
 namespace vg {
 
 using namespace std;
@@ -40,6 +47,8 @@ using namespace std;
 const string Version::VERSION = VG_GIT_VERSION;
 const string Version::COMPILER = VG_COMPILER_VERSION;
 const string Version::STANDARD_LIBRARY = VG_STANDARD_LIBRARY_VERSION;
+const string Version::HTSLIB_HEADERS = VG_HTSLIB_VERSION;
+const string Version::HTSLIB_LIBRARY(hts_version());
 const string Version::OS = VG_OS;
 const string Version::BUILD_USER = VG_BUILD_USER;
 const string Version::BUILD_HOST = VG_BUILD_HOST;
@@ -107,13 +116,64 @@ const unordered_map<string, string> Version::codenames = {
     {"v1.61.0", "Plodio"},
     {"v1.62.0", "Ranzano"},
     {"v1.63.0", "Boccaleone"},
+    {"v1.63.1", "Boccaleone"},
     {"v1.64.0", "Vibbiana"},
+    {"v1.64.1", "Vibbiana"},
     {"v1.65.0", "Carfon"},
+    {"v1.65.1", "Carfon"},
     {"v1.66.0", "Navetta"},
     {"v1.67.0", "Vetria"},
     {"v1.68.0", "Rimbocchi"},
     {"v1.69.0", "Bologna"},
-    {"v1.70.0", "Zebedassi"}
+    {"v1.70.0", "Zebedassi"},
+    {"v1.71.0", "Cera"},
+    {"v1.72.0", "Littlefoot"},
+    {"v1.73.0", "Ducky"},
+    {"v1.74.0", "Petrie"},
+    {"v1.74.1", "Petrie"},
+    {"v1.75.0", "Spike"},
+    {"v1.75.1", "Spike"},
+    {"v1.76.0", "Chomper"},
+    {"v1.76.1", "Chomper"},
+    {"v1.77.0", "Ruby"},
+    {"v1.78.0", "Sharptooth"},
+    {"v1.79.0", "Rooter"},
+    {"v1.80.0", "Ali"},
+    {"v1.81.0", "Doc"},
+    {"v1.82.0", "Pterano"},
+    {"v1.83.0", "Tippy"},
+    {"v1.84.0", "Mo"},
+    {"v1.85.0", "Bron"},
+    {"v1.86.0", "Shorty"},
+    {"v1.87.0", "Sue"},
+    {"v1.88.0", "Topps"},
+    {"v1.89.0", "Tria"},
+    {"v1.90.0", "Tricia"},
+    {"v1.91.0", "Ozzy"},
+    {"v1.92.0", "Strut"},
+    {"v1.93.0", "Ichy"},
+    {"v1.94.0", "Dil"},
+    {"v1.95.0", "Hyp"},
+    {"v1.96.0", "Mutt"},
+    {"v1.97.0", "Nod"},
+    {"v1.98.0", "Dinah"},
+    {"v1.99.0", "Dana"},
+    {"v1.100.0", "Elsie"},
+    {"v1.101.0", "Archie"},
+    {"v1.102.0", "Thicknose"},
+    {"v1.103.0", "Rinkus"},
+    {"v1.104.0", "Sierra"},
+    {"v1.105.0", "Loofah"},
+    {"v1.106.0", "Doofah"},
+    {"v1.107.0", "Foobie"},
+    {"v1.108.0", "Skitter"},
+    {"v1.109.0", "Rocky"},
+    {"v1.110.0", "Etta"},
+    {"v1.111.0", "Wildarms"},
+    {"v1.112.0", "Redclaw"},
+    {"v1.113.0", "Screech"},
+    {"v1.114.0", "Thud"},
+    {"v1.115.0", "Swooper"}
     // Add more codenames here
 };
 
@@ -165,6 +225,7 @@ string Version::get_long() {
     s << "vg version " << get_short() << endl;
     s << "Compiled with " << COMPILER << " on " << OS << endl;
     s << "Linked against " << STANDARD_LIBRARY << endl;
+    s << "Using HTSlib headers " << HTSLIB_HEADERS << ", library " << HTSLIB_LIBRARY << endl;
     s << "Built by " << BUILD_USER << "@" << BUILD_HOST;
     return s.str();
 }

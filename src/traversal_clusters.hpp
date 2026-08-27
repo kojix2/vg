@@ -41,8 +41,11 @@ inline double jaccard_coefficient(const T& target, const U& query) {
     return (double)isec_size / (double)union_size;
 }
 
-// specialized version that weights jaccard by node lenths. 
-double weighted_jaccard_coefficient(const PathHandleGraph* graph, const multiset<handle_t>& target, const multiset<handle_t>& query);
+// length-weighted similarity of two snarl alleles, with a special case for pure deletions.
+// see the definition for why.  site_length is the total length of the site's reference traversal
+// interior; 0 means "unknown".
+double weighted_traversal_similarity(const PathHandleGraph* graph, const multiset<handle_t>& target,
+                                     const multiset<handle_t>& query, int64_t site_length);
 
 // the information needed from the parent traversal in order to
 // genotype a child traversal
@@ -75,13 +78,19 @@ vector<int> get_traversal_order(const PathHandleGraph* graph,
 /// traversal (this guarantees the snarl nesting structure is exactly represented in the vcf alleles!)
 /// if child snarls are given, then we also fill in the mapping of each child snarl to its
 /// "reference" traversals -- ie first traversal in a cluster that contains both its endpoints
+/// site_ref_trav is the site's reference traversal, used to scale the similarity of a PURE DELETION
+/// (a 2-visit traversal, whose interior is empty) -- see weighted_traversal_similarity.  Pass
+/// nullptr only when no reference traversal is available; a site with a pure deletion will then fall
+/// back to pairwise scoring and that deletion can never be merged.  Deliberately has no default: a
+/// caller that omits it would silently reintroduce that bug.
 vector<vector<int>> cluster_traversals(const PathHandleGraph* graph,
                                        const vector<Traversal>& traversals,
                                        const vector<int>& traversal_order,
                                        const vector<pair<handle_t, handle_t>>& child_snarls,
                                        double min_jaccard,
                                        vector<pair<double, int64_t>>& out_info,
-                                       vector<int>& out_child_snarl_to_trav);
+                                       vector<int>& out_child_snarl_to_trav,
+                                       const Traversal* site_ref_trav);
 
 /// assign a list of child snarls to traversals that fully conrtain them
 /// the output is a list (for each traversal) of each child snarl that's contained in it
@@ -99,6 +108,38 @@ vector<vector<int>> assign_child_snarls_to_traversals(const PathHandleGraph* gra
 /// Note: this doesn't modify the graph toplogy, so uncovered nodes and edges as a result of path editing
 /// would usually need removale with vg clip afterwards
 ///
-void merge_equivalent_traversals_in_graph(MutablePathHandleGraph* graph, const unordered_set<path_handle_t>& selected_paths);
+/// the use_snarl_manager toggles between distnace index and snarl manager for computing snarls
+/// (adding this option to (hopefully) temporarily revert to the snarl manager for performance reasons)
+void merge_equivalent_traversals_in_graph(MutablePathHandleGraph* graph, const unordered_set<path_handle_t>& selected_paths,
+                                          bool use_snarl_manager=false);
+
+
+/// for every snarl, bottom up, compute all the traversals through it.  choose a reference traversal
+/// (using the prefix where possible), then if
+void simplify_graph_using_traversals(MutablePathMutableHandleGraph* graph, const string& ref_path_prefix,
+                                     int64_t min_snarl_length,
+                                     double min_jaccard,
+                                     int64_t max_iterations,
+                                     int64_t min_fragment_length);
+
+/**
+ * Add star-allele traversals for haplotypes that appear in the parent snarl but are missing
+ * from the current snarl's traversals. This is used for nested calling to ensure that
+ * haplotypes spanning a parent site but not traversing a child site get a "*" allele.
+ *
+ * @param travs             Vector of traversals (modified in place to add star traversals)
+ * @param names             Vector of path names corresponding to traversals (modified in place)
+ * @param trav_clusters     Vector of cluster assignments (modified in place)
+ * @param trav_cluster_info Vector of cluster info (similarity, length delta) (modified in place)
+ * @param parent_haplotypes Map from sample name -> vector of haplotype phases in the parent
+ * @param sample_names      Set of sample names to consider (reference-only samples are skipped)
+ * @return                  Map from sample name -> vector of haplotype phases in all traversals
+ */
+unordered_map<string, vector<int>> add_star_traversals(vector<Traversal>& travs,
+                                                       vector<string>& names,
+                                                       vector<vector<int>>& trav_clusters,
+                                                       vector<pair<double, int64_t>>& trav_cluster_info,
+                                                       const unordered_map<string, vector<int>>& parent_haplotypes,
+                                                       const set<string>& sample_names);
 
 }

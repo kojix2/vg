@@ -40,11 +40,17 @@ vector<int> Deconstructor::get_alleles(vcflib::Variant& v,
     // go from traversals number (offset in travs) to allele number
     vector<int> trav_to_allele(travs.size());
 
+    // A star allele is a haplotype genotyped in the parent snarl that does not pass through this
+    // one.  It is an EMPTY traversal (sole producer: add_star_traversals in traversal_clusters.cpp)
+    // spelled "*" in VCF.  That spelling is a MARKER, not sequence -- every test below asks the
+    // traversal, never the string.
+    auto is_star_trav = [](const Traversal& trav) { return trav.empty(); };
+
     // compute the allele as a string
     auto trav_to_string = [&](const Traversal& trav) {
         string allele;
         // hack to support star alleles
-        if (trav.size() == 0) {
+        if (is_star_trav(trav)) {
             allele = "*";
         } else {
             // we skip the snarl endpoints
@@ -55,7 +61,10 @@ vector<int> Deconstructor::get_alleles(vcflib::Variant& v,
         return allele;
     };
 
-    // set the reference allele
+    // set the reference allele.  The reference traversal comes from PathTraversalFinder, which
+    // always emits both snarl endpoints, so it is never empty; stars are appended later by
+    // add_star_traversals.  Fail loudly rather than putting "*" -- or its revcomp -- in REF.
+    assert(!is_star_trav(travs.at(ref_path_idx)));
     string ref_allele = trav_to_string(travs.at(ref_path_idx));
     allele_idx[ref_allele] = make_pair(0, ref_path_idx);
     trav_to_allele[ref_path_idx] = 0;
@@ -64,16 +73,27 @@ vector<int> Deconstructor::get_alleles(vcflib::Variant& v,
     // set the other alleles (they can end up as 0 alleles too if their strings match the reference)
     // note that we have one (unique) allele per cluster, so we take advantage of that here
     for (const vector<int>& cluster : trav_clusters) {
-        string allele = trav_to_string(travs[cluster.front()]);
+        const Traversal& cluster_trav = travs[cluster.front()];
+        string allele = trav_to_string(cluster_trav);
+        bool allele_is_star = is_star_trav(cluster_trav);
         for (const int& i : cluster) {
             if (i != ref_path_idx) {
                 auto ai_it = allele_idx.find(allele);
                 if (ai_it == allele_idx.end()) {
+                    // star traversals are always singleton clusters (add_star_traversals in
+                    // traversal_clusters.cpp pushes {travs.size() - 1}), which is what lets the
+                    // emission loop below re-derive star-ness from the stored member index i
+                    // rather than from cluster.front()
+                    assert(!allele_is_star || cluster.size() == 1);
                     // make a new allele for this string
                     allele_idx[allele] = make_pair(cur_alt, i);
                     trav_to_allele.at(i) = cur_alt;
                     ++cur_alt;
-                    substitution = substitution && allele.size() == ref_allele.size();
+                    if (!allele_is_star) {
+                        // a star carries no sequence: it is neither the reference's length nor a
+                        // different one, so it must not decide whether this site needs an anchor base
+                        substitution = substitution && allele.size() == ref_allele.size();
+                    }
                 } else {
                     // allele string has been seen, map this traversal to it
                     trav_to_allele.at(i) = ai_it->second.first;
@@ -82,6 +102,15 @@ vector<int> Deconstructor::get_alleles(vcflib::Variant& v,
                 trav_to_allele.at(i) = -1; // HACK! negative allele indexes are ignored
             }
         }
+    }
+
+    // An empty reference allele has no anchor base of its own, so the record must be written in
+    // padded (indel) form.  Before stars were excluded from the fold above, a star's length-1 "*"
+    // happened to force that; without this guard a star-only site would leave REF empty and vcflib
+    // silently rewrites "" to ".".  This restores the pre-fix behaviour at such sites, so it adds
+    // no new exposure to the assert(v.position >= 2) below.
+    if (ref_allele.empty() && allele_idx.size() > 1) {
+        substitution = false;
     }
 
     // fill in the variant
@@ -120,11 +149,16 @@ vector<int> Deconstructor::get_alleles(vcflib::Variant& v,
         string allele_string = ai_pair.first;
         int allele_no = ai_pair.second.first;
         int allele_trav_no = ai_pair.second.second;
-        if (reversed) {
-            reverse_complement_in_place(allele_string);
-        }
-        if (!substitution) {
-            allele_string = string(1, prev_char) + allele_string;
+        // the star is a marker, not sequence: complement['*'] is 'N' (src/utility.cpp) and htslib
+        // only recognizes an overlapping-deletion ALT when the field is exactly "*", so both
+        // transforms below would corrupt it ("N", "AN", "A*")
+        if (!is_star_trav(travs.at(allele_trav_no))) {
+            if (reversed) {
+                reverse_complement_in_place(allele_string);
+            }
+            if (!substitution) {
+                allele_string = string(1, prev_char) + allele_string;
+            }
         }
         v.alleles[allele_no] = allele_string;
         if (allele_no > 0) {
@@ -298,7 +332,7 @@ void Deconstructor::get_genotypes(vcflib::Variant& v, const vector<string>& name
     assert(names.size() == trav_to_allele.size());
     // set up our variant fields
     v.format.push_back("GT");
-    if (show_path_info && path_to_sample_phase) {
+    if (show_path_info && !gbwt_sample_to_phase_range.empty()) {
         v.format.push_back("PI");
     }
     if (this->cluster_threshold < 1.0) {
@@ -323,7 +357,11 @@ void Deconstructor::get_genotypes(vcflib::Variant& v, const vector<string>& name
             phase = 0;
         }
         gbwt_phases[i] = (int)phase;
-        if (sample_names.count(sample_name)) {
+        // is_other_reference_view() drops these paths per-path from the header scan, but
+        // sample identity is per-sample: when only one contig's gref reference is
+        // selected, the base sample survives via its other contigs, and this traversal
+        // would be re-attached to it and inflate AC/AF/AN/NS.
+        if (sample_names.count(sample_name) && !is_other_reference_view(names[i])) {
             sample_to_traversals[sample_name].push_back(i);
         }
     }
@@ -350,7 +388,7 @@ void Deconstructor::get_genotypes(vcflib::Variant& v, const vector<string>& name
             for (int i = 0; i < chosen_travs.size(); ++i) {
                 if (i > 0) {
                     // TODO check flag for phasing
-                    genotype += (path_to_sample_phase || gbwt_trav_finder.get())  ? "|" : "/";
+                    genotype += (!gbwt_sample_to_phase_range.empty() || gbwt_trav_finder.get())  ? "|" : "/";
                 }
                 genotype += (chosen_travs[i] != -1 && (!conflict || keep_conflicted_genotypes))
                     ? std::to_string(trav_to_allele[chosen_travs[i]]) : ".";
@@ -368,7 +406,7 @@ void Deconstructor::get_genotypes(vcflib::Variant& v, const vector<string>& name
                 }
             }
             v.samples[sample_name]["GT"] = {genotype};
-            if (show_path_info && path_to_sample_phase) {
+            if (show_path_info && !gbwt_sample_to_phase_range.empty()) {
                 for (auto trav : travs) {
                     auto allele = trav_to_allele[trav];
                     if (allele != -1) {
@@ -379,13 +417,18 @@ void Deconstructor::get_genotypes(vcflib::Variant& v, const vector<string>& name
         } else {
             string blank_gt = ".";
             if (gbwt_sample_to_phase_range.count(sample_name)) {
-                auto& phase_range = gbwt_sample_to_phase_range.at(sample_name);
-                for (int phase = phase_range.first + 1; phase <= phase_range.second; ++phase) {
+                // note: this is the same logic used when filling in actual genotypes
+                int min_phase, max_phase;
+                std::tie(min_phase, max_phase) = gbwt_sample_to_phase_range.at(sample_name);
+                // shift left by 1 unless min phase is 0
+                int sample_ploidy = min_phase == 0 ? max_phase + 1 : max_phase;
+                assert(sample_ploidy > 0);
+                for (int phase = 1; phase < sample_ploidy; ++phase) {
                     blank_gt += "|.";
                 }
             }
             v.samples[sample_name]["GT"] = {blank_gt};
-            if (show_path_info && path_to_sample_phase) {
+            if (show_path_info && !gbwt_sample_to_phase_range.empty()) {
                 v.samples[sample_name]["PI"] = {blank_gt};
             }
         }
@@ -441,12 +484,11 @@ pair<vector<int>, bool> Deconstructor::choose_traversals(const string& sample_na
     // try to pull out unique phases if available
     bool has_phasing = gbwt_sample_to_phase_range.count(sample_name) &&
         std::any_of(gbwt_phases.begin(), gbwt_phases.end(), [](int i) { return i >= 0; });
-    //|| path_to_sample_phase;
     bool phasing_conflict = false;
     int sample_ploidy = 1;
     int min_phase = 1;
     int max_phase = 1;
-    if (has_phasing || path_to_sample_phase) {
+    if (has_phasing || !gbwt_sample_to_phase_range.empty()) {
         if (has_phasing) {
             // override ploidy with information about all phases found in input
             std::tie(min_phase, max_phase) = gbwt_sample_to_phase_range.at(sample_name);
@@ -494,7 +536,7 @@ pair<vector<int>, bool> Deconstructor::choose_traversals(const string& sample_na
             }
             swap(padded_travs, most_frequent_travs);
         }
-    } else if (path_to_sample_phase) {
+    } else if (!gbwt_sample_to_phase_range.empty()) {
         std::sort(most_frequent_travs.begin(), most_frequent_travs.end(),
                   [&](int t1, int t2) {return gbwt_phases.at(t1) < gbwt_phases.at(t2);});
         vector<int> padded_travs(sample_ploidy, -1);
@@ -618,70 +660,16 @@ unordered_map<string, vector<int>> Deconstructor::add_star_traversals(vector<Tra
                                                                       vector<string>& names,
                                                                       vector<vector<int>>& trav_clusters,
                                                                       vector<pair<double, int64_t>>& trav_cluster_info,
-                                                                      const unordered_map<string, vector<int>>& parent_haplotypes) const {    
-    // todo: refactor this into general genotyping code
-    unordered_map<string, vector<int>> sample_to_haps;
-
-    // find out what's in the traversals
-    assert(names.size() == travs.size());
-    for (int64_t i = 0; i < names.size(); ++i) {
-        string sample_name = PathMetadata::parse_sample_name(names[i]);
-        // for backward compatibility
-        if (sample_name.empty()) {
-            sample_name = names[i];
-        }
-        auto phase = PathMetadata::parse_haplotype(names[i]);
-        if (!sample_name.empty() && phase == PathMetadata::NO_HAPLOTYPE) {
-            // THis probably won't fit in an int. Use 0 instead.
-            phase = 0;
-        }
-        sample_to_haps[sample_name].push_back(phase);
-    }
-
-    // find everything that's in parent_haplotyes but not the travefsals,
-    // and add in dummy start-alleles for them
-    for (const auto& parent_sample_haps : parent_haplotypes) {
-        string parent_sample_name = PathMetadata::parse_sample_name(parent_sample_haps.first);
-        if (parent_sample_name.empty()) {
-            parent_sample_name = parent_sample_haps.first;
-        }
-        if (!this->sample_names.count(parent_sample_name)) {
-            // dont' bother for purely reference samples -- we don't need to force and allele for them.
-            continue;
-        }
-        for (int parent_hap : parent_sample_haps.second) {
-            bool found = false;
-            if (sample_to_haps.count(parent_sample_haps.first)) {
-                // note: this is brute-force search, but number of haplotypes usually tiny.
-                for (int hap : sample_to_haps[parent_sample_haps.first]) {
-                    if (parent_hap == hap) {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if (!found) {
-                travs.push_back(Traversal());
-                names.push_back(PathMetadata::create_path_name(PathSense::REFERENCE,
-                                                               parent_sample_haps.first,
-                                                               "star",
-                                                               parent_hap,
-                                                               PathMetadata::NO_PHASE_BLOCK,
-                                                               PathMetadata::NO_SUBRANGE));
-                sample_to_haps[parent_sample_haps.first].push_back(parent_hap);
-                trav_clusters.push_back({(int)travs.size() - 1});
-                trav_cluster_info.push_back(make_pair(0, 0));
-            }
-        }
-    }
-    
-    return sample_to_haps;
+                                                                      const unordered_map<string, vector<int>>& parent_haplotypes) const {
+    // Delegate to the shared implementation in traversal_clusters.cpp
+    return vg::add_star_traversals(travs, names, trav_clusters, trav_cluster_info,
+                                   parent_haplotypes, this->sample_names);
 }
 
 
 bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t& snarl_end,
-                                     const NestingInfo* in_nesting_info,
-                                     vector<NestingInfo>* out_nesting_infos) const {
+                                     const ChildContext* in_context,
+                                     vector<ChildContext>* out_child_contexts) const {
 
 
     vector<Traversal> travs;
@@ -695,21 +683,14 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
     int64_t trav_step_count = trav_steps.size();
 
     if (travs.empty()) {
+#ifdef debug
+        cerr << "Skipping site because no traversals were found " << graph_interval_to_string(graph, snarl_start, snarl_end) << endl;
+#endif
         return false;        
     }
     
     // pick out the traversal corresponding to an embedded reference path, breaking ties consistently
     string ref_trav_name;
-    string parent_ref_trav_name;
-    if (in_nesting_info != nullptr && in_nesting_info->has_ref) {
-        parent_ref_trav_name = graph->get_path_name(graph->get_path_handle_of_step(in_nesting_info->parent_path_interval.first));
-#ifdef debug
-#pragma omp critical (cerr)
-        cerr << "Using nesting information to set reference to " << parent_ref_trav_name << endl;
-#endif
-        // remember it for the vcf header
-        this->off_ref_paths[omp_get_thread_num()].insert(graph->get_path_handle_of_step(in_nesting_info->parent_path_interval.first));
-    }
     for (int i = 0; i < travs.size(); ++i) {
         const string& path_trav_name = trav_path_names[i];
 #ifdef debug
@@ -720,23 +701,25 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
                 cerr << ", start=" << graph->get_position_of_step(trav_steps[i].first)
                      << ", end=" << graph->get_position_of_step(trav_steps[i].second) << endl;
             }
-            cerr << " trav=" << traversal_to_string(graph, travs[i]) << endl;
+            cerr << " trav=" << traversal_to_string(graph, travs[i], 100000) << endl;
         }
 #endif
-        bool ref_path_check;
-        if (!parent_ref_trav_name.empty()) {
-            // the reference was specified by the parent
-            ref_path_check = path_trav_name == parent_ref_trav_name;
-        } else {
-            // the reference comes from the global options
-            ref_path_check = ref_paths.count(path_trav_name);
+        bool ref_path_check = ref_paths.count(path_trav_name);
+        // Prefer a base reference over its gref copy when both are selected: they carry
+        // the same sequence, but a gref name sorts before the path it was copied from
+        // (gref_x < x), so name order alone would put the derived name on the record.
+        bool better_ref = ref_trav_name.empty();
+        if (!better_ref) {
+            bool best_is_gref = GrefCover::is_gref_derived(ref_trav_name);
+            bool this_is_gref = GrefCover::is_gref_derived(path_trav_name);
+            better_ref = best_is_gref != this_is_gref ? best_is_gref
+                                                      : path_trav_name < ref_trav_name;
         }
-        if (ref_path_check &&
-            (ref_trav_name.empty() || path_trav_name < ref_trav_name)) {
+        if (ref_path_check && better_ref) {
             ref_trav_name = path_trav_name;
 #ifdef debug
 #pragma omp critical (cerr)
-            cerr << "Setting ref_trav_name " << ref_trav_name << (in_nesting_info ? " using nesting info" : "") << endl;
+            cerr << "Setting ref_trav_name " << ref_trav_name << endl;
 #endif
         }
     }
@@ -774,35 +757,15 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
         cerr << "Skipping site because no reference traversal was found " << graph_interval_to_string(graph, snarl_start, snarl_end) << endl;
 #endif
         return false;
-    }    
-    
+    }
+
     // there's not alt path through the snarl, so we can't make an interesting variant
     if (travs.size() < 2) {
 #ifdef debug
 #pragma omp critical (cerr)
-        cerr << "Skipping site because to alt traversal was found " << graph_interval_to_string(graph, snarl_start, snarl_end) << endl;
+        cerr << "Skipping site because no alt traversal was found " << graph_interval_to_string(graph, snarl_start, snarl_end) << endl;
 #endif
         return false;
-    }
-
-    if (ref_travs.size() > 1 && this->nested_decomposition) {
-#ifdef debug
-#pragma omp critical (cerr)
-        cerr << "Multiple ref traversals not yet supported with nested decomposition: removing all but first" << endl;
-#endif
-        size_t min_start_pos = numeric_limits<size_t>::max();
-        int64_t first_ref_trav;
-        for (int64_t i = 0; i < ref_travs.size(); ++i) {            
-            auto& ref_trav_idx = ref_travs[i];
-            step_handle_t start_step = trav_steps[ref_trav_idx].first;
-            step_handle_t end_step = trav_steps[ref_trav_idx].second;
-            size_t ref_trav_pos = min(graph->get_position_of_step(start_step), graph->get_position_of_step(end_step));
-            if (ref_trav_pos < min_start_pos) {
-                min_start_pos = ref_trav_pos;
-                first_ref_trav = i;
-            }
-        }
-        ref_travs = {ref_travs[first_ref_trav]};        
     }
 
     // XXX CHECKME this assumes there is only one reference path here, and that multiple traversals are due to cycles
@@ -918,7 +881,22 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
 
         v.position = first_path_pos + ref_trav_offset;
 
-        v.id = print_snarl(graph, snarl_start, snarl_end);
+        // Spell the ID in the orientation the reference traverses the snarl.  The snarl finder
+        // stores a snarl in whichever orientation it happened to root it, so without this the
+        // ID can contradict the orientation of the record's own POS/REF/ALT, and -- worse --
+        // differs from the ID vg call emits for the same site, which flips the snarl to the
+        // reference before genotyping (graph_caller.cpp, "orient the snarl along the reference
+        // path").  Measured before this change: deconstruct spelled 26% of chrOther-v2.1 sites
+        // and 8.8% of chr22 sites the other way round from call, so IDs and PS chains from the
+        // two tools could not be compared, and anything keying on the ID had to try both.
+        //
+        // use_start is exactly the test: it is start_pos < end_pos on the reference path.
+        //
+        // PS follows automatically.  chrom_of_name is keyed on the emitted ID, and the
+        // ancestor walk in update_nesting_info_tags() already looks up both spellings, so the
+        // parent it records is whichever one the VCF actually contains.
+        v.id = use_start ? print_snarl(graph, snarl_start, snarl_end)
+                         : print_snarl(graph, graph->flip(snarl_end), graph->flip(snarl_start));
             
         // Convert the snarl traversals to strings and add them to the variant
         vector<bool> use_trav(travs.size());
@@ -940,15 +918,87 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
         // Sort the traversals for clustering
         vector<int> sorted_travs = get_traversal_order(graph, travs, trav_path_names, ref_travs, ref_trav_idx, use_trav);
 
-        // jaccard clustering (using handles for now) on traversals
+        // similarity clustering (over interior handles) on traversals
         vector<pair<double, int64_t>> trav_cluster_info;
-        vector<int> child_snarl_to_trav;
-        vector<vector<int>> trav_clusters = cluster_traversals(graph, travs, sorted_travs,
-                                                               (in_nesting_info ? in_nesting_info->child_snarls :
-                                                                vector<pair<handle_t, handle_t>>()),
-                                                               cluster_threshold,
-                                                               trav_cluster_info,
-                                                               child_snarl_to_trav);
+        vector<int> unused_child_snarl_mapping;
+        vector<vector<int>> trav_clusters;
+
+        // If a minimum-allele-length gate is set, skip clustering at sites whose CORE LENGTH -- the
+        // longest allele once the prefix and suffix common to every allele are stripped -- is below
+        // the threshold.  This lets the clustering be SV-only (50bp matches the standard SV size
+        // cutoff) while leaving small variants represented exactly as they are.  Measuring the raw
+        // snarl interior instead would gate a 1bp SNP on the size of the snarl that happens to
+        // contain it, and would disagree with vg call, whose records are flattened.  See
+        // VCFOutputCaller::allele_core_length.
+        bool do_clustering = true;
+        if (cluster_min_allele_len > 0 && cluster_threshold < 1.0) {
+            // The traversals that become alleles: everything get_traversal_order kept, plus the
+            // reference, which get_alleles() spells as allele 0 whether or not use_trav has it.
+            // Not every use_trav member -- get_traversal_order drops used traversals that are OTHER
+            // reference traversals, and those never become alleles.  No star can be here:
+            // add_star_traversals runs further down.
+            auto for_each_measured = [&](const function<bool(const Traversal&)>& fn) {
+                if (!fn(travs[ref_trav_idx])) {
+                    return;
+                }
+                for (int idx : sorted_travs) {
+                    if (idx != ref_trav_idx && !fn(travs[idx])) {
+                        return;
+                    }
+                }
+            };
+            // Conservative pre-filter: core length can never exceed the longest interior, so if no
+            // measured traversal reaches the threshold we are done without building a single
+            // string.  Sites that fail it therefore cost no more than before.  Sites that pass do
+            // cost more -- one interior string per traversal here, against one per cluster in
+            // get_alleles -- so 2x when nothing collapses, and more when many haplotypes share a
+            // cluster.
+            bool interior_reaches = false;
+            for_each_measured([&](const Traversal& t) {
+                int64_t len = 0;
+                for (size_t k = 1; k + 1 < t.size() && !interior_reaches; ++k) {
+                    len += graph->get_length(t[k]);
+                    interior_reaches = len >= cluster_min_allele_len;
+                }
+                return !interior_reaches;
+            });
+            do_clustering = false;
+            if (interior_reaches) {
+                // The allele strings do not exist yet -- get_alleles() runs after clustering -- so
+                // rebuild the set this record would emit if we did NOT cluster, which is exactly
+                // what the gate is asking about.  This is exact rather than approximate: the only
+                // transforms get_alleles applies afterwards are reverse-complementing every allele
+                // and prepending a common anchor base, and core length is invariant to both.
+                vector<string> unclustered_alleles;
+                unclustered_alleles.reserve(sorted_travs.size() + 1);
+                for_each_measured([&](const Traversal& t) {
+                    string allele;
+                    for (size_t k = 1; k + 1 < t.size(); ++k) {
+                        allele += toUppercase(graph->get_sequence(t[k]));
+                    }
+                    unclustered_alleles.push_back(std::move(allele));
+                    return true;
+                });
+                do_clustering = allele_core_length(unclustered_alleles) >= cluster_min_allele_len;
+            }
+        }
+
+        if (do_clustering) {
+            trav_clusters = cluster_traversals(graph, travs, sorted_travs,
+                                               vector<pair<handle_t, handle_t>>(),
+                                               cluster_threshold,
+                                               trav_cluster_info,
+                                               unused_child_snarl_mapping,
+                                               &travs[ref_trav_idx]);
+        } else {
+            // Trivial clusters (one per used traversal) in sorted_travs order.
+            // Mirrors what cluster_traversals would return when nothing collapses.
+            trav_cluster_info.assign(travs.size(), make_pair(-1.0, (int64_t)0));
+            for (int idx : sorted_travs) {
+                trav_clusters.push_back({idx});
+                trav_cluster_info[idx] = make_pair(1.0, (int64_t)0);
+            }
+        }
 
 #ifdef debug
         cerr << "cluster priority";
@@ -965,8 +1015,12 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
         }
 #endif
 
-        unordered_map<string, vector<int>> sample_to_haps;                     
-        if (in_nesting_info != nullptr) {
+        // Track sample haplotypes for passing to children (used by star alleles)
+        unordered_map<string, vector<int>> sample_to_haps;
+
+        // Only run nested-specific logic when we have context from parent
+        // (i.e., when using top-down processing, not flat processing)
+        if (in_context != nullptr) {
             // if the reference traversal is also an alt traversal, we pop out an extra copy
             // todo: this is a hack add add off-reference support while keeping the current
             // logic where the reference traversal is always distinct from the alts. this step
@@ -991,14 +1045,13 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
                 }
                 assert(found_cluster == true);
             }
-            
+
             // add in the star alleles -- these are alleles that were genotyped in the parent but not
             // the current allele, and are treated as *'s in VCF.
-            if (this->star_allele) {
+            if (this->star_allele && in_context != nullptr && !in_context->empty()) {
                 sample_to_haps = add_star_traversals(travs, trav_path_names, trav_clusters, trav_cluster_info,
-                                                     in_nesting_info->sample_to_haplotypes);
+                                                     *in_context->sample_to_haplotypes);
             }
-            
         }
 
         vector<int> trav_to_allele = get_alleles(v, travs, trav_steps,
@@ -1006,7 +1059,7 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
                                                  trav_clusters,
                                                  prev_char, use_start);
 
-      
+
 #ifdef debug
         assert(trav_to_allele.size() == travs.size());
         cerr << "trav_to_allele =";
@@ -1014,74 +1067,45 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
             cerr << " " << tta;
         }
         cerr << endl;
-#endif           
+#endif
 
         // Fill in the genotypes
         get_genotypes(v, trav_path_names, trav_to_allele, trav_cluster_info);
 
-        // Fill in some nesting-specific (site-level) tags
-        NestingInfo ref_info; // since in_nesting_info is const, we put top-level stuff here       
-        if (this->nested_decomposition) {
-            if (in_nesting_info != nullptr && in_nesting_info->has_ref == true) {
-                // if we're a child, just take what's passed in
-                ref_info.parent_allele = in_nesting_info->parent_allele;
-                ref_info.parent_len = in_nesting_info->parent_len;
-                ref_info.parent_ref_len = in_nesting_info->parent_ref_len;
-                ref_info.lv0_ref_name = in_nesting_info->lv0_ref_name;
-                ref_info.lv0_ref_start = in_nesting_info->lv0_ref_start;
-                ref_info.lv0_ref_len = in_nesting_info->lv0_ref_len;
-                ref_info.lv0_alt_len = in_nesting_info->lv0_alt_len;
-            } else {
-                // if we're a root, compute values from the prsent site
-                // todo: should they just be left undefined?
-                ref_info.parent_allele = 0;
-                ref_info.parent_len = v.alleles[0].length();
-                ref_info.parent_ref_len = v.alleles[0].length();
-                ref_info.lv0_ref_name = v.sequenceName;
-                ref_info.lv0_ref_start = v.position;
-                ref_info.lv0_ref_len = v.alleles[0].length();
-                ref_info.lv0_alt_len = v.alleles[ref_info.parent_allele].length();
-            }            
-            v.info["PA"].push_back(std::to_string(ref_info.parent_allele));
-            v.info["PL"].push_back(std::to_string(ref_info.parent_len));
-            v.info["PR"].push_back(std::to_string(ref_info.parent_ref_len));            
-            v.info["RC"].push_back(ref_info.lv0_ref_name);
-            v.info["RS"].push_back(std::to_string(ref_info.lv0_ref_start));
-            v.info["RD"].push_back(std::to_string(ref_info.lv0_ref_len));
-            v.info["RL"].push_back(std::to_string(ref_info.lv0_alt_len));
-        }
+        // Note: LV and PS tags are computed by update_nesting_info_tags() in write_variants()
+        // when include_nested is true (same as vg call)
 
-        if (i == 0 && out_nesting_infos != nullptr) {
-            // we pass some information down to the children
-            // todo: do/can we consider all the diferent reference intervals?
-            //       right now, the info passed is hopefully coarse-grained enough not to matter?
-            assert(in_nesting_info != nullptr &&
-                   in_nesting_info->child_snarls.size() == out_nesting_infos->size());
-
-            for (int64_t j = 0; j < out_nesting_infos->size(); ++j) {
-                out_nesting_infos->at(j).child_snarls.clear();
-                out_nesting_infos->at(j).has_ref = false;
-                if (child_snarl_to_trav[j] >= 0) {
-                    if (child_snarl_to_trav[j] < trav_steps.size()) {
-                        NestingInfo& child_info = out_nesting_infos->at(j);
-                        child_info.has_ref = true;
-                        child_info.parent_path_interval = trav_steps[child_snarl_to_trav[j]];
-                        child_info.sample_to_haplotypes = sample_to_haps;
-                        child_info.parent_allele = trav_to_allele[child_snarl_to_trav[j]] >= 0 ?
-                            trav_to_allele[child_snarl_to_trav[j]] : 0;
-                        child_info.parent_len = v.alleles[child_info.parent_allele].length();
-                        child_info.parent_ref_len = v.alleles[0].length();
-                        child_info.lv0_ref_name = ref_info.lv0_ref_name;
-                        child_info.lv0_ref_start = ref_info.lv0_ref_start;
-                        child_info.lv0_ref_len = ref_info.lv0_ref_len;
-                        if (in_nesting_info == nullptr || in_nesting_info->has_ref == false) {
-                            // we're the parent of root, so we want to set this here
-                            child_info.lv0_alt_len = child_info.parent_len;
-                        } else {
-                            child_info.lv0_alt_len = ref_info.lv0_alt_len;
-                        }
+        // Only populate child contexts when:
+        // 1. Star alleles are enabled (context only needed for star allele detection)
+        // 2. We have a place to put them (out_child_contexts != nullptr)
+        // 3. This is the first reference traversal (i == 0 to avoid duplicate work)
+        // 4. There's exactly one reference traversal (no cycles) - for cyclic references,
+        //    we don't pass context to children and let them process independently
+        if (this->star_allele && i == 0 && out_child_contexts != nullptr && ref_travs.size() == 1) {
+            // Build sample_to_haps from ALL current traversals (for star alleles)
+            // This includes ALL haplotypes at the parent level, which is needed for
+            // add_star_traversals to detect missing haplotypes at nested sites
+            if (sample_to_haps.empty()) {
+                for (int64_t ti = 0; ti < trav_path_names.size(); ++ti) {
+                    string sample_name = PathMetadata::parse_sample_name(trav_path_names[ti]);
+                    if (sample_name.empty()) {
+                        sample_name = trav_path_names[ti];
                     }
+                    auto phase = PathMetadata::parse_haplotype(trav_path_names[ti]);
+                    if (!sample_name.empty() && phase == PathMetadata::NO_HAPLOTYPE) {
+                        phase = 0;
+                    }
+                    sample_to_haps[sample_name].push_back(phase);
                 }
+            }
+
+            // Create a shared_ptr to the map so all children share the same data
+            // (avoids copying the map for each child, major memory optimization)
+            auto shared_haps = std::make_shared<const unordered_map<string, vector<int>>>(std::move(sample_to_haps));
+
+            // Pass the shared map to ALL children
+            for (int64_t j = 0; j < out_child_contexts->size(); ++j) {
+                out_child_contexts->at(j).sample_to_haplotypes = shared_haps;
             }
         }
 
@@ -1096,11 +1120,33 @@ bool Deconstructor::deconstruct_site(const handle_t& snarl_start, const handle_t
                 cerr << "Warning [vg deconstruct]: Skipping variant at " << v.sequenceName << ":" << v.position
                      << " with ID=" << v.id << " because its line length of " << ss.str().length() << " exceeds vg's limit of "
                      << VCFOutputCaller::max_vcf_line_length << endl;
-                return false;            
+                return false;
             }
+        } else if (include_nested) {
+            // No variant here, but a nested record may still need this site's reference interval
+            // for its RC/RS/RD: we are the only thing standing between it and the reference, and
+            // once we return there is nothing left that knows where this snarl sits.  Keeping the
+            // whole record would be far too expensive, so keep just the interval.
+            suppressed_ref_info[omp_get_thread_num()][v.id] =
+                {v.sequenceName, static_cast<size_t>(v.position), v.ref.length()};
         }
     }
     return true;
+}
+
+bool Deconstructor::is_other_reference_view(const string& path_name) const {
+    // A gref cover writes the reference twice: once under its own name and once in the
+    // gref_ namespace, plus the gref fragments.  Whichever of the two we were asked to
+    // deconstruct against, the other one is not a sample -- it's the same sequence.
+    // The naming convention makes both directions a lookup:
+    if (GrefCover::is_gref_derived(path_name)) {
+        // A gref path, and we're deconstructing against the base reference.
+        return true;
+    }
+    // A base path whose gref copy is one of our references, so we're deconstructing
+    // against the gref reference.  Other assemblies don't have a gref copy and so stay
+    // samples.
+    return this->ref_paths.count(GrefCover::make_gref_copy_name(path_name)) > 0;
 }
 
 string Deconstructor::get_vcf_header() {
@@ -1112,17 +1158,82 @@ string Deconstructor::get_vcf_header() {
         ref_haplotypes.insert(PathMetadata::parse_haplotype(ref_path_name));
     }
     if (!long_ref_contig) {
-        long_ref_contig = ref_samples.size() > 1 || ref_haplotypes.size() > 1 || nested_decomposition;
+        long_ref_contig = ref_samples.size() > 1 || ref_haplotypes.size() > 1;
     }
-    this->long_ref_contig = long_ref_contig;
+    // Samples that only exist in this graph as the other view of a reference we were
+    // asked to deconstruct against.  is_other_reference_view() catches those paths one by
+    // one, but a sample also survives through its *other* contigs when only one contig's
+    // reference is selected, and then it contributes an all-reference column.
+    // Ask the question in the direction that survives round-tripping.  Going the other
+    // way -- from a selected gref reference back to its base path by dropping the prefix
+    // -- does not work: make_gref_copy_name() drops the phase block (a reference-sense
+    // name cannot carry one), so gref_GRCh38#0#chr1 does not name GRCh38#0#chr1#0, which
+    // is what a GFA without an RS header gives you.
+    other_ref_samples.clear();
+    auto note_other_reference_view = [&](const string& path_name, const string& sample_name) {
+        if (!ref_paths.count(path_name) && sample_name != PathMetadata::NO_SAMPLE_NAME &&
+            is_other_reference_view(path_name)) {
+            other_ref_samples.insert(sample_name);
+        }
+    };
+    graph->for_each_path_handle([&](const path_handle_t& path_handle) {
+        note_other_reference_view(graph->get_path_name(path_handle),
+                                  graph->get_sample_name(path_handle));
+    });
+    if (gbwt) {
+        // The haplotypes are only visible through the GBWT here -- the overlay does not
+        // enumerate them -- and the base reference is one of them whenever it is
+        // haplotype sense, so this scan is the only thing that can spot it.
+        for (size_t i = 0; i < gbwt->metadata.paths(); i++) {
+            PathSense sense = gbwtgraph::get_path_sense(*gbwt, i, gbwt_reference_samples);
+            note_other_reference_view(PathMetadata::create_path_name(
+                                          sense,
+                                          gbwtgraph::get_path_sample_name(*gbwt, i, sense),
+                                          gbwtgraph::get_path_locus_name(*gbwt, i, sense),
+                                          gbwtgraph::get_path_haplotype(*gbwt, i, sense),
+                                          gbwtgraph::get_path_phase_block(*gbwt, i, sense),
+                                          gbwtgraph::get_path_subrange(*gbwt, i, sense)),
+                                      gbwtgraph::get_path_sample_name(*gbwt, i, sense));
+        }
+    }
+
     sample_names.clear();
     unordered_map<string, set<int>> sample_to_haps;
 
-    // find sample names from non-reference paths
-    graph->for_each_path_handle([&](const path_handle_t& path_handle) {
+    // We always want generic and reference paths, since we do our own designated deconstruction reference dropping.
+    std::unordered_set<PathSense> wanted_senses{PathSense::GENERIC, PathSense::REFERENCE};
+
+    // If we're using a GBWT, we don't want to include any haplotypes in the
+    // input graph, because we want the haplotypes from the GBWT instead (even
+    // if the haplotypes in ther input graph are actually backed by the
+    // provided GBWT). If we aren't, we want the haplotypes from the input
+    // graph included.
+    if (!gbwt) {
+        wanted_senses.insert(PathSense::HAPLOTYPE);
+    }
+
+    // TODO: Should we unify around using haplotype-sense paths and not the
+    // GBWT API?
+
+    // find sample names from paths
+    graph->for_each_path_of_sense(wanted_senses, [&](const path_handle_t& path_handle) {
         string path_name = graph->get_path_name(path_handle);
         if (!this->ref_paths.count(path_name)) {
+            // This isn't a designated decosntruction reference path.
+            // Note that we allow alt paths through here.
+
+            if (is_other_reference_view(path_name)) {
+                // It's the same reference we're deconstructing against, seen through the
+                // other of the base/gref pair.  It would genotype as all-reference and
+                // inflate AC/AF/AN/NS, so it isn't a sample.
+                return;
+            }
+
             string sample_name = graph->get_sample_name(path_handle);
+            if (other_ref_samples.count(sample_name)) {
+                // Another contig of a sample that is the other view of our reference.
+                return;
+            }
             // for backward compatibility
             if (sample_name == PathMetadata::NO_SAMPLE_NAME) {
                 sample_name = path_name;
@@ -1131,6 +1242,10 @@ string Deconstructor::get_vcf_header() {
                 size_t haplotype = graph->get_haplotype(path_handle);
                 if (haplotype == PathMetadata::NO_HAPLOTYPE) {
                     haplotype = 0;
+                }
+                if (haplotype > 10) {
+                    cerr << "Warning [vg deconstruct]: Suspiciously large haplotype, " << haplotype
+                         << ", parsed from path, " << path_name << ": This will leed to giant GT entries.";
                 }
                 sample_to_haps[sample_name].insert((int)haplotype);
                 sample_names.insert(sample_name);
@@ -1151,13 +1266,17 @@ string Deconstructor::get_vcf_header() {
                     gbwtgraph::get_path_haplotype(*gbwt, i, sense),
                     gbwtgraph::get_path_phase_block(*gbwt, i, sense),
                     gbwtgraph::get_path_subrange(*gbwt, i, sense));
-                if (!this->ref_paths.count(path_name)) {
+                if (!this->ref_paths.count(path_name) && !is_other_reference_view(path_name)) {
                     string sample_name = gbwtgraph::get_path_sample_name(*gbwt, i, sense);
-                    if (!ref_samples.count(sample_name)) {
+                    if (!ref_samples.count(sample_name) && !other_ref_samples.count(sample_name)) {
                         auto phase = gbwtgraph::get_path_haplotype(*gbwt, i, sense);
                         if (phase == PathMetadata::NO_HAPLOTYPE) {
                             // Default to 0.
                             phase = 0;
+                        }
+                        if (phase > 10) {
+                            cerr << "Warning [vg deconstruct]: Suspiciously large haplotype, " << phase
+                                 << ", parsed from GBWT thread, " << path_name << ": This will leed to giant GT entries.";
                         }
                         sample_to_haps[sample_name].insert((int)phase);
                         sample_names.insert(sample_name);
@@ -1168,9 +1287,10 @@ string Deconstructor::get_vcf_header() {
     }
 
     if (sample_to_haps.empty()) {
-        cerr << "Error [vg deconstruct]: No paths found for alt alleles in the graph. Note that "
-             << "exhaustive path-free traversal finding is no longer supported, and vg deconstruct "
-             << "now only works on embedded paths and GBWT threads." << endl;
+        cerr << "Error [vg deconstruct]: No paths other than selected reference(s) found in the graph, "
+             << "so no alt alleles can be generated. Note that exhaustive path-free traversal finding "
+             << "is no longer supported, and vg deconstruct now only works on embedded paths and GBWT "
+             << "threads." << endl;
         exit(1);
     }
 
@@ -1186,17 +1306,17 @@ string Deconstructor::get_vcf_header() {
     stringstream stream;
     stream << "##fileformat=VCFv4.2" << endl;
     stream << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">" << endl;
-    if (show_path_info && path_to_sample_phase) {
+    if (show_path_info && !gbwt_sample_to_phase_range.empty()) {
         stream << "##FORMAT=<ID=PI,Number=.,Type=String,Description=\"Path information. Original vg path name for sample as well as its allele (can be many paths per sample)\">" << endl;
     }
-    if (path_to_sample_phase || gbwt) {
+    if (!gbwt_sample_to_phase_range.empty() || gbwt) {
         stream << "##INFO=<ID=CONFLICT,Number=.,Type=String,Description=\"Sample names for which there are multiple paths in the graph with conflicting alleles";
         if (!gbwt && show_path_info) {
             stream << " (details in PI field)";
         }
         stream << "\">" << endl;
     }
-    if (path_to_sample_phase && cluster_threshold < 1) {
+    if (!gbwt_sample_to_phase_range.empty() && cluster_threshold < 1) {
         stream << "##FORMAT=<ID=TS,Number=1,Type=Float,Description=\"Similarity between the sample's actual path and its allele\">"
                << endl;
         stream << "##FORMAT=<ID=TL,Number=1,Type=Integer,Description=\"Length difference between the sample's actual path and its allele\">"
@@ -1208,17 +1328,7 @@ string Deconstructor::get_vcf_header() {
     stream << "##INFO=<ID=NS,Number=1,Type=Integer,Description=\"Number of samples with data\">" << endl;
     stream << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles in called genotypes\">" << endl;
     if (include_nested) {
-        stream << "##INFO=<ID=LV,Number=1,Type=Integer,Description=\"Level in the snarl tree (0=top level)\">" << endl;
-        stream << "##INFO=<ID=PS,Number=1,Type=String,Description=\"ID of variant corresponding to parent snarl\">" << endl;
-    }
-    if (this->nested_decomposition) {
-        stream << "##INFO=<ID=PA,Number=1,Type=Integer,Description=\"Allele number of the reference allele in Parent Snarl\">" << endl;
-        stream << "##INFO=<ID=PL,Number=1,Type=Integer,Description=\"Length of the reference allele in Parent Snarl\">" << endl;
-        stream << "##INFO=<ID=PR,Number=1,Type=Integer,Description=\"Length of 0th allele in the Parent Snarl\">" << endl;
-        stream << "##INFO=<ID=RC,Number=1,Type=String,Description=\"Reference chromosome name of top-level containing site\">" << endl;
-        stream << "##INFO=<ID=RS,Number=1,Type=Integer,Description=\"Reference start position of top-level containing site\">" << endl;
-        stream << "##INFO=<ID=RD,Number=1,Type=Integer,Description=\"Reference end position name of top-level containing site\">" << endl;
-        stream << "##INFO=<ID=RL,Number=1,Type=Integer,Description=\"Length of the top-level allele in which this site nests\">" << endl;
+        stream << nesting_info_headers();
     }
     if (untangle_allele_traversals) {
         stream << "##INFO=<ID=UT,Number=R,Type=String,Description=\"Untangled allele Traversal with reference node start and end positions, format: [>|<][id]_[start|.]_[end|.], with '.' indicating non-reference nodes.\">" << endl;
@@ -1244,14 +1354,7 @@ string Deconstructor::add_contigs_to_vcf_header(const string& vcf_header) const 
     }
 
     set<string> all_ref_paths = this->ref_paths;
-    
-    // add in the off-ref paths that nested deconstruction may have found
-    for (const unordered_set<path_handle_t>& off_ref_path_set : this->off_ref_paths) {
-        for (const path_handle_t& off_ref_path : off_ref_path_set) {
-            all_ref_paths.insert(graph->get_path_name(off_ref_path));
-        }
-    }
-    
+
     map<string, int64_t> ref_path_to_length;
     for(auto& refpath : all_ref_paths) {
         assert(graph->has_path(refpath));
@@ -1291,11 +1394,13 @@ string Deconstructor::add_contigs_to_vcf_header(const string& vcf_header) const 
 }
 
 void Deconstructor::deconstruct_graph(SnarlManager* snarl_manager) {
+    // Simple flat processing of all snarls without context passing.
+    // More memory-efficient than top-down approach when star alleles aren't needed.
 
     vector<const Snarl*> snarls;
     vector<const Snarl*> queue;
 
-    // read all our snarls into a list
+    // Read all snarls into a list
     snarl_manager->for_each_top_level_snarl([&](const Snarl* snarl) {
         queue.push_back(snarl);
     });
@@ -1311,8 +1416,8 @@ void Deconstructor::deconstruct_graph(SnarlManager* snarl_manager) {
         swap(snarls, queue);
     }
 
-    // process the whole shebang in parallel
-#pragma omp parallel for schedule(dynamic,1)
+    // Process all snarls in parallel (no context passing)
+#pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < snarls.size(); i++) {
         deconstruct_site(graph->get_handle(snarls[i]->start().node_id(), snarls[i]->start().backward()),
                          graph->get_handle(snarls[i]->end().node_id(), snarls[i]->end().backward()));
@@ -1321,45 +1426,34 @@ void Deconstructor::deconstruct_graph(SnarlManager* snarl_manager) {
 
 void Deconstructor::deconstruct_graph_top_down(SnarlManager* snarl_manager) {
     // logic copied from vg call (graph_caller.cpp)
-    
-    size_t thread_count = get_thread_count();
-    this->off_ref_paths.clear();
-    this->off_ref_paths.resize(get_thread_count());
-    // Used to recurse on children of parents that can't be called
-    vector<vector<pair<const Snarl*, NestingInfo>>> snarl_queue(thread_count);
 
-    // Run the deconstructor on a snarl, and queue up the children if it fails
-    auto process_snarl = [&](const Snarl* snarl, NestingInfo nesting_info) {
+    size_t thread_count = get_thread_count();
+    // Used to recurse on children of parents that can't be called
+    vector<vector<pair<const Snarl*, ChildContext>>> snarl_queue(thread_count);
+
+    // Run the deconstructor on a snarl, and queue up the children
+    auto process_snarl = [&](const Snarl* snarl, ChildContext context) {
         if (!snarl_manager->is_trivial(snarl, *graph)) {
             const vector<const Snarl*>& children = snarl_manager->children_of(snarl);
-            assert(nesting_info.child_snarls.empty());
-            for (const Snarl* child : children) {
-                nesting_info.child_snarls.push_back(make_pair(graph->get_handle(child->start().node_id(), child->start().backward()),
-                                                              graph->get_handle(child->end().node_id(), child->end().backward())));
-                                                    
-            }
-            vector<NestingInfo> out_nesting_infos(children.size());
-            bool was_deconstructed = deconstruct_site(graph->get_handle(snarl->start().node_id(), snarl->start().backward()),
-                                                      graph->get_handle(snarl->end().node_id(), snarl->end().backward()),
-                                                      include_nested ? &nesting_info : nullptr,
-                                                      include_nested ? &out_nesting_infos : nullptr);
-            if (include_nested || !was_deconstructed) {
-                vector<pair<const Snarl*, NestingInfo>>& thread_queue = snarl_queue[omp_get_thread_num()];
+            vector<ChildContext> out_child_contexts(children.size());
+            deconstruct_site(graph->get_handle(snarl->start().node_id(), snarl->start().backward()),
+                             graph->get_handle(snarl->end().node_id(), snarl->end().backward()),
+                             include_nested ? &context : nullptr,
+                             include_nested ? &out_child_contexts : nullptr);
+            if (include_nested) {
+                vector<pair<const Snarl*, ChildContext>>& thread_queue = snarl_queue[omp_get_thread_num()];
                 for (int64_t i = 0; i < children.size(); ++i) {
-                    thread_queue.push_back(make_pair(children[i], out_nesting_infos[i]));
+                    thread_queue.push_back(make_pair(children[i], out_child_contexts[i]));
                 }
-
-            }            
+            }
         }
     };
 
-    // Start with the top level snarls
-    // (note, can't do for_each_top_level_snarl_parallel() because interface wont take nesting info)
-    vector<pair<const Snarl*, NestingInfo>> top_level_snarls;
+    // Start with the top level snarls (no parent context)
+    vector<pair<const Snarl*, ChildContext>> top_level_snarls;
     snarl_manager->for_each_top_level_snarl([&](const Snarl* snarl) {
-        NestingInfo nesting_info;
-        nesting_info.has_ref = false;
-        top_level_snarls.push_back(make_pair(snarl, nesting_info));
+        ChildContext empty_context;
+        top_level_snarls.push_back(make_pair(snarl, empty_context));
     });
 #pragma omp parallel for schedule(dynamic, 1)
     for (int i = 0; i < top_level_snarls.size(); ++i) {
@@ -1368,9 +1462,9 @@ void Deconstructor::deconstruct_graph_top_down(SnarlManager* snarl_manager) {
 
     // Then recurse on any children the snarl caller failed to handle
     while (!std::all_of(snarl_queue.begin(), snarl_queue.end(),
-                        [](const vector<pair<const Snarl*, NestingInfo>>& snarl_vec) {return snarl_vec.empty();})) {
-        vector<pair<const Snarl*, NestingInfo>> cur_queue;
-        for (vector<pair<const Snarl*, NestingInfo>>& thread_queue : snarl_queue) {
+                        [](const vector<pair<const Snarl*, ChildContext>>& snarl_vec) {return snarl_vec.empty();})) {
+        vector<pair<const Snarl*, ChildContext>> cur_queue;
+        for (vector<pair<const Snarl*, ChildContext>>& thread_queue : snarl_queue) {
             cur_queue.reserve(cur_queue.size() + thread_queue.size());
             std::move(thread_queue.begin(), thread_queue.end(), std::back_inserter(cur_queue));
             thread_queue.clear();
@@ -1393,13 +1487,13 @@ void Deconstructor::deconstruct(vector<string> ref_paths, const PathPositionHand
                                 bool strict_conflicts,
                                 bool long_ref_contig,
                                 double cluster_threshold,
+                                int64_t cluster_min_allele_len,
                                 gbwt::GBWT* gbwt,
-                                bool nested_decomposition,
                                 bool star_allele) {
 
     this->graph = graph;
     this->ref_paths = set<string>(ref_paths.begin(), ref_paths.end());
-    this->include_nested = include_nested || nested_decomposition;
+    this->include_nested = include_nested;
     this->path_jaccard_window = context_jaccard_window;
     this->untangle_allele_traversals = untangle_traversals;
     this->keep_conflicted_genotypes = keep_conflicted;
@@ -1409,19 +1503,19 @@ void Deconstructor::deconstruct(vector<string> ref_paths, const PathPositionHand
         this->gbwt_reference_samples = gbwtgraph::parse_reference_samples_tag(*gbwt);
     }
     this->cluster_threshold = cluster_threshold;
+    this->cluster_min_allele_len = cluster_min_allele_len;
     this->gbwt = gbwt;
-    this->nested_decomposition = nested_decomposition;
     this->star_allele = star_allele;
 
     // the need to use nesting is due to a problem with omp tasks and shared state
     // which results in extremely high memory costs (ex. ~10x RAM for 2 threads vs. 1)
     omp_set_nested(1);
     omp_set_max_active_levels(3);
-    
+
     // create the traversal finder
     map<string, const Alignment*> reads_by_name;
     path_trav_finder = unique_ptr<PathTraversalFinder>(new PathTraversalFinder(*graph));
-        
+
     if (gbwt != nullptr) {
         gbwt_trav_finder = unique_ptr<GBWTTraversalFinder>(new GBWTTraversalFinder(*graph, *gbwt));
     }
@@ -1429,19 +1523,25 @@ void Deconstructor::deconstruct(vector<string> ref_paths, const PathPositionHand
     string hstr = this->get_vcf_header();
     assert(output_vcf.openForOutput(hstr));
 
-    if (nested_decomposition) {
+    // Use top-down processing only when star alleles are needed (requires context passing).
+    // Otherwise use simpler flat processing which is more memory-efficient.
+    if (star_allele) {
+        cerr << "[vg deconstruct] Using top-down processing (star alleles enabled)" << endl;
         deconstruct_graph_top_down(snarl_manager);
     } else {
+        cerr << "[vg deconstruct] Using flat processing" << endl;
         deconstruct_graph(snarl_manager);
     }
 
+    // Prune after add_contigs_to_vcf_header, which is what emits the ##contig lines, and
+    // before write_variants, which drains the buffer get_output_contigs() reads.
     string patched_header = this->add_contigs_to_vcf_header(output_vcf.header);
+    patched_header = this->prune_header_contigs(patched_header, this->get_output_contigs());
     cout << patched_header << endl;
 
     // write variants in sorted order
     write_variants(cout, snarl_manager);
 }
-
 
 }
 

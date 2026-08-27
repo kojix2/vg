@@ -27,19 +27,24 @@ using namespace vg::subcommand;
 void help_combine(char** argv) {
     cerr << "usage: " << argv[0] << " combine [options] <graph1.vg> [graph2.vg ...] >merged.vg" << endl
          << "Combines one or more graphs into a single file, regardless of input format." << endl
-         << "Node IDs will be modified as needed to resolve conflicts (in same manner as vg ids -j)." << endl
+         << "Node IDs will be modified as needed to resolve conflicts (same as vg ids -j)." << endl
          << endl
          << "Options:" << endl
-         << "    -c, --cat-proto       Merge graphs by converting each to Protobuf (if not already) and catting the results."
-         << "                          Node IDs not modified [DEPRECATED]" << endl
-         << "    -p, --connect-paths   Add edges necessary to connect paths with the same name present in different graphs." << endl
-         << "                          ex: If path x is present in graphs N-1 and N, then an edge connecting the last node of x in N-1 " << endl
-         << "                          and the first node of x in N will be added." << endl;
+         << "  -c, --cat-proto       merge by converting each to Protobuf (if not already)" << endl
+         << "                        and catting the results." << endl
+         << "                        node IDs not modified [DEPRECATED]" << endl
+         << "  -p, --connect-paths   add edges necessary to connect paths with the same name" << endl
+         << "                        which are present in different graphs." << endl
+         << "                        ex: If path x is present in graphs N-1 and N, then" << endl
+         << "                        an edge connecting the last node of x in N-1 " << endl
+         << "                        and the first node of x in N will be added." << endl
+         << "  -h, --help            print this help message to stderr and exit" << endl;
 }
 
-static int cat_proto_graphs(int argc, char** argv);
+static int cat_proto_graphs(int argc, char** argv, const Logger& logger);
 
 int main_combine(int argc, char** argv) {
+    Logger logger("vg combine");
 
     if (argc == 2) {
         help_combine(argv);
@@ -61,8 +66,8 @@ int main_combine(int argc, char** argv) {
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hpc",
-                long_options, &option_index);
+        c = getopt_long (argc, argv, "h?pc",
+                         long_options, &option_index);
 
         // Detect the end of the options.
         if (c == -1)
@@ -89,8 +94,9 @@ int main_combine(int argc, char** argv) {
 
     if (cat_proto) {
         if (connect_paths) 
-        cerr << "warning [vg combine]: --cat-proto/-c option is deprecated and will be removed in a future version of vg." << endl;
-        return cat_proto_graphs(argc, argv);
+        logger.warn() << "--cat-proto/-c option is deprecated "
+                      << "and will be removed in a future version of vg." << endl;
+        return cat_proto_graphs(argc, argv, logger);
     }
     
     unique_ptr<MutablePathMutableHandleGraph> first_graph;
@@ -117,8 +123,9 @@ int main_combine(int argc, char** argv) {
             graph->for_each_path_handle([&](path_handle_t path_handle) {
                     string path_name = graph->get_path_name(path_handle);
                     if (first_graph->has_path(path_name)) {
-                        cerr << "error [vg combine]: Paths with name \"" << path_name << "\" found in multiple input graphs. If they are consecutive subpath ranges, they can be connected by using the -p option." << endl;
-                        exit(1);
+                        logger.error() << "Paths with name \"" << path_name 
+                                       << "\" found in multiple input graphs. If they are consecutive"
+                                       << "subpath ranges, they can be connected by using the -p option." << endl;
                     }
                 });
             handlealgs::copy_path_handle_graph(graph.get(), first_graph.get());
@@ -139,7 +146,7 @@ static Subcommand vg_combine("combine", "merge multiple graph files together", m
 // Since it relies on the Protobuf format itself, particular the ability to stream together chunks that
 // would otherwise be invalid individually, it is probably never going to be ported to the handle graph
 // api, which is why it's been relegated to the deprecated bin
-int cat_proto_graphs(int argc, char** argv) {
+int cat_proto_graphs(int argc, char** argv, const Logger& logger) {
     
     while (optind < argc) {
         get_input_file(optind, argc, argv, [&](istream& in) {
@@ -168,8 +175,7 @@ int cat_proto_graphs(int argc, char** argv) {
                         }
                         
                         if (!cout) {
-                            cerr << "error [vg combine]: Could not write decompressed data to output stream." << endl;
-                            exit(1);
+                            logger.error() << "Could not write decompressed data to output stream." << endl;
                         }
                         
                         // Do the next input file
@@ -190,8 +196,7 @@ int cat_proto_graphs(int argc, char** argv) {
                 cout << in.rdbuf();
                 
                 if (!cout) {
-                    cerr << "error [vg combine]: Could not write raw data to output stream." << endl;
-                    exit(1);
+                    logger.error() << "Could not write raw data to output stream." << endl;
                 }
                 
                 // Do the next input file
@@ -221,8 +226,7 @@ int cat_proto_graphs(int argc, char** argv) {
             }
             
             if (!cout) {
-                cerr << "error [vg combine]: Could not write converted graph to output stream." << endl;
-                exit(1);
+                logger.error() << "Could not write converted graph to output stream." << endl;
             }
             
         });

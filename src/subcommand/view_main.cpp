@@ -19,7 +19,7 @@
 #include "../gfa.hpp"
 #include "../io/json_stream_helper.hpp"
 #include "../handle.hpp"
-#include "../algorithms/gfa_to_handle.hpp"
+#include "../algorithms/gfaz_to_handle.hpp"
 
 #include <vg/io/message_iterator.hpp>
 #include <vg/io/vpkg.hpp>
@@ -32,72 +32,78 @@ using namespace vg::subcommand;
 using namespace vg::io;
 
 void help_view(char** argv) {
-    cerr << "usage: " << argv[0] << " view [options] [ <graph.vg> | <graph.json> | <aln.gam> | <read1.fq> [<read2.fq>] ]" << endl
+    cerr << "usage: " << argv[0] << " view [options] [ <graph> | <aln.gam> | <read1.fq> [<read2.fq>] ]" << endl
          << "options:" << endl
-         << "    -g, --gfa                  output GFA format (default)" << endl
-         << "    -F, --gfa-in               input GFA format, reducing overlaps if they occur" << endl
+         << "  -g, --gfa                 output GFA format (default)" << endl
+         << "  -F, --gfa-in              input GFA format, reducing overlaps if they occur" << endl
 
-         << "    -v, --vg                   output VG format [DEPRECATED, use vg convert instead]" << endl
-         << "    -V, --vg-in                input VG format only" << endl
+         << "  -v, --vg                  output VG format [DEPRECATED, use vg convert]" << endl
+         << "  -V, --vg-in               input VG format only" << endl
 
-         << "    -j, --json                 output JSON format" << endl
-         << "    -J, --json-in              input JSON format" << endl
-         << "    -c, --json-stream          streaming conversion of a VG format graph in line delimited JSON format" << endl
-         << "                               (this cannot be loaded directly via -J)" << endl
+         << "  -j, --json                output JSON format" << endl
+         << "  -J, --json-in             input JSON format (use with e.g. -a as necessary)" << endl
+         << "  -c, --json-stream         streaming conversion of a VG format graph" << endl
+         << "                            in line delimited JSON format" << endl
+         << "                            (this cannot be loaded directly via -J)" << endl
 
-         << "    -G, --gam                  output GAM format (vg alignment format: Graph Alignment/Map)" << endl
-         << "    -Z, --translation-in       input is a graph translation description" << endl
+         << "  -G, --gam                 output GAM format (vg alignment format)" << endl
+         << "  -Z, --translation-in      input is a graph translation description" << endl
 
-         << "    -t, --turtle               output RDF/turtle format (can not be loaded by VG)" << endl
-         << "    -T, --turtle-in            input turtle format." << endl
-         << "    -r, --rdf_base_uri         set base uri for the RDF output" << endl
+         << "  -t, --turtle              output RDF/turtle format (can not be loaded by VG)" << endl
+         << "  -T, --turtle-in           input turtle format." << endl
+         << "  -r, --rdf-base-uri URI    set base uri for the RDF output" << endl
 
-         << "    -a, --align-in             input GAM format" << endl
-         << "    -A, --aln-graph GAM        add alignments from GAM to the graph" << endl
+         << "  -a, --align-in            input GAM format, or JSON version of GAM format" << endl
+         << "  -A, --aln-graph GAM       add alignments from GAM to the graph" << endl
 
-         << "    -q, --locus-in             input stream is Locus format" << endl
-         << "    -z, --locus-out            output stream Locus format" << endl
-         << "    -Q, --loci FILE            input is Locus format for use by dot output" << endl
+         << "  -q, --locus-in            input is Locus format, or JSON version of it" << endl
+         << "  -z, --locus-out           output is Locus format" << endl
+         << "  -Q, --loci FILE           input is Locus format for use by dot output" << endl
 
-         << "    -d, --dot                  output dot format" << endl
-         << "    -S, --simple-dot           simplify the dot output; remove node labels, simplify alignments" << endl
-         << "    -u, --noseq-dot            shows size information instead of sequence in the dot output" << endl
-         << "    -e, --ascii-labels         use labels for paths or superbubbles with char/colors rather than emoji" << endl
-         << "    -Y, --ultra-label          label nodes with emoji/colors that correspond to ultrabubbles" << endl
-         << "    -m, --skip-missing         skip mappings to nodes not in the graph when drawing alignments" << endl
-         << "    -C, --color                color nodes that are not in the reference path (DOT OUTPUT ONLY)" << endl
-         << "    -p, --show-paths           show paths in dot output" << endl
-         << "    -w, --walk-paths           add labeled edges to represent paths in dot output" << endl
-         << "    -n, --annotate-paths       add labels to normal edges to represent paths in dot output" << endl
-         << "    -M, --show-mappings        with -p print the mappings in each path in JSON" << endl
-         << "    -I, --invert-ports         invert the edge ports in dot so that ne->nw is reversed" << endl
-         << "    -s, --random-seed N        use this seed when assigning path symbols in dot output" << endl
+         << "  -d, --dot                 output dot format" << endl
+         << "  -S, --simple-dot          simple alignments & no node labels in dot output" << endl
+         << "  -u, --noseq-dot           show size instead of sequence in dot output" << endl
+         << "  -e, --ascii-labels        label paths/superbubbles with char/colors vs. emoji" << endl
+         << "  -Y, --ultra-label         label nodes with emoji/colors for ultrabubbles" << endl
+         << "  -m, --skip-missing        skip mappings to nodes not in the graph" << endl
+         << "                            when drawing alignments" << endl
+         << "  -C, --color               color nodes not in reference path (DOT OUTPUT ONLY)" << endl
+         << "  -p, --show-paths          show paths in dot output" << endl
+         << "  -w, --walk-paths          add labeled edges to represent paths in dot output" << endl
+         << "  -n, --annotate-paths      add labels to edges to represent paths in dot output" << endl
+         << "  -M, --show-mappings       with -p, print the mappings in each path in JSON" << endl
+         << "  -I, --invert-ports        invert edge ports in dot so that ne->nw is reversed" << endl
+         << "  -s, --random-seed N       use this seed for path symbols in dot output" << endl
 
-         << "    -b, --bam                  input BAM or other htslib-parseable alignments" << endl
+         << "  -b, --bam                 input BAM or other htslib-parseable alignments" << endl
 
-         << "    -f, --fastq-in             input fastq (output defaults to GAM). Takes two " << endl
-         << "                               positional file arguments if paired" << endl
-         << "    -X, --fastq-out            output fastq (input defaults to GAM)" << endl
-         << "    -i, --interleaved          fastq is interleaved paired-ended" << endl
+         << "  -f, --fastq-in            input fastq (output defaults to GAM). Takes two" << endl
+         << "                            positional file arguments if paired" << endl
+         << "  -X, --fastq-out           output fastq (input defaults to GAM)" << endl
+         << "  -i, --interleaved         fastq is interleaved paired-ended" << endl
 
-         << "    -L, --pileup               output VG Pileup format" << endl
-         << "    -l, --pileup-in            input VG Pileup format" << endl
+         << "  -L, --pileup              output VG Pileup format" << endl
+         << "  -l, --pileup-in           input VG Pileup format, or JSON version of it" << endl
 
-         << "    -B, --distance-in          input distance index" << endl
-         << "    -R, --snarl-in             input VG Snarl format" << endl
-         << "    -E, --snarl-traversal-in   input VG SnarlTraversal format" << endl
-         << "    -K, --multipath-in         input VG MultipathAlignment format (GAMP)" << endl
-         << "    -k, --multipath            output VG MultipathAlignment format (GAMP)" << endl
-         << "    -D, --expect-duplicates    don't warn if encountering the same node or edge multiple times" << endl
-         << "    -x, --extract-tag TAG      extract and concatenate messages with the given tag" << endl
-         << "    --verbose                  explain the file being read with --extract-tag" << endl
-         << "    --threads N                for parallel operations use this many threads [1]" << endl;
+         << "  -B, --distance-in         input distance index" << endl
+         << "  -R, --snarl-in            input VG Snarl format" << endl
+         << "  -E, --snarl-traversal-in  input VG SnarlTraversal format" << endl
+         << "  -K, --multipath-in        input VG MultipathAlignment format (GAMP)," << endl
+         << "                            or JSON version of it" << endl
+         << "  -k, --multipath           output VG MultipathAlignment format (GAMP)" << endl
+         << "  -D, --expect-duplicates   don't warn about duplicate nodes or edges" << endl
+         << "  -x, --extract-tag TAG     extract and concatenate messages with the given tag" << endl
+         << "      --first               only extract first message with the requested tag" << endl
+         << "      --verbose             explain the file being read with --extract-tag" << endl
+         << "  -7, --threads N           for parallel operations use this many threads [1]" << endl
+         << "  -h, --help                print this help message to stderr and exit" << endl;
     
     // TODO: Can we regularize the option names for input and output types?
 
 }
 
 int main_view(int argc, char** argv) {
+    Logger logger("vg view");
 
     if (argc == 2) {
         help_view(argv);
@@ -141,11 +147,13 @@ int main_view(int argc, char** argv) {
     bool skip_missing_nodes = false;
     bool expect_duplicates = false;
     string extract_tag;
-    bool verbose;
+    bool first_tag = false;
+    bool verbose = false;
     bool ascii_labels = false;
     omp_set_num_threads(1); // default to 1 thread
     
-    #define OPT_VERBOSE 1000
+    constexpr int OPT_FIRST = 1000;
+    constexpr int OPT_VERBOSE = 1001;
 
     int c;
     optind = 2; // force optind past "view" argument
@@ -187,23 +195,25 @@ int main_view(int argc, char** argv) {
                 {"ultra-label", no_argument, 0, 'Y'},
                 {"skip-missing", no_argument, 0, 'm'},
                 {"locus-in", no_argument, 0, 'q'},
-                {"loci", no_argument, 0, 'Q'},
+                {"loci", required_argument, 0, 'Q'},
                 {"locus-out", no_argument, 0, 'z'},
                 {"distance-in", no_argument, 0, 'B'},
                 {"snarl-in", no_argument, 0, 'R'},
                 {"snarl-traversal-in", no_argument, 0, 'E'},
                 {"expect-duplicates", no_argument, 0, 'D'},
                 {"extract-tag", required_argument, 0, 'x'},
+                {"first", no_argument, 0, OPT_FIRST},
                 {"verbose", no_argument, 0, OPT_VERBOSE},
                 {"multipath", no_argument, 0, 'k'},
                 {"multipath-in", no_argument, 0, 'K'},
                 {"ascii-labels", no_argument, 0, 'e'},
                 {"threads", required_argument, 0, '7'},
+                {"help", no_argument, 0, 'h'},
                 {0, 0, 0, 0}
             };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "dgFjJhvVpaGbifA:s:wnlLIMcTtr:SuCZYmqQ:zXBREDx:kKe7:",
+        c = getopt_long (argc, argv, "dgFjJh?vVpaGbifA:s:wnlLIMcTtr:SuCZYmqQ:zXBREDx:kKe7:",
                          long_options, &option_index);
 
         /* Detect the end of the options. */
@@ -350,7 +360,7 @@ int main_view(int argc, char** argv) {
             break;
 
         case 'A':
-            alignments = optarg;
+            alignments = require_exists(logger, optarg);
             break;
 
         case 'I':
@@ -382,7 +392,7 @@ int main_view(int argc, char** argv) {
             break;
 
         case 'Q':
-            loci_file = optarg;
+            loci_file = require_exists(logger, optarg);
             break;
 
         case 'B':
@@ -425,12 +435,16 @@ int main_view(int argc, char** argv) {
             extract_tag = optarg;
             break;
 
+        case OPT_FIRST:
+            first_tag = true;
+            break;
+
         case OPT_VERBOSE:
             verbose = true;
             break;
 
         case '7':
-            omp_set_num_threads(parse<int>(optarg));
+            set_thread_count(logger, optarg);
             break;
 
         case 'h':
@@ -471,11 +485,10 @@ int main_view(int argc, char** argv) {
     }
     
     if (optind >= argc) {
-        cerr << "[vg view] error: no filename given" << endl;
-        exit(1);
+        logger.error() << "no filename given" << endl;
     }
     if (output_type == "vg") {
-        cerr << "[vg view] warning: vg-protobuf output (-v / --v) is deprecated. please use vg convert instead." << endl;
+        logger.warn() << "vg-protobuf output (-v / --v) is deprecated. please use vg convert instead." << endl;
     }
     
     string file_name = get_input_file_name(optind, argc, argv);
@@ -487,21 +500,39 @@ int main_view(int argc, char** argv) {
             // Iterate over the input as tagged messages.
             vg::io::MessageIterator it(in, verbose);
             while(it.has_current()) {
-                if ((*it).first == extract_tag && (*it).second.get() != nullptr) {
+                if ((*it).first == extract_tag) {
                     // We match the tag, so dump this message.
-                    if (verbose) {
-                        cerr << "Message of " << (*it).second->size() << " bytes in matches tag to extract" << endl;
+                    if ((*it).second.get() != nullptr) {
+                        if (verbose) {
+                            logger.info() << "Message of " << (*it).second->size() 
+                                          << " bytes in matches tag to extract" << endl;
+                        }
+                        cout << *((*it).second.get());
+                        if (first_tag) {
+                            // Stop at the first hit
+                            exit(0);
+                        }
+                    } else {
+                        if (verbose) {
+                            logger.info() << "Messageless tag matching tag to extract" << endl;
+                        }
                     }
-                    cout << *((*it).second.get());
                 } else {
-                    if (verbose) {
-                        cerr << "Message of " << (*it).second->size() << " bytes does not match tag; skip" << endl;
+                    if ((*it).second.get() != nullptr) {
+                        if (verbose) {
+                            logger.info() << "Message of " << (*it).second->size()
+                                          << " bytes does not match tag; skip" << endl;
+                        }
+                    } else {
+                        if (verbose) {
+                            logger.info() << "Messageless tag not matching tag to extract" << endl;
+                        }
                     }
                 }
                 ++it;
             }
             if (verbose) {
-                cerr << "Iterator no longer has messages" << endl;
+                logger.info() << "Iterator no longer has messages" << endl;
             }
         });
         return 0;
@@ -525,8 +556,7 @@ int main_view(int argc, char** argv) {
         // VG can convert to any of the graph formats, so keep going
     } else if (input_type == "handlegraph") {
         if (output_type == "stream") {
-            cerr << "[vg view] error: Cannot stream a generic HandleGraph to JSON" << endl;
-            exit(1);
+            logger.error() << "Cannot stream a generic HandleGraph to JSON" << endl;
         } else {
             graph = vg::io::VPKG::load_one<PathHandleGraph>(file_name);
         }
@@ -535,18 +565,14 @@ int main_view(int argc, char** argv) {
        
         try {
             // Use the disk-backed GFA loader that `vg convert` also uses.
-            vg::algorithms::gfa_to_path_handle_graph(file_name,
-                                                 dynamic_cast<MutablePathMutableHandleGraph*>(graph.get()),
-                                                 nullptr,
-                                                 0); // set rgfa path rank to 0 to be consistent with vg convert's default logic
+            vg::algorithms::load_gfa_or_gfaz_to_path_handle_graph(file_name,
+                                                                  dynamic_cast<MutablePathMutableHandleGraph*>(graph.get()),
+                                                                  nullptr,
+                                                                  0); // set rgfa path rank to 0 to be consistent with vg convert's default logic
         } catch (vg::algorithms::GFAFormatError& e) {
-            cerr << "error:[vg view] Input GFA is not acceptable." << endl;
-            cerr << e.what() << endl;
-            exit(1);
+            logger.error() << "Input GFA is not acceptable\n" << e.what() << endl;
         } catch (std::ios_base::failure& e) {
-            cerr << "error:[vg view] IO error processing input GFA." << endl;
-            cerr << e.what() << endl;
-            exit(1);
+            logger.error() << "IO error processing input GFA\n" << e.what() << endl;
         }
         
         // GFA can convert to any of the graph formats, so keep going
@@ -618,7 +644,7 @@ int main_view(int argc, char** argv) {
             }
             else {
                 // todo
-                cerr << "[vg view] error: (binary) GAM can only be converted to JSON, GAMP or FASTQ" << endl;
+                logger.error() << "(binary) GAM can only be converted to JSON, GAMP, or FASTQ" << endl;
                 return 1;
             }
         } else {
@@ -639,8 +665,7 @@ int main_view(int argc, char** argv) {
                 vg::io::write_buffered(cout, buf, 0);
             }
             else {
-                cerr << "[vg view] error: JSON GAM can only be converted to GAM, GAMP, or JSON" << endl;
-                return 1;
+                logger.error() << "JSON GAM can only be converted to GAM, GAMP, or JSON" << endl;
             }
         }
         cout.flush();
@@ -655,11 +680,9 @@ int main_view(int argc, char** argv) {
             return 0;
         } else if (output_type == "json") {
             // todo
-            cerr << "[vg view] error: BAM to JSON conversion not yet implemented" << endl;
-            return 0;
+            logger.error() << "BAM to JSON conversion not yet implemented" << endl;
         } else {
-            cerr << "[vg view] error: BAM can only be converted to GAM" << endl;
-            return 1;
+            logger.error() << "BAM can only be converted to GAM" << endl;
         }
     } else if (input_type == "multipath") {
         if (input_json) {
@@ -716,8 +739,7 @@ int main_view(int argc, char** argv) {
                 }
             }
             else {
-                cerr << "[vg view] error: Unrecognized output format for MultipathAlignment (GAMP)" << endl;
-                return 1;
+                logger.error() << "Unrecognized output format for MultipathAlignment (GAMP)" << endl;
             }
             return 0;
         }
@@ -782,8 +804,7 @@ int main_view(int argc, char** argv) {
                 });
             }
             else {
-                cerr << "[vg view] error: Unrecognized output format for MultipathAlignment (GAMP)" << endl;
-                return 1;
+                logger.error() << "Unrecognized output format for MultipathAlignment (GAMP)" << endl;
             }
             return 0;
         }
@@ -816,8 +837,7 @@ int main_view(int argc, char** argv) {
             }
         } else {
             // We can't convert fastq to the other graph formats
-            cerr << "[vg view] error: FASTQ can only be converted to GAM" << endl;
-            return 1;
+            logger.error() << "FASTQ can only be converted to GAM" << endl;
         }
         cout.flush();
         return 0;
@@ -833,16 +853,14 @@ int main_view(int argc, char** argv) {
                 });
             } else {
                 // todo
-                cerr << "[vg view] error: (binary) Pileup can only be converted to JSON" << endl;
-                return 1;
+                logger.error() << "(binary) Pileup can only be converted to JSON" << endl;
             }
         } else {
             if (output_type == "json" || output_type == "pileup") {
                 vg::io::JSONStreamHelper<Pileup> json_helper(file_name);
                 json_helper.write(cout, output_type == "json");
             } else {
-                cerr << "[vg view] error: JSON Pileup can only be converted to Pileup or JSON" << endl;
-                return 1;
+                logger.error() << "JSON Pileup can only be converted to Pileup or JSON" << endl;
             }
         }
         cout.flush();
@@ -856,8 +874,7 @@ int main_view(int argc, char** argv) {
                 vg::io::for_each(in, lambda);
             });
         } else {
-            cerr << "[vg view] error: (binary) Translation can only be converted to JSON" << endl;
-            return 1;
+            logger.error() << "(binary) Translation can only be converted to JSON" << endl;
         }
         return 0;
     } else if (input_type == "locus") {
@@ -872,16 +889,14 @@ int main_view(int argc, char** argv) {
                 });
             } else {
                 // todo
-                cerr << "[vg view] error: (binary) Locus can only be converted to JSON" << endl;
-                return 1;
+                logger.error() << "(binary) Locus can only be converted to JSON" << endl;
             }
         } else {
             if (output_type == "json" || output_type == "locus") {
                 vg::io::JSONStreamHelper<Locus> json_helper(file_name);
                 json_helper.write(cout, output_type == "json");
             } else {
-                cerr << "[vg view] error: JSON Locus can only be converted to Locus or JSON" << endl;
-                return 1;
+                logger.error() << "JSON Locus can only be converted to Locus or JSON" << endl;
             }
         }
         cout.flush();
@@ -893,8 +908,7 @@ int main_view(int argc, char** argv) {
                 distance_index->write_snarls_to_json();
             });
         } else {
-            cerr << "[vg view] error: (binary) Distance index can only be converted to JSON" << endl;
-            return 1;
+            logger.error() << "(binary) Distance index can only be converted to JSON" << endl;
         }
         return 0;
     } else if (input_type == "snarls") {
@@ -906,8 +920,7 @@ int main_view(int argc, char** argv) {
                 vg::io::for_each(in, lambda);
             });
         } else {
-            cerr << "[vg view] error: (binary) Snarls can only be converted to JSON" << endl;
-            return 1;
+            logger.error() << "(binary) Snarls can only be converted to JSON" << endl;
         }
         return 0;
     } else if (input_type == "snarltraversals") {
@@ -919,16 +932,14 @@ int main_view(int argc, char** argv) {
                 vg::io::for_each(in, lambda);
             });
         } else {
-            cerr << "[vg view] error: (binary) SnarlTraversals can only be converted to JSON" << endl;
-            return 1;
+            logger.error() << "(binary) SnarlTraversals can only be converted to JSON" << endl;
         }
         return 0;
     }
 
     if(!graph) {
         // Make sure we didn't forget to implement an input format.
-        cerr << "[vg view] error: cannot load graph in " << input_type << " format" << endl;
-        return 1;
+        logger.error() << "cannot load graph in " << input_type << " format" << endl;
     }
 
     if (output_type == "gfa") {
@@ -953,19 +964,19 @@ int main_view(int argc, char** argv) {
         vg_graph->paths.to_graph(vg_graph->graph);
         
 #ifdef debug
-        cerr << "Paths before conversion: " << endl;
+        logger.info() << "Paths before conversion: " << endl;
         graph->for_each_path_handle([&](const path_handle_t& p) {
-            cerr << graph->get_path_name(p) << endl;
+            logger.info() << graph->get_path_name(p) << endl;
         });
         
-        cerr << "Paths after conversion: " << endl;
+        logger.info() << "Paths after conversion: " << endl;
         vg_graph->for_each_path_handle([&](const path_handle_t& p) {
-            cerr << vg_graph->get_path_name(p) << endl;
+            logger.info() << vg_graph->get_path_name(p) << endl;
         });
         
-        cerr << "VG Protobuf paths:" << endl;
+        logger.info() << "VG Protobuf paths:" << endl;
         for (auto& p : vg_graph->graph.path()) {
-            cerr << p.name() << endl;
+            logger.info() << p.name() << endl;
         }
 #endif
         
@@ -976,7 +987,7 @@ int main_view(int argc, char** argv) {
     if(!vg_graph->is_valid()) {
         // If we're converting the graph via VG, we might as well make sure it's valid.
         // This is especially useful for JSON import.
-        cerr << "[vg view] warning: graph is invalid!" << endl;
+        logger.warn() << "graph is invalid!" << endl;
     }
     if (output_type == "dot") {
         vg_graph->to_dot(std::cout,
@@ -1002,8 +1013,7 @@ int main_view(int argc, char** argv) {
         vg_graph->serialize_to_ostream(cout);
     } else if (output_type != "gfa") {
         // We somehow got here with a bad output format.
-        cerr << "[vg view] error: cannot save a graph in " << output_type << " format" << endl;
-        return 1;
+        logger.error() << "cannot save a graph in " << output_type << " format" << endl;
     }
     
     // We made it to the end and nothing broke.
@@ -1012,4 +1022,3 @@ int main_view(int argc, char** argv) {
 
 // Register subcommand
 static Subcommand vg_view("view", "format conversions for graphs and alignments", TOOLKIT, main_view);
-

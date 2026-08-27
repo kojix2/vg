@@ -1,7 +1,6 @@
 #include "gbwt_helper.hpp"
 #include "utility.hpp"
 
-#include <vg/io/vpkg.hpp>
 #include <handle.hpp>
 #include <gbwtgraph/utils.h>
 
@@ -88,102 +87,130 @@ gbwt::size_type gbwt_node_width(const HandleGraph& graph) {
     return gbwt::bit_length(gbwt::Node::encode(graph.max_node_id(), true));
 }
 
-void finish_gbwt_constuction(gbwt::GBWTBuilder& builder,
-    const std::vector<std::string>& sample_names,
-    const std::vector<std::string>& contig_names,
-    size_t haplotype_count, bool print_metadata,
-    const std::string& header) {
-
-    builder.finish();
-    builder.index.metadata.setSamples(sample_names);
-    builder.index.metadata.setHaplotypes(haplotype_count);
-    builder.index.metadata.setContigs(contig_names);
-    if (print_metadata) {
-        #pragma omp critical
-        {
-            std::cerr << header << ": ";
-            gbwt::operator<<(std::cerr, builder.index.metadata);
-            std::cerr << std::endl;
-        }
-    }
-}
-
 //------------------------------------------------------------------------------
 
 void load_gbwt(gbwt::GBWT& index, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Loading compressed GBWT from " << filename << std::endl;
     }
-    std::unique_ptr<gbwt::GBWT> loaded = vg::io::VPKG::load_one<gbwt::GBWT>(filename);
-    if (loaded.get() == nullptr) {
-        std::cerr << "error: [load_gbwt()] cannot load compressed GBWT " << filename << std::endl;
+    try {
+        sdsl::simple_sds::load_from(index, filename);
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [load_gbwt()] cannot load compressed GBWT " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    index = std::move(*loaded);
 }
 
 void load_gbwt(gbwt::DynamicGBWT& index, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Loading dynamic GBWT from " << filename << std::endl;
     }
-    std::unique_ptr<gbwt::DynamicGBWT> loaded = vg::io::VPKG::load_one<gbwt::DynamicGBWT>(filename);
-    if (loaded.get() == nullptr) {
-        std::cerr << "error: [load_gbwt()] cannot load dynamic GBWT " << filename << std::endl;
+    try {
+        sdsl::simple_sds::load_from(index, filename);
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [load_gbwt()] cannot load dynamic GBWT " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    index = std::move(*loaded);
 }
 
 void load_r_index(gbwt::FastLocate& index, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Loading r-index from " << filename << std::endl;
     }
-    std::unique_ptr<gbwt::FastLocate> loaded = vg::io::VPKG::load_one<gbwt::FastLocate>(filename);
-    if (loaded.get() == nullptr) {
-        std::cerr << "error: [load_r_index()] cannot load r-index " << filename << std::endl;
+
+    // This mimics Simple-SDS serialization.
+    try {
+        std::ifstream in(filename, std::ios_base::binary);
+        if (!in) {
+            throw sdsl::simple_sds::CannotOpenFile(filename, false);
+        }
+        in.exceptions(std::ifstream::badbit | std::ifstream::failbit | std::ifstream::eofbit);
+        index.load(in);
+        in.close();
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [load_r_index()] cannot load r-index " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    index = std::move(*loaded);
 }
 
 void save_gbwt(const gbwt::GBWT& index, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Saving compressed GBWT to " << filename << std::endl;
     }
-    sdsl::simple_sds::serialize_to(index, filename);
+    try {
+        sdsl::simple_sds::serialize_to(index, filename);
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [save_gbwt()] cannot save compressed GBWT to " << filename << ": " << e.what() << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
 }
 
 void save_gbwt(const gbwt::DynamicGBWT& index, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Saving dynamic GBWT to " << filename << std::endl;
     }
-    sdsl::simple_sds::serialize_to(index, filename);
+    try {
+        sdsl::simple_sds::serialize_to(index, filename);
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [save_gbwt()] cannot save dynamic GBWT to " << filename << ": " << e.what() << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
 }
 
 void save_r_index(const gbwt::FastLocate& index, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Saving r-index to " << filename << std::endl;
     }
-    if (!sdsl::store_to_file(index, filename)) {
-        std::cerr << "error: [save_r_index()] cannot write r-index to " << filename << std::endl;
+
+    // This mimics Simple-SDS serialization.
+    try {
+        std::ofstream out(filename, std::ios_base::binary);
+        if (!out) {
+            throw sdsl::simple_sds::CannotOpenFile(filename, true);
+        }
+        out.exceptions(std::ofstream::badbit | std::ofstream::failbit);
+        index.serialize(out);
+        out.close();
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [save_r_index()] cannot save r-index to " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
 }
 
 //------------------------------------------------------------------------------
 
-void GBWTHandler::use_compressed() {
+gbwt::GBWT* GBWTHandler::get_compressed() {
     if (this->in_use == index_compressed) {
+        return &this->compressed_owned;
+    } else if (this->in_use == index_external) {
+        return this->compressed_external;
+    } else {
+        return nullptr;
+    }
+}
+
+const gbwt::GBWT* GBWTHandler::get_compressed() const {
+    if (this->in_use == index_compressed) {
+        return &this->compressed_owned;
+    } else if (this->in_use == index_external) {
+        return this->compressed_external;
+    } else {
+        return nullptr;
+    }
+}
+
+void GBWTHandler::use_compressed() {
+    if (this->in_use == index_compressed || this->in_use == index_external) {
         return;
     } else if (this->in_use == index_dynamic) {
         if (this->show_progress) {
             std::cerr << "Converting dynamic GBWT into compressed GBWT" << std::endl;
         }
-        this->compressed = gbwt::GBWT(this->dynamic);
+        this->compressed_owned = gbwt::GBWT(this->dynamic);
         this->dynamic = gbwt::DynamicGBWT();
         this->in_use = index_compressed;
     } else {
-        load_gbwt(this->compressed, this->filename, this->show_progress);
+        load_gbwt(this->compressed_owned, this->filename, this->show_progress);
         this->in_use = index_compressed;
     }
 }
@@ -191,12 +218,13 @@ void GBWTHandler::use_compressed() {
 void GBWTHandler::use_dynamic() {
     if (this->in_use == index_dynamic) {
         return;
-    } else if (this->in_use == index_compressed) {
+    } else if (this->in_use == index_compressed || this->in_use == index_external) {
         if (this->show_progress) {
             std::cerr << "Converting compressed GBWT into dynamic GBWT" << std::endl;
         }
-        this->dynamic = gbwt::DynamicGBWT(this->compressed);
-        this->compressed = gbwt::GBWT();
+        this->dynamic = gbwt::DynamicGBWT(*this->get_compressed());
+        this->compressed_owned = gbwt::GBWT();
+        this->compressed_external = nullptr;
         this->in_use = index_dynamic;
     } else {
         load_gbwt(this->dynamic, this->filename, this->show_progress);
@@ -207,8 +235,15 @@ void GBWTHandler::use_dynamic() {
 void GBWTHandler::use(gbwt::GBWT& new_index) {
     this->clear();
     this->unbacked();
-    this->compressed.swap(new_index);
+    this->compressed_owned.swap(new_index);
     this->in_use = index_compressed;
+}
+
+void GBWTHandler::use_external(gbwt::GBWT& new_index) {
+    this->clear();
+    this->unbacked();
+    this->compressed_external = &new_index;
+    this->in_use = index_external;
 }
 
 void GBWTHandler::use(gbwt::DynamicGBWT& new_index) {
@@ -226,8 +261,8 @@ void GBWTHandler::serialize(const std::string& new_filename) {
     if (this->in_use == index_none) {
         std::cerr << "warning: [GBWTHandler] no GBWT to serialize" << std::endl;
         return;
-    } else if (this->in_use == index_compressed) {
-        save_gbwt(this->compressed, new_filename, this->show_progress);
+    } else if (this->in_use == index_compressed || this->in_use == index_external) {
+        save_gbwt(*this->get_compressed(), new_filename, this->show_progress);
     } else {
         save_gbwt(this->dynamic, new_filename, this->show_progress);
     }
@@ -235,7 +270,8 @@ void GBWTHandler::serialize(const std::string& new_filename) {
 }
 
 void GBWTHandler::clear() {
-    this->compressed = gbwt::GBWT();
+    this->compressed_owned = gbwt::GBWT();
+    this->compressed_external = nullptr;
     this->dynamic = gbwt::DynamicGBWT();
     this->in_use = index_none;
 }
@@ -574,6 +610,94 @@ void copy_reference_samples(const PathHandleGraph& source, gbwt::GBWT& destinati
 }
 
 //------------------------------------------------------------------------------
+
+void append_wrap_fragment(gbwt::vector_type& last_fragment, const gbwt::vector_type& origin_fragment) {
+    // The caller must pass distinct vectors, so inserting from the origin's
+    // iterators is safe even if the last fragment reallocates.
+    last_fragment.insert(last_fragment.end(), origin_fragment.begin(), origin_fragment.end());
+}
+
+gbwt::GBWT wrap_haplotype_paths(const gbwt::GBWT& source, const std::unordered_set<std::string>& contigs) {
+
+    if (contigs.empty()) {
+        return source;
+    }
+    if (!source.hasMetadata() || !source.metadata.hasPathNames() || !source.metadata.hasContigNames()) {
+        throw std::runtime_error("wrap_haplotype_paths(): the GBWT does not have the metadata for identifying haplotype fragments");
+    }
+
+    gbwtgraph::sample_name_set reference_samples = gbwtgraph::parse_reference_samples_tag(source);
+
+    // Group each haplotype's fragments into a chain using the fragment map.
+    // Fragments are grouped by (sample, contig, phase) and ordered by their
+    // position along the contig, so every fragment of a chain lies on the same
+    // contig. Wrapping applies to the chain as a whole: linearizing a circular
+    // sequence drops a single adjacency, the one joining the end of the last
+    // fragment back to the start of the first. We restore it by appending the
+    // origin (first) fragment onto the last fragment.
+    gbwt::FragmentMap fragment_map(source.metadata, false);
+
+    // For each haplotype chain that ends on a named contig, record the path id
+    // of its origin fragment against the path id of its last fragment. We act
+    // at the last fragment (the one with no successor) and walk back to the
+    // origin (the one with no predecessor). For an unfragmented haplotype the
+    // origin and the last fragment coincide, so the path is appended to itself.
+    gbwt::size_type path_count = source.metadata.paths();
+    std::unordered_map<gbwt::size_type, gbwt::size_type> origin_for_last;
+    for (gbwt::size_type path_id = 0; path_id < path_count; path_id++) {
+        const gbwt::PathName& path_name = source.metadata.path(path_id);
+        gbwtgraph::PathSense sense = gbwtgraph::get_path_sense(source.metadata, path_name, reference_samples);
+        if (sense != gbwtgraph::PathSense::HAPLOTYPE) {
+            continue;
+        }
+        const std::string& contig_name = source.metadata.contig(path_name.contig);
+        if (contigs.find(contig_name) == contigs.end()) {
+            continue;
+        }
+        if (fragment_map.next(path_id) != gbwt::invalid_sequence()) {
+            continue;
+        }
+        gbwt::size_type origin = path_id;
+        for (gbwt::size_type prev = fragment_map.prev(origin); prev != gbwt::invalid_sequence(); prev = fragment_map.prev(origin)) {
+            origin = prev;
+        }
+
+        // The origin fragment must contain contig position 0. In both GFA
+        // W-line GBWTs (where count is the genomic start offset) and VCF GBWTs
+        // (where count is a dense 0-based fragment identifier), the origin has
+        // count 0. A nonzero count means the start was truncated out of the
+        // graph, so there is no origin node to wrap onto.
+        if (source.metadata.path(origin).count != 0) {
+            const std::string& sample_name = source.metadata.sample(path_name.sample);
+            throw std::runtime_error("wrap_haplotype_paths(): haplotype " + sample_name + " on contig " + contig_name + " has no origin fragment and cannot be wrapped");
+        }
+        origin_for_last[path_id] = origin;
+    }
+
+    // Rebuild the index, appending the origin fragment onto each wrapped
+    // haplotype's last fragment and copying the other paths verbatim.
+    gbwt::size_type node_width = sdsl::bits::length(source.sigma() - 1);
+    gbwt::GBWTBuilder builder(node_width, gbwt::DynamicGBWT::INSERT_BATCH_SIZE, gbwt::DynamicGBWT::SAMPLE_INTERVAL);
+    for (gbwt::size_type path_id = 0; path_id < path_count; path_id++) {
+        gbwt::size_type sequence_id = source.bidirectional() ? gbwt::Path::encode(path_id, false) : path_id;
+        gbwt::vector_type path = source.extract(sequence_id);
+        auto iter = origin_for_last.find(path_id);
+        if (iter != origin_for_last.end()) {
+            gbwt::size_type origin_sequence = source.bidirectional() ? gbwt::Path::encode(iter->second, false) : iter->second;
+            gbwt::vector_type origin_path = source.extract(origin_sequence);
+            append_wrap_fragment(path, origin_path);
+        }
+        builder.insert(path, source.bidirectional());
+    }
+    builder.finish();
+
+    gbwt::GBWT result(builder.index);
+    result.addMetadata();
+    result.metadata = source.metadata;
+    copy_reference_samples(source, result);
+
+    return result;
+}
 
 gbwt::GBWT get_gbwt(const std::vector<gbwt::vector_type>& paths) {
     gbwt::size_type node_width = 1, total_length = 0;

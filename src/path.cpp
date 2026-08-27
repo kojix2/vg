@@ -1,7 +1,11 @@
 #include "path.hpp"
 #include <vg/io/stream.hpp>
 #include "region.hpp"
+#include "alignment.hpp"
+#include "crash.hpp"
 #include <sstream>
+
+// #define debug_simplify
 
 using namespace vg::io;
 
@@ -12,7 +16,6 @@ const std::function<bool(const string&)> Paths::is_alt = [](const string& path_n
     // But std::regex was taking loads and loads of time (probably matching .+) so we're replacing it with special-purpose code.
     
     string prefix("_alt_");
-    
     if (path_name.length() < prefix.length() || !std::equal(prefix.begin(), prefix.end(), path_name.begin())) {
         // We lack the prefix
         return false;
@@ -1106,6 +1109,28 @@ int softclip_end(const Mapping& mapping) {
     return to_length;
 }
 
+int softclip_start(const Path& path) {
+    if (path.mapping_size() > 0) {
+        auto& first_mapping = path.mapping(0);
+        auto& first_edit = first_mapping.edit(0);
+        if (first_edit.from_length() == 0 && first_edit.to_length() > 0) {
+            return first_edit.to_length();
+        }
+    }
+    return 0;
+}
+
+int softclip_end(const Path& path) {
+    if (path.mapping_size() > 0) {
+        auto& last_mapping = path.mapping(path.mapping_size()-1);
+        auto& last_edit = last_mapping.edit(last_mapping.edit_size()-1);
+        if (last_edit.from_length() == 0 && last_edit.to_length() > 0) {
+            return last_edit.to_length();
+        }
+    }
+    return 0;
+}
+
 // returns the first non-softclip position in the path
 Position first_path_position(const Path& path) {
     // step through soft clips
@@ -1289,13 +1314,18 @@ Path concat_paths(const Path& path1, const Path& path2) {
 Path simplify(const Path& p, bool trim_internal_deletions) {
     Path s;
     s.set_name(p.name());
-    //cerr << "simplifying " << pb2json(p) << endl;
+#ifdef debug_simplify
+    cerr << "simplifying " << pb2json(p) << endl;
+#endif
     // loop over the mappings in the path, doing a few things
     // exclude mappings that are total deletions
     // when possible, merge a mapping with the previous mapping
     // push inserted sequences to the left
     for (size_t i = 0; i < p.mapping_size(); ++i) {
         auto m = simplify(p.mapping(i), trim_internal_deletions);
+#ifdef debug_simplify
+        std::cerr << "Simplify mapping " << pb2json(p.mapping(i)) << " to " << pb2json(m) << std::endl;
+#endif
         // remove empty mappings as these are redundant
         if (trim_internal_deletions) {
             // remove wholly-deleted or empty mappings as these are redundant
@@ -1306,39 +1336,45 @@ Path simplify(const Path& p, bool trim_internal_deletions) {
             if (m.edit_size() == 0) continue;
         }
         if (s.mapping_size()) {
-            //&& m.position().is_reverse() == s.mapping(s.mapping_size()-1).position().is_reverse()) {
             // if this isn't the first mapping
             // refer to the last mapping
             Mapping* l = s.mutable_mapping(s.mapping_size()-1);
-            // split off any insertions from the start
-            // and push them to the last mapping
-            size_t ins_at_start = 0;
-            for (size_t j = 0; j < m.edit_size(); ++j) {
-                auto& e = m.edit(j);
-                if (!edit_is_insertion(e)) break;
-                ins_at_start += e.to_length();
+
+            // Move any insertion edits at the start of m to be in l instead.
+            //
+            // We don't use cut_mapping() here because it is too powerful and
+            // also will bring along any adjacent deletions.
+            size_t edits_moved = 0;
+            while (edits_moved < m.edit_size() && edit_is_insertion(m.edit(edits_moved))) {
+                // Copy insertions to the end of l
+                *l->add_edit() = std::move(*m.mutable_edit(edits_moved));
+                edits_moved++;
             }
-            // if there are insertions at the start, move them left
-            if (ins_at_start) {
-                auto p = cut_mapping(m, ins_at_start);
-                auto& ins = p.first;
-                // cerr << "insertion " << pb2json(ins) << endl;
-                // take the position from the original mapping
-                m = p.second;
-                *m.mutable_position() = ins.position();
-                // cerr << "before and after " << pb2json(ins) << " and " << pb2json(m) << endl;
-                for (size_t j = 0; j < ins.edit_size(); ++j) {
-                    auto& e = ins.edit(j);
-                    *l->add_edit() = e;
-                }
+            // Splice them out of m
+            m.mutable_edit()->DeleteSubrange(0, edits_moved);
+
+#ifdef debug_simplify
+            if (edits_moved > 0) {
+                cerr << "Moved " << edits_moved << "insertion edits left so previous mapping is now " << pb2json(*l) << endl;
             }
+#endif
             // if our last mapping has no position, but we do, merge
             if ((!l->has_position() || l->position().node_id() == 0)
                 && (m.has_position() && m.position().node_id() != 0)) {
+
+#ifdef debug_simplify
+                std::cerr << "Push position to previous mapping" << std::endl;
+#endif
+
                 *l->mutable_position() = m.position();
                 // if our last mapping has a position, and we don't, merge
             } else if ((!m.has_position() || m.position().node_id() == 0)
                        && (l->has_position() && l->position().node_id() != 0)) {
+
+#ifdef debug_simplify
+                std::cerr << "Get position from previous mapping" << std::endl;
+#endif
+
                 *m.mutable_position() = *l->mutable_position();
                 m.mutable_position()->set_offset(from_length(*l));
             }
@@ -1350,10 +1386,19 @@ Path simplify(const Path& p, bool trim_internal_deletions) {
                  && l->position().node_id() == m.position().node_id()
                  && l->position().offset() + mapping_from_length(*l) == m.position().offset())) {
                 // we can merge the current mapping onto the old one
+                
+#ifdef debug_simplify
+                std::cerr << "Combine with previous mapping" << std::endl;
+#endif
+                
                 *l = concat_mappings(*l, m, trim_internal_deletions);
             } else {
                 if (from_length(m) || to_length(m)) {
                     *s.add_mapping() = m;
+                } else {
+#ifdef debug_simplify
+                    std::cerr << "Drop empty mapping" << std::endl;
+#endif
                 }
             }
         } else {
@@ -2269,7 +2314,6 @@ double divergence(const Mapping& m) {
 }
 
 double identity(const Path& path) {
-    double ident = 0;
     size_t total_length = path_to_length(path);
     size_t matched_length = 0;
     for (size_t i = 0; i < path.mapping_size(); ++i) {
@@ -2278,6 +2322,12 @@ double identity(const Path& path) {
             auto& edit = mapping.edit(j);
             if (edit_is_match(edit)) {
                 matched_length += edit.from_length();
+            } else if (edit_is_insertion(edit)) {
+                bool is_first_edit = (i == 0) && (j == 0);
+                bool is_last_edit = (i == path.mapping_size() - 1) && (j == mapping.edit_size() - 1);
+                if (is_first_edit || is_last_edit) {
+                    total_length -= edit.to_length();
+                }
             }
         }
     }
@@ -2509,6 +2559,221 @@ Alignment alignment_from_path(const HandleGraph& graph, const Path& path) {
     return aln;
 }
 
+bool find_containing_subpath(const PathPositionHandleGraph& graph, Region& region, path_handle_t& path) {
+    bool found_overlapping = false;
+    path_handle_t overlapping;
+    size_t overlap_length = 0;
+    // Look at overlapping subpaths and fill in the region if we find one exact
+    // match that isn't just a GBZ first subpath.
+    for_each_overlapping_subpath(graph, region, [&](const path_handle_t& candidate, size_t start_offset, size_t past_end_offset) {
+        // To distinguish multiple 0-length regions, we set a flag.
+        found_overlapping = true;
+        // Keep only the first overlapping subpath.
+        overlapping = candidate;
+        // And the length of the overlap.
+        overlap_length = past_end_offset - start_offset;
+#ifdef debug
+        std::cerr << "Found overlap with region of length " << overlap_length << std::endl;
+#endif
+        return false;
+    });
+#ifdef debug
+    std::cerr << "Region now runs " << region.start << "-" << region.end << std::endl;
+#endif
+
+    // At this point, the region is filled in if possible.
+    if (region.start == -1 || region.end == -1) {
+        // So if the region isn't fully filled in, there's no single path for
+        // it, so there's no containing path.
+        return false;
+    }
+
+    if (found_overlapping && overlap_length == region.end + 1 - region.start) {
+        // To contain the region, the length of the overlap must equal the length
+        // of the region.
+        path = overlapping;
+        return true;
+    }
+
+    // Otherwise, we found something that intersects the region but doesn't contain it.
+    // Because subpaths don't overlap, this means no subpath can contain the region.
+    return false;
+}
+
+bool for_each_overlapping_subpath(const PathPositionHandleGraph& graph, Region& region, const std::function<bool(const path_handle_t& path, size_t start_offset, size_t past_end_offset)>& iteratee) {
+    // Track the number of subpaths of this base path, and the last one we saw.
+    size_t path_count = 0;
+    path_handle_t last_path;
+
+    // We need to always query at least twice even if the iteratee asked to
+    // stop on the first call, to know whether we're looking at a full base
+    // path or not.
+    bool iteratee_active = true;
+
+    for_each_subpath_of(graph, region.seq, [&](const path_handle_t& candidate) {
+        // We will have no subrange for a full path, or for a first subpath in a GBWT/GBZ.
+
+        // So populate subrange bounds for even those cases.
+        subrange_t candidate_subrange = graph.get_subrange(candidate);
+        if (candidate_subrange == PathMetadata::NO_SUBRANGE) {
+            candidate_subrange.first = 0;
+            candidate_subrange.second = PathMetadata::NO_END_POSITION;
+        }
+        if (candidate_subrange.second == PathMetadata::NO_END_POSITION) {
+            candidate_subrange.second = candidate_subrange.first + graph.get_path_length(candidate);  
+        }
+
+#ifdef debug
+        std::cerr << "Candidate subpath running " << candidate_subrange.first << "-" << candidate_subrange.second << std::endl;
+#endif
+
+        // Remember we saw a path, and it was this one
+        path_count++;
+        last_path = candidate;
+        
+        if (iteratee_active) {
+            size_t region_offset = 0;
+            if (graph.get_path_name(candidate) == region.seq && candidate_subrange.first > 0) {
+                // We found a path that exactly matches the region asked for, and it doesn't start at 0.
+                // The region's start and end need to be interpreted relative to the start of this path, not relative to the base path.
+                region_offset = candidate_subrange.first;
+#ifdef debug
+                std::cerr << "Subpath is what region is on" << std::endl;
+#endif
+            }
+            if ((region.start == -1 || candidate_subrange.second > region.start + region_offset) && (region.end == -1 || candidate_subrange.first < region.end + region_offset + 1)) {
+                // The subranges are 0-based exclusive and the regions are 0-based inclusive.
+                // This subrange intersects this region.
+#ifdef debug
+                std::cerr << "Subpath intersects region" << std::endl;
+#endif
+                
+                // If the region has a start other than -1 and starts after the subpath does, cut into the subpath on the left.
+                // We need the explicit comparison against -1 because we can't usefully compare a signed -1 to an unsigned number.
+                size_t intersection_start = (region.start != -1 && region.start + region_offset > candidate_subrange.first) ? (region.start + region_offset - candidate_subrange.first) : 0;
+                // If the region ends somewhere other than -1 and ends before the subpath does, cut into the subpath on the right.
+                size_t intersection_end = (region.end != -1 && region.end + region_offset + 1 < candidate_subrange.second) ? region.end + region_offset + 1 - candidate_subrange.first : candidate_subrange.second - candidate_subrange.first;
+                
+                // Show the iteratee the intersecting part.
+                iteratee_active = iteratee(candidate, intersection_start, intersection_end);
+            } else {
+#ifdef debug
+                std::cerr << "Subpath does not intersect region" << std::endl;
+#endif
+            }
+        }
+
+        return path_count == 1 || iteratee_active;
+    });
+
+#ifdef debug
+    std::cerr << "Overlapped path count: " << path_count << std::endl;
+#endif
+
+    if (path_count == 1) {
+        // There's only one subpath in the graph matching this base path.
+        if (graph.get_path_name(last_path) == region.seq) {
+            // It's exactly the path we asked for (either a full base path, or
+            // an initial subpath in a GBZ where there aren't any other
+            // subpaths on the base path, or a subpath we named directly.)
+#ifdef debug
+            std::cerr << "Found exact path name match without extra subpaths" << std::endl;
+#endif
+            if (region.start == -1) {
+                // Infer a region start
+                region.start = 0;
+            }
+            if (region.end == -1) {
+                // Infer a region end
+                region.end = graph.get_path_length(last_path) - 1;
+            }
+        }
+    }
+
+    return iteratee_active;
+    
+}
+
+bool for_each_subpath_of(const PathPositionHandleGraph& graph, const string& path_name, const std::function<bool(const path_handle_t& path)>& iteratee) {
+    // In a GBWT or GBZ, the first fragment is indistinguishable from a full
+    // base path if it starts at 0. The only way to tell the difference is by
+    // the presence of other fragments on the same base path.
+    
+    // Parse out the metadata of the thing we want subpaths of
+    PathSense sense;
+    string sample;
+    string locus;
+    size_t haplotype;
+    size_t phase_block;
+    subrange_t subrange;
+    PathMetadata::parse_path_name(path_name,
+                                  sense,
+                                  sample,
+                                  locus,
+                                  haplotype,
+                                  phase_block,
+                                  subrange);
+                                  
+    if (subrange != PathMetadata::NO_SUBRANGE) {
+        // The path name described a subpath. Look for it specifically.
+#ifdef debug
+        std::cerr << "Path name appears to itself be a subpath" << std::endl;
+#endif
+        if (graph.has_path(path_name)) {
+            // We found exactly that subpath with that name.
+#ifdef debug
+            std::cerr << "That subpath exists" << std::endl;
+#endif
+            return iteratee(graph.get_path_handle(path_name));
+        }
+#ifdef debug
+        std::cerr << "That subpath does not exist" << std::endl;
+#endif
+        // If we don't find it, don't call the iteratee.
+        return true;
+    }
+
+    // Otherwise, the path name described a base path.
+    // Look at every subpath on it
+    return graph.for_each_path_matching({sense}, {sample}, {locus}, [&](const path_handle_t& match) {
+        // TODO: There's no way to search by haplotype and phase block, we have to scan
+        if (graph.get_haplotype(match) != haplotype) {
+            // Skip this haplotype
+            return true;
+        }
+        if (graph.get_phase_block(match) != phase_block) {
+            // Skip this phase block
+            return true;
+        }
+        // Don't need to check subrange, we know we don't have one and this
+        // candidate either has one or is missing one because it's a 0-based
+        // fragment in a GBZ.
+        return iteratee(match);    
+    });
+}
+
+std::string get_path_base_name(const PathPositionHandleGraph& graph, const path_handle_t& path) {
+    if (graph.get_subrange(path) == PathMetadata::NO_SUBRANGE) {
+        // This is a full path
+        return graph.get_path_name(path);
+    } else {
+        // This is a subpath, so remember what it's a subpath of, and use that.
+        return PathMetadata::create_path_name(graph.get_sense(path),
+                                              graph.get_sample_name(path),
+                                              graph.get_locus_name(path),
+                                              graph.get_haplotype(path),
+                                              graph.get_phase_block(path),
+                                              PathMetadata::NO_SUBRANGE);
+    }
+}
+
+size_t get_path_base_offset(const PathPositionHandleGraph& graph, const path_handle_t& path) {
+    subrange_t subrange = graph.get_subrange(path);
+    // NO_SUBRANGE doesn't necessarily have a 0 in the first field.
+    return subrange == PathMetadata::NO_SUBRANGE ? 0 : subrange.first;
+}
+
+
 void from_proto_edit(const Edit& proto_edit, edit_t& edit) {
     edit.set_from_length(proto_edit.from_length());
     edit.set_to_length(proto_edit.to_length());
@@ -2587,7 +2852,6 @@ int path_to_length(const path_t& path) {
     }
     return length;
 }
-
 
 void reverse_complement_mapping_in_place(path_mapping_t* m,
                                          const function<int64_t(id_t)>& node_length) {
@@ -2737,6 +3001,17 @@ string debug_string(const edit_t& edit) {
     }
     to_return += "}";
     return to_return;
+}
+
+string debug_cigar_string(const path_t& path) {
+    std::vector<std::pair<int, char>> cigar;
+    for (auto& m : path.mapping()) {
+        // Gigar string generation isn't written for path_mapping_t, so use the Protobuf version.
+        Mapping mapping;
+        to_proto_mapping(m, mapping);
+        mapping_cigar(mapping, cigar, 'X');
+    }
+    return cigar_string(cigar);
 }
 
 int corresponding_length_internal(const path_t& path, int given_length, bool is_from_length, bool from_end) {

@@ -5,14 +5,14 @@
 
 #include "../gbwt_extender.hpp"
 #include "../gbwt_helper.hpp"
-#include "vg/io/json2pb.h"
+#include "../io/json2graph.hpp"
 #include "../utility.hpp"
 #include "../vg.hpp"
 
 #include <bdsg/hash_graph.hpp>
 
 #include "catch.hpp"
-#include "randomness.hpp"
+#include "support/randomness.hpp"
 
 #include <map>
 #include <unordered_set>
@@ -90,10 +90,9 @@ gbwt::GBWT build_gbwt_index() {
 
 // Build a GBWTGraph using the provided GBWT index.
 gbwtgraph::GBWTGraph build_gbwt_graph(const gbwt::GBWT& gbwt_index) {
-    Graph graph;
-    json2pb(graph, gapless_extender_graph.c_str(), gapless_extender_graph.size());
-    VG vg_graph(graph);
-    return gbwtgraph::GBWTGraph(gbwt_index, vg_graph);
+    bdsg::HashGraph graph;
+    vg::io::json2graph(gapless_extender_graph, &graph);
+    return gbwtgraph::GBWTGraph(gbwt_index, graph, nullptr);
 }
 
 void same_position(const Position& pos, const Position& correct) {
@@ -123,10 +122,10 @@ enum PinnedEnds {
 };
 
 void correct_score(const GaplessExtension& extension, const Aligner& aligner) {
-    int32_t expected_score = (extension.length() - extension.mismatches()) * aligner.match;
-    expected_score -= extension.mismatches() * aligner.mismatch;
-    expected_score += extension.left_full * aligner.full_length_bonus;
-    expected_score += extension.right_full * aligner.full_length_bonus;
+    int32_t expected_score = (extension.length() - extension.mismatches()) * aligner.scorer->match;
+    expected_score -= extension.mismatches() * aligner.scorer->mismatch;
+    expected_score += extension.left_full * aligner.scorer->full_length_bonus;
+    expected_score += extension.right_full * aligner.scorer->full_length_bonus;
     REQUIRE(extension.score == expected_score);
 }
 
@@ -135,15 +134,15 @@ void correct_score(const WFAAlignment& alignment, const Aligner& aligner, size_t
     for (auto& edit : alignment.edits) {
         switch (edit.first) {
         case WFAAlignment::match:
-            expected_score += edit.second * aligner.match;
+            expected_score += edit.second * aligner.scorer->match;
             break;
         case WFAAlignment::mismatch:
-            expected_score -= edit.second * aligner.mismatch;
+            expected_score -= edit.second * aligner.scorer->mismatch;
             break;
         case WFAAlignment::insertion:
             // Fall-through
         case WFAAlignment::deletion:
-            expected_score -= (aligner.gap_open + (edit.second - 1) * aligner.gap_extension);
+            expected_score -= (aligner.scorer->gap_open + (edit.second - 1) * aligner.scorer->gap_extension);
             break;
         default:
             REQUIRE(false);
@@ -154,13 +153,13 @@ void correct_score(const WFAAlignment& alignment, const Aligner& aligner, size_t
         if (!(ends & PINNED_RIGHT)) {
             // We might have a full length right end
             if (alignment.edits.back().first == WFAAlignment::match || alignment.edits.back().first == WFAAlignment::mismatch) {
-                expected_score += aligner.full_length_bonus;
+                expected_score += aligner.scorer->full_length_bonus;
             }
         }
         if (!(ends & PINNED_LEFT)) {
             // We might have a full length left end
             if (alignment.edits.front().first == WFAAlignment::match || alignment.edits.front().first == WFAAlignment::mismatch) {
-                expected_score += aligner.full_length_bonus;
+                expected_score += aligner.scorer->full_length_bonus;
             }
         }
     }
@@ -1131,7 +1130,7 @@ TEST_CASE("Non-ACGT characters do not match", "[gapless_extender]") {
         { static_cast<gbwt::vector_type::value_type>(gbwt::Node::encode(1, false)) }
     };
     gbwt::GBWT gbwt_index = get_gbwt(paths);
-    gbwtgraph::GBWTGraph gbwt_graph(gbwt_index, graph);
+    gbwtgraph::GBWTGraph gbwt_graph(gbwt_index, graph, nullptr);
 
 
     // Wrap it in a GaplessExtender with an Aligner.
@@ -1177,7 +1176,7 @@ TEST_CASE("Gapless extensions can be converted to WFAAlignments and joined", "[w
         },
         0, gbwt::BidirectionalState(),
         { 0, 4 }, { },
-        4 * aligner.match, false, false,
+        4 * aligner.scorer->match, false, false,
         false, false, 0, 0
     };
     correct_score(a, aligner);
@@ -1196,7 +1195,7 @@ TEST_CASE("Gapless extensions can be converted to WFAAlignments and joined", "[w
         },
         0, gbwt::BidirectionalState(),
         { 4, 8 }, { },
-        4 * aligner.match, false, false,
+        4 * aligner.scorer->match, false, false,
         false, false, 0, 0
     };
     // And turn it into a WFAAlignment
@@ -1225,7 +1224,7 @@ TEST_CASE("Gapless extensions can be converted to WFAAlignments and joined", "[w
     REQUIRE(joined.path.at(3) == gbwt_graph.get_handle(6, false));
     REQUIRE(joined.path.at(4) == gbwt_graph.get_handle(8, false));
     REQUIRE(joined.path.at(5) == gbwt_graph.get_handle(9, false));
-    REQUIRE(joined.score == 8 * aligner.match);
+    REQUIRE(joined.score == 8 * aligner.scorer->match);
 }
 
 namespace {
@@ -1241,11 +1240,11 @@ gbwt::GBWT wfa_linear_gbwt() {
 }
 
 gbwtgraph::GBWTGraph wfa_linear_graph(const gbwt::GBWT& index) {
-    gbwtgraph::SequenceSource source;
-    source.add_node(1, "CGC");
-    source.add_node(2, "GATTACA");
-    source.add_node(3, "GATTA");
-    source.add_node(4, "TAT");
+    gbwtgraph::NaiveGraph source;
+    source.create_node(1, "CGC");
+    source.create_node(2, "GATTACA");
+    source.create_node(3, "GATTA");
+    source.create_node(4, "TAT");
     return gbwtgraph::GBWTGraph(index, source);
 }
 
@@ -1278,32 +1277,32 @@ gbwt::GBWT wfa_general_gbwt() {
 }
 
 gbwtgraph::GBWTGraph wfa_general_graph(const gbwt::GBWT& index) {
-    gbwtgraph::SequenceSource source;
+    gbwtgraph::NaiveGraph source;
 
     // Start.
-    source.add_node(1, "CGC");
-    source.add_node(2, "GATTACA");
+    source.create_node(1, "CGC");
+    source.create_node(2, "GATTACA");
 
     // Simple bubble.
-    source.add_node(3, "G");
-    source.add_node(4, "C");
+    source.create_node(3, "G");
+    source.create_node(4, "C");
 
     // Middle.
-    source.add_node(5, "ATTA");
+    source.create_node(5, "ATTA");
 
     // Nondeterministic bubble.
-    source.add_node(6, "TG");
-    source.add_node(7, "TC");
+    source.create_node(6, "TG");
+    source.create_node(7, "TC");
 
     // Middle.
-    source.add_node(8, "GAA");
+    source.create_node(8, "GAA");
 
     // Bubble that depends on the nondeterministic choice.
-    source.add_node(9, "CAT");
-    source.add_node(10, "GTA");
+    source.create_node(9, "CAT");
+    source.create_node(10, "GTA");
 
     // End.
-    source.add_node(11, "TAT");
+    source.create_node(11, "TAT");
 
     return gbwtgraph::GBWTGraph(index, source);
 }
@@ -1335,10 +1334,10 @@ gbwt::GBWT wfa_cycle_gbwt() {
 }
 
 gbwtgraph::GBWTGraph wfa_cycle_graph(const gbwt::GBWT& index) {
-    gbwtgraph::SequenceSource source;
-    source.add_node(1, "CGC");
-    source.add_node(2, "GA");
-    source.add_node(3, "TAT");
+    gbwtgraph::NaiveGraph source;
+    source.create_node(1, "CGC");
+    source.create_node(2, "GA");
+    source.create_node(3, "TAT");
     return gbwtgraph::GBWTGraph(index, source);
 }
 
@@ -1379,12 +1378,12 @@ gbwt::GBWT wfa_non_diverging_multi_node_cycle_gbwt() {
 }
 
 gbwtgraph::GBWTGraph wfa_non_diverging_multi_node_cycle_graph(const gbwt::GBWT& index) {
-    gbwtgraph::SequenceSource source;
-    source.add_node(1, "CATTAG");
-    source.add_node(2, "GA");
-    source.add_node(3, "TTA");
-    source.add_node(4, "CA");
-    source.add_node(5, "TATAGAGA");
+    gbwtgraph::NaiveGraph source;
+    source.create_node(1, "CATTAG");
+    source.create_node(2, "GA");
+    source.create_node(3, "TTA");
+    source.create_node(4, "CA");
+    source.create_node(5, "TATAGAGA");
     return gbwtgraph::GBWTGraph(index, source);
 }
 
@@ -1393,7 +1392,7 @@ void check_score(const WFAAlignment& alignment, const Aligner& aligner, int32_t 
     // cap count and total length. So convert total length to number of
     // extends.
     int32_t extensions = gap_length - gaps;
-    int32_t expected_score = matches * aligner.match - mismatches * aligner.mismatch - gaps * aligner.gap_open - extensions * aligner.gap_extension + full_length_ends * aligner.full_length_bonus;
+    int32_t expected_score = matches * aligner.scorer->match - mismatches * aligner.scorer->mismatch - gaps * aligner.scorer->gap_open - extensions * aligner.scorer->gap_extension + full_length_ends * aligner.scorer->full_length_bonus;
     if (alignment.score != expected_score) {
         // Log a bit about what we don't like about this alignment.
         std::cerr << "Expected " << matches << " matches, " << mismatches << " mismatches, and " << gaps << " gaps of total length " << gap_length << ", with " << full_length_ends << " full-length ends, for total score " << expected_score << std::endl;
@@ -1416,7 +1415,7 @@ void check_unlocalized_insertion(const WFAAlignment& alignment, const std::strin
     REQUIRE(alignment.seq_offset == 0);
     REQUIRE(alignment.length == sequence.length());
 
-    int32_t gap_score = -aligner.gap_open - (int32_t(alignment.length) - 1) * aligner.gap_extension;
+    int32_t gap_score = -aligner.scorer->gap_open - (int32_t(alignment.length) - 1) * aligner.scorer->gap_extension;
     REQUIRE(alignment.score == gap_score);
 }
 
@@ -1615,8 +1614,8 @@ TEST_CASE("Exact matches in a linear graph with full length bonus", "[wfa_extend
     gbwtgraph::GBWTGraph graph = wfa_linear_graph(index);
     Aligner aligner;
     // Rely on some scoring parameters we know for this test
-    REQUIRE(aligner.match == 1);
-    REQUIRE(aligner.full_length_bonus == 5);
+    REQUIRE(aligner.scorer->match == 1);
+    REQUIRE(aligner.scorer->full_length_bonus == 5);
     WFAExtender extender(graph, aligner);
 
     SECTION("Single node, prefix") {

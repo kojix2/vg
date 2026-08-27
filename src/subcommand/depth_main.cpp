@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <sstream>
 
 #include "subcommand.hpp"
 
@@ -25,30 +26,42 @@ using namespace std;
 using namespace vg;
 using namespace vg::subcommand;
 
+const size_t DEFAULT_MAX_NODES = 1000000;
+const size_t DEFAULT_MIN_MAPQ = 0;
+const size_t DEFAULT_BIN_SIZE = 1;
+const size_t DEFAULT_MIN_COVERAGE = 1;
+
 void help_depth(char** argv) {
     cerr << "usage: " << argv[0] << " depth [options] <graph>" << endl
          << "options:" << endl
-         << "  packed coverage depth (print 1-based positional depths along path):" << endl
-         << "    -k, --pack FILE        supports created from vg pack for given input graph" << endl
-         << "    -d, --count-dels       count deletion edges within the bin as covering reference positions" << endl
-         << "  GAM/GAF coverage depth (print <mean> <stddev> for depth):" << endl
-         << "    -g, --gam FILE         read alignments from this GAM file (could be '-' for stdin)" << endl
-         << "    -a, --gaf FILE         read alignments from this GAF file (could be '-' for stdin)" << endl
-         << "    -n, --max-nodes N      maximum nodes to consider [1000000]" << endl
-         << "    -s, --random-seed N    random seed for sampling nodes to consider" << endl
-         << "    -Q, --min-mapq N       ignore alignments with mapping quality < N [0]" << endl
-         << "  path coverage depth (print 1-based positional depths along path):" << endl
-         << "     activate by specifiying -p without -k" << endl
-         << "    -c, --count-cycles     count each time a path steps on a position (by default paths are only counted once)" << endl
-         << "  common options:" << endl
-         << "    -p, --ref-path NAME    reference path to call on (multipile allowed.  defaults to all paths)" << endl
-         << "    -P, --paths-by STR     select the paths with the given name prefix" << endl        
-         << "    -b, --bin-size N       bin size (in bases) [1] (2 extra columns printed when N>1: bin-end-pos and stddev)" << endl
-         << "    -m, --min-coverage N   ignore nodes with less than N coverage depth [1]" << endl
-         << "    -t, --threads N        number of threads to use [all available]" << endl;
+         << "packed coverage depth (print 1-based positional depths along path):" << endl
+         << "  -k, --pack FILE        supports created from vg pack for given input graph" << endl
+         << "  -d, --count-dels       count deletion edges within the bin" << endl
+         << "                         as covering reference positions" << endl
+         << "GAM/GAF coverage depth (print <mean> <stddev> for depth):" << endl
+         << "  -g, --gam FILE         read alignments from this GAM file ('-' for stdin)" << endl
+         << "  -a, --gaf FILE         read alignments from this GAF file ('-' for stdin)" << endl
+         << "  -n, --max-nodes N      maximum nodes to consider [" << DEFAULT_MAX_NODES << "]" << endl
+         << "  -s, --random-seed N    random seed for sampling nodes to consider" << endl
+         << "  -Q, --min-mapq N       ignore alignments with mapping quality < N " 
+                                  << "[" << DEFAULT_MIN_MAPQ << "]" << endl
+         << "path coverage depth (print 1-based positional depths along path):" << endl
+         << "   activate by specifiying -p without -k" << endl
+         << "  -c, --count-cycles     count each time a path steps on a position" << endl
+         << "                         (by default paths are only counted once)" << endl
+         << "common options:" << endl
+         << "  -p, --ref-path NAME    reference path to call on (may repeat; defaults all)" << endl
+         << "  -P, --paths-by STR     select the paths with the given name prefix" << endl        
+         << "  -b, --bin-size N       bin size (in bases) [" << DEFAULT_BIN_SIZE << "]" << endl
+         << "                         2 extra columns printed when N>1: bin-end-pos & stddev" << endl
+         << "  -m, --min-coverage N   ignore nodes with less than N coverage depth "
+                                  << "[" << DEFAULT_MIN_COVERAGE << "]" << endl
+         << "  -t, --threads N        number of threads to use [all available]" << endl
+         << "  -h, --help             print this help message to stderr and exit" << endl;
 }
 
 int main_depth(int argc, char** argv) {
+    Logger logger("vg depth");
 
     if (argc == 2) {
         help_depth(argv);
@@ -58,17 +71,18 @@ int main_depth(int argc, char** argv) {
     string pack_filename;
     unordered_set<string> ref_paths_input_set;
     vector<string> path_prefixes;
-    size_t bin_size = 1;
+    size_t bin_size = DEFAULT_BIN_SIZE;
     bool count_dels = false;
     
     string gam_filename;
     string gaf_filename;
-    size_t max_nodes = 1000000;
+    size_t max_nodes = DEFAULT_MAX_NODES;
     int random_seed = time(NULL);
+    const int initial_random_seed = random_seed;
     size_t min_mapq = 0;
     bool count_cycles = false;
 
-    size_t min_coverage = 1;
+    size_t min_coverage = DEFAULT_MIN_COVERAGE;
 
     int c;
     optind = 2; // force optind past command positional argument
@@ -81,7 +95,7 @@ int main_depth(int argc, char** argv) {
             {"bin-size", required_argument, 0, 'b'},
             {"count-dels", no_argument, 0, 'd'},
             {"gam", required_argument, 0, 'g'},
-            {"gaf", no_argument, 0, 'a'},
+            {"gaf", required_argument, 0, 'a'},
             {"max-nodes", required_argument, 0, 'n'},
             {"random-seed", required_argument, 0, 's'},
             {"min-mapq", required_argument, 0, 'Q'},
@@ -93,8 +107,8 @@ int main_depth(int argc, char** argv) {
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hk:p:P:b:dg:a:n:s:m:ct:",
-                long_options, &option_index);
+        c = getopt_long (argc, argv, "h?k:p:P:b:dg:a:n:s:Q:m:ct:",
+                         long_options, &option_index);
 
         // Detect the end of the options.
         if (c == -1)
@@ -103,7 +117,7 @@ int main_depth(int argc, char** argv) {
         switch (c)
         {
         case 'k':
-            pack_filename = optarg;
+            pack_filename = require_exists(logger, optarg);
             break;
         case 'p':
             ref_paths_input_set.insert(optarg);
@@ -118,10 +132,10 @@ int main_depth(int argc, char** argv) {
             count_dels = true;
             break;            
         case 'g':
-            gam_filename = optarg;
+            gam_filename = require_exists(logger, optarg);
             break;
         case 'a':
-            gaf_filename = optarg;
+            gaf_filename = require_exists(logger, optarg);
             break;
         case 'n':
             max_nodes = parse<size_t>(optarg);
@@ -139,15 +153,8 @@ int main_depth(int argc, char** argv) {
             count_cycles = true;
             break;
         case 't':
-        {
-            int num_threads = parse<int>(optarg);
-            if (num_threads <= 0) {
-                cerr << "error:[vg depth] Thread count (-t) set to " << num_threads << ", must set to a positive integer." << endl;
-                exit(1);
-            }
-            omp_set_num_threads(num_threads);
+            set_thread_count(logger, optarg);
             break;
-        }
         case 'h':
         case '?':
             /* getopt_long already printed an error message. */
@@ -164,12 +171,30 @@ int main_depth(int argc, char** argv) {
         return 1;
     }
 
-    size_t input_count = pack_filename.empty() ? 0 : 1;
+    size_t input_count = 0;
+    if (!pack_filename.empty()) ++input_count;
     if (!gam_filename.empty()) ++input_count;
     if (!gaf_filename.empty()) ++input_count;
-    if (input_count > 1) {                                          
-        cerr << "error:[vg depth] At most one of a pack file (-k), a GAM file (-g), or a GAF file (-a) must be given" << endl;
-        exit(1);
+    if (input_count > 1) {
+        logger.error() << "At most one of a pack file (-k), a GAM file (-g), "
+                             << "or a GAF file (-a) must be given" << endl;   
+    }
+    if (pack_filename.empty() && count_dels) {
+        logger.error() << "--count-dels requires a pack file" << endl;
+    }
+    if (gam_filename.empty() && gaf_filename.empty()) {
+        if (max_nodes != DEFAULT_MAX_NODES || random_seed != initial_random_seed
+            || min_mapq != DEFAULT_MIN_MAPQ) {
+            logger.error() << "The --max-nodes, --random-seed, and --min-mapq options "
+                           << "require a GAM or GAF file" << endl;
+        }
+    } else {
+        if (!ref_paths_input_set.empty() || !path_prefixes.empty() || bin_size != DEFAULT_BIN_SIZE) {
+            logger.error() << "Cannot specify paths (-p/-P) or --bin-size for a GAM or GAF" << endl;
+        }
+    }
+    if (count_cycles && input_count == 0) {
+        logger.error() << "--count-cycles is only supported for path coverage depth" << endl;
     }
 
     // Read the graph
@@ -198,7 +223,7 @@ int main_depth(int argc, char** argv) {
         map<pair<string, int64_t>, string> ref_paths;
         unordered_set<string> base_path_set;
         
-        graph->for_each_path_handle([&](path_handle_t path_handle) {
+        auto select_path = [&](const path_handle_t& path_handle) {
                 string path_name = graph->get_path_name(path_handle);
                 subrange_t subrange;
                 string base_name = Paths::strip_subrange(path_name, &subrange);
@@ -210,7 +235,7 @@ int main_depth(int argc, char** argv) {
                 if (!use_it && ref_paths_input_set.count(base_name)) {
                     use_it = true;
                 }
-                
+
                 // then look in the prefixes
                 for (size_t i = 0; i < path_prefixes.size() && !use_it; ++i) {
                     if (path_name.substr(0, path_prefixes[i].length()) == path_prefixes[i]) {
@@ -222,19 +247,65 @@ int main_depth(int argc, char** argv) {
                     assert(!ref_paths.count(coord));
                     ref_paths[coord] = path_name;
                 }
-            });
+        };
+
+        if (pack_filename.empty()) {
+            // Path coverage: include HAPLOTYPE sense so haplotype paths stored
+            // in GBZ/GBWT contribute.  On non-GBZ graphs this is equivalent to
+            // the default for_each_path_handle iteration.
+            static const std::unordered_set<PathSense> path_senses{
+                PathSense::REFERENCE, PathSense::GENERIC, PathSense::HAPLOTYPE
+            };
+            graph->for_each_path_of_sense(path_senses, select_path);
+        } else {
+            // Pack coverage (-k): preserve prior behavior and skip haplotype
+            // paths, which the packed supports don't index by default.
+            graph->for_each_path_handle(select_path);
+        }
         
         for (const auto& ref_name : ref_paths_input_set) {
             if (!base_path_set.count(ref_name)) {
-                cerr << "error:[vg depth] Path \"" << ref_name << "\" not found in graph" << endl;
+                logger.error() << "Path \"" << ref_name << "\" not found in graph" << endl;
             }
         }
 
+        // Flatten ref_paths into a vector so we can OpenMP over indices.  The
+        // map already orders entries by (base_name, subpath_offset); preserve
+        // that ordering for deterministic output.
+        vector<tuple<string, string, size_t>> ordered_paths;
+        ordered_paths.reserve(ref_paths.size());
         for (const auto& ref_coord_path : ref_paths) {
-            const string& ref_path = ref_coord_path.second;
-            const string& base_path = ref_coord_path.first.first;
-            const size_t subpath_offset = ref_coord_path.first.second;
-            
+            ordered_paths.emplace_back(ref_coord_path.first.first,
+                                       ref_coord_path.second,
+                                       ref_coord_path.first.second);
+        }
+
+        // Outer parallelism is across paths.  The binned depth helpers have
+        // their own inner `#pragma omp parallel for`; when we're running the
+        // outer region cap active levels so those don't nest and over-subscribe
+        // the CPU.  With a single path we skip the outer region entirely so the
+        // inner parallelism still runs -- binning remains useful.
+        int saved_max_levels = omp_get_max_active_levels();
+        const bool parallel_outer = ordered_paths.size() > 1;
+        if (parallel_outer) {
+            omp_set_max_active_levels(1);
+        }
+
+        // Collect each path's output into its own slot so threads never block
+        // on emission.  Avoids the `#pragma omp ordered` pitfall where a thread
+        // that finishes a short iteration has to wait for earlier (potentially
+        // much longer) iterations to emit before it can pick up new work.
+        // Emitting serially after the parallel region preserves path order.
+        vector<string> path_output(ordered_paths.size());
+
+#pragma omp parallel for schedule(dynamic, 1) if(parallel_outer)
+        for (size_t i = 0; i < ordered_paths.size(); ++i) {
+            const string& base_path = get<0>(ordered_paths[i]);
+            const string& ref_path = get<1>(ordered_paths[i]);
+            const size_t subpath_offset = get<2>(ordered_paths[i]);
+
+            ostringstream buf;
+
             if (bin_size > 1) {
                 vector<tuple<size_t, size_t, double, double>> binned_depth;
                 if (!pack_filename.empty()) {
@@ -243,23 +314,33 @@ int main_depth(int argc, char** argv) {
                     binned_depth = algorithms::binned_path_depth(*graph, ref_path, bin_size, min_coverage, count_cycles);
                 }
                 for (auto& bin_cov : binned_depth) {
-                    // bins can ben nan if min_coverage filters everything out.  just skip
+                    // bins can be nan if min_coverage filters everything out.  just skip
                     if (!isnan(get<3>(bin_cov))) {
-                        cout << base_path << "\t" << (get<0>(bin_cov) + 1 + subpath_offset)<< "\t" << (get<1>(bin_cov) + 1 + subpath_offset) << "\t" << get<2>(bin_cov)
-                             << "\t" << sqrt(get<3>(bin_cov)) << endl;
+                        buf << base_path << "\t" << (get<0>(bin_cov) + 1 + subpath_offset)<< "\t" << (get<1>(bin_cov) + 1 + subpath_offset) << "\t" << get<2>(bin_cov)
+                            << "\t" << sqrt(get<3>(bin_cov)) << "\n";
                     }
                 }
             } else {
                 if (!pack_filename.empty()) {
-                    algorithms::packed_depths(*packer, ref_path, min_coverage, cout);
+                    algorithms::packed_depths(*packer, ref_path, min_coverage, buf);
                 } else {
-                    algorithms::path_depths(*graph, ref_path, min_coverage, count_cycles, cout);
+                    algorithms::path_depths(*graph, ref_path, min_coverage, count_cycles, buf);
                 }
             }
+
+            path_output[i] = buf.str();
+        }
+
+        if (parallel_outer) {
+            omp_set_max_active_levels(saved_max_levels);
+        }
+
+        for (const string& s : path_output) {
+            cout << s;
         }
     }
 
-    // Process the gam
+    // Process the GAM
     if (!gam_filename.empty() || !gaf_filename.empty()) {
         const string& mapping_filename = !gam_filename.empty() ? gam_filename : gaf_filename;
         pair<double, double> mapping_cov;

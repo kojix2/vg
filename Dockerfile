@@ -3,7 +3,7 @@
 # Use Google's non-rate-limited mirror of Docker Hub to get our base image.
 # This helps automated Quay builds because Quay hasn't built a caching system
 # and exposes pull rate limits to users.
-FROM mirror.gcr.io/library/ubuntu:20.04 AS base
+FROM mirror.gcr.io/library/ubuntu:26.04 AS base
 MAINTAINER vgteam
 
 RUN echo base > /stage.txt
@@ -14,7 +14,7 @@ WORKDIR /vg
 ENV DEBIAN_FRONTEND noninteractive
 ENV DEBCONF_NONINTERACTIVE_SEEN true
 
-FROM base AS build
+FROM base AS packages
 ARG THREADS=8
 ARG TARGETARCH
 
@@ -23,11 +23,10 @@ ARG TARGETARCH
 ARG VG_GIT_VERSION
 ENV VG_GIT_VERSION=${VG_GIT_VERSION:-unknown}
 
-RUN echo build > /stage.txt
+RUN echo packages > /stage.txt
 
 RUN apt-get -qq -y update && \
-    apt-get -qq -y upgrade && \
-    apt-get -qq -y install sudo
+    apt-get -qq -y install --no-upgrade sudo
 
 # Install all vg's dependencies.
 # The Makefile will come parse the Dockerfile to get the correct dependencies;
@@ -38,17 +37,24 @@ RUN apt-get -qq -y update && \
 # that starts with RUN, or comments. And we pull out line continuation slashes.
 # TODO: can we read them here and in the Makefile from the README instead?
 ###DEPS_BEGIN###
-RUN apt-get -qq -y update && apt-get -qq -y upgrade && apt-get -qq -y install \
+RUN apt-get -qq -y update && apt-get -y install --no-upgrade \
     make git build-essential protobuf-compiler libprotoc-dev libjansson-dev libbz2-dev \
     libncurses5-dev automake gettext autopoint libtool jq bsdmainutils bc rs parallel npm \
     samtools curl unzip redland-utils librdf-dev cmake pkg-config wget gtk-doc-tools \
     raptor2-utils rasqal-utils bison flex gawk libgoogle-perftools-dev liblz4-dev liblzma-dev \
-    libcairo2-dev libpixman-1-dev libffi-dev libcairo-dev libprotobuf-dev libboost-all-dev \
-    tabix bcftools libzstd-dev pybind11-dev python3-pybind11
+    libffi-dev libfontconfig-dev libfreetype-dev libglib2.0-dev libpcre2-dev libpng-dev \
+    libprotobuf-dev libboost-all-dev tabix bcftools libzstd-dev pybind11-dev \
+    python3-pybind11 pandoc libssl-dev libjitterentropy3-dev kmc meson
 ###DEPS_END###
+# TODO: libjitterentropy3-dev ought to be a dependency of libssl-dev, since the
+# static libcrypto.a library in libssl-dev needs it, but as of 3.5.5-1ubuntu3.2
+# it isn't, and we need to pull it in manually.
+
+FROM packages AS build
+
+RUN echo build > /stage.txt
 
 # Prepare to build submodule dependencies
-COPY source_me.sh /vg/source_me.sh
 COPY deps /vg/deps
 # To increase portability of the docker image, when building for amd64, set the
 # target CPU architecture to Nehalem (2008) rather than auto-detecting the
@@ -58,18 +64,20 @@ RUN if [ -z "${TARGETARCH}" ] || [ "${TARGETARCH}" = "amd64" ] ; then sed -i s/m
 # Clear any CMake caches in case we are building from someone's checkout
 RUN find . -name CMakeCache.txt | xargs rm -f
 # Build the dependencies
+COPY pre-build.sh /vg/pre-build.sh
 COPY Makefile /vg/Makefile
-RUN . ./source_me.sh && CXXFLAGS="$(if [ -z "${TARGETARCH}" ] || [ "${TARGETARCH}" = "amd64" ] ; then echo " -march=nehalem "; fi)" CFLAGS="$(if [ -z "${TARGETARCH}" ] || [ "${TARGETARCH}" = "amd64" ] ; then echo " -march=nehalem "; fi)" make -j $((THREADS < $(nproc) ? THREADS : $(nproc))) deps
+# Turn off user-defined conversion warning until https://github.com/greg7mdp/sparsepp/issues/98 can be fixed
+RUN CXXFLAGS="$(if [ -z "${TARGETARCH}" ] || [ "${TARGETARCH}" = "amd64" ] ; then echo " -march=nehalem "; fi) -Wno-cast-user-defined" CFLAGS="$(if [ -z "${TARGETARCH}" ] || [ "${TARGETARCH}" = "amd64" ] ; then echo " -march=nehalem "; fi)" make -j $((THREADS < $(nproc) ? THREADS : $(nproc))) deps
 
 # Bring in the sources, which we need in order to build.
 COPY src /vg/src
 
 # Build all the object files for vg, but don't link.
 # Also pass the arch here
-RUN . ./source_me.sh && CXXFLAGS="$(if [ -z "${TARGETARCH}" ] || [ "${TARGETARCH}" = "amd64" ] ; then echo " -march=nehalem "; fi)" make -j $((THREADS < $(nproc) ? THREADS : $(nproc))) objs
+RUN CXXFLAGS="$(if [ -z "${TARGETARCH}" ] || [ "${TARGETARCH}" = "amd64" ] ; then echo " -march=nehalem "; fi) -Wno-cast-user-defined" make -j $((THREADS < $(nproc) ? THREADS : $(nproc))) objs
 
 # Do the final build and link, knowing the version. Trim down the resulting binary but make sure to include enough debug info for profiling.
-RUN . ./source_me.sh && CXXFLAGS="$(if [ -z "${TARGETARCH}" ] || [ "${TARGETARCH}" = "amd64" ] ; then echo " -march=nehalem "; fi)" make -j $((THREADS < $(nproc) ? THREADS : $(nproc))) static && strip -d bin/vg
+RUN CXXFLAGS="$(if [ -z "${TARGETARCH}" ] || [ "${TARGETARCH}" = "amd64" ] ; then echo " -march=nehalem "; fi) -Wno-cast-user-defined" make -j $((THREADS < $(nproc) ? THREADS : $(nproc))) static && strip -d bin/vg
 
 # Ship the scripts
 COPY scripts /vg/scripts
@@ -109,7 +117,6 @@ RUN echo run > /stage.txt
 # Make sure to clean so we don't ship old apt package indexes in our Docker.
 RUN ls -lah /vg && \
     apt-get -qq -y update && \
-    apt-get -qq -y upgrade && \
     apt-get -qq -y install --no-upgrade \
     curl \
     wget \
@@ -123,7 +130,7 @@ RUN ls -lah /vg && \
     fontconfig-config \
     awscli \
     binutils \
-    libpython2.7 \
+    python3 \
     libperl-dev \
     libelf1 \
     libdw1 \

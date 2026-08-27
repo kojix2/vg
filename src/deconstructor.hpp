@@ -6,12 +6,15 @@
 #include <sstream>
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include "genotypekit.hpp"
 #include "Variant.h"
 #include "handle.hpp"
 #include "traversal_finder.hpp"
 #include "graph_caller.hpp"
 #include "lru_cache.h"
+
+#include <gbwtgraph/utils.h>
 
 /** \file
 * Deconstruct is getting rewritten.
@@ -46,8 +49,8 @@ public:
                      bool strict_conflicts,
                      bool long_ref_contig,
                      double cluster_threshold = 1.0,
+                     int64_t cluster_min_allele_len = 0,
                      gbwt::GBWT* gbwt = nullptr,
-                     bool nested_decomposition = false,
                      bool star_allele = false);
     
 private:
@@ -55,42 +58,51 @@ private:
     // initialize the vcf and get the header 
     string get_vcf_header();
 
+    // Test if a path is the reference we're deconstructing against, seen through the
+    // other half of the base/gref pair (a gref path when deconstructing against the
+    // base reference, or the base path of a selected gref reference).  Such a path is
+    // not a sample: it would genotype as all-reference and inflate AC/AF/AN/NS.
+    bool is_other_reference_view(const string& path_name) const;
+
+    // Samples that exist only as the other view (base or gref) of a selected reference.
+    set<string> other_ref_samples;
+
     // the header needs to be initialized *before* construction for vcflib
     // but we don't know all the non-ref contigs (in nested mode) until *after*
     // construction.  end result: this hacky function to patch them in before printing
     string add_contigs_to_vcf_header(const string& vcf_header) const;
     
-    // deconstruct all snarls in parallel (ie nesting relationship ignored)
+    // Simple flat processing: collect all snarls then process in parallel.
+    // More memory-efficient when star alleles aren't needed.
     void deconstruct_graph(SnarlManager* snarl_manager);
 
-    // deconstruct all top-level snarls in parallel
-    // nested snarls are processed after their parents in the same thread
-    // (same logic as vg call)
+    // Top-down processing: process snarls level by level, passing context to children.
+    // Required for star allele detection (context tracks parent haplotypes).
     void deconstruct_graph_top_down(SnarlManager* snarl_manager);
 
-    // some information we pass from parent to child site when
-    // doing nested deconstruction
-    struct NestingInfo {
-        bool has_ref;
-        vector<pair<handle_t, handle_t>> child_snarls;
-        PathInterval parent_path_interval;
-        unordered_map<string, vector<int>> sample_to_haplotypes;
-        int parent_allele;
-        int64_t parent_len;
-        int64_t parent_ref_len;
-        string lv0_ref_name;
-        int64_t lv0_ref_start;
-        int64_t lv0_ref_len;
-        int64_t lv0_alt_len;
+    // Context passed from parent to child site for nested deconstruction.
+    // Used for star allele detection: samples in parent but not in child get * allele.
+    // Note: context is only populated when star_allele is enabled.
+    // Note: context is NOT passed when parent has multiple reference traversals (cycles).
+    struct ChildContext {
+        // Map from sample name to vector of haplotype phases that traversed the parent snarl.
+        // Child compares against its own traversals to detect star alleles.
+        // Format matches what add_star_traversals() expects.
+        // Uses shared_ptr so all children of a snarl share the same map (memory optimization).
+        std::shared_ptr<const unordered_map<string, vector<int>>> sample_to_haplotypes;
+
+        // Check if context is populated
+        bool empty() const { return !sample_to_haplotypes || sample_to_haplotypes->empty(); }
     };
-    
+
     // write a vcf record for the given site.  returns true if a record was written
     // (need to have a path going through the site)
-    // the nesting_info structs are optional and used to pass reference information through nested sites...
-    // the output nesting_info vector writes a record for each child snarl
+    // in_context: optional context from parent (for star allele detection)
+    // out_child_contexts: if provided, populated with contexts for each child snarl
+    //                     (only populated when site has exactly one reference traversal)
     bool deconstruct_site(const handle_t& snarl_start, const handle_t& snarl_end,
-                          const NestingInfo* in_nesting_info = nullptr,
-                          vector<NestingInfo>* out_nesting_infos = nullptr) const;
+                          const ChildContext* in_context = nullptr,
+                          vector<ChildContext>* out_child_contexts = nullptr) const;
 
     // get the traversals for a given site
     // this returns a combination of embedded path traversals and gbwt traversals
@@ -101,15 +113,10 @@ private:
                         vector<string>& out_trav_path_names,
                         vector<pair<step_handle_t, step_handle_t>>& out_trav_steps) const;
 
-    // this is a hack to add in * alleles -- these are haplotypes that we genotyped in the
-    // parent but aren't represented in any of the traversals found in the current
-    // site. *-alleles are represented as empty traversals.
-    // todo: conflicts arising from alt-cycles will be able to lead to conflicting
-    // results -- need to overhaul code to pass more detailed traversal information
-    // from parent to child to have a chance at consistently resolving
-    // star traversals are appended onto travs and trav_names
-    // this funtion returns a map containing both parent and child haploty
-    unordered_map<string, vector<int>> add_star_traversals(vector<Traversal>& travs,    
+    // Add star (*) alleles for haplotypes that were genotyped in the parent but don't
+    // have a traversal through the current site. Star alleles are represented as empty
+    // traversals. Returns a map of sample name to haplotype phases (both parent and child).
+    unordered_map<string, vector<int>> add_star_traversals(vector<Traversal>& travs,
                                                            vector<string>& trav_names,
                                                            vector<vector<int>>& trav_clusters,
                                                            vector<pair<double, int64_t>>& trav_cluster_info,
@@ -151,17 +158,13 @@ private:
     // we can also use a gbwt for traversals
     unique_ptr<GBWTTraversalFinder> gbwt_trav_finder;
     // When using the gbwt we need some precomputed information to ask about stored paths.
-    unordered_set<string> gbwt_reference_samples;
+    gbwtgraph::sample_name_set gbwt_reference_samples;
     
     // infer ploidys from gbwt when possible
     unordered_map<string, pair<int, int>> gbwt_sample_to_phase_range;
 
     // the ref paths
     set<string> ref_paths;
-
-    // the off-ref paths that may be found during nested deconstruction
-    // (buffered by thread)
-    mutable vector<unordered_set<path_handle_t>> off_ref_paths;
 
     // keep track of reference samples
     set<string> ref_samples;
@@ -171,9 +174,6 @@ private:
     
     // keep track of the non-ref paths as they will be our samples
     set<string> sample_names;
-
-    // map the path name to the sample in the vcf
-    const unordered_map<string, pair<string, int>>* path_to_sample_phase;
 
     // the sample ploidys given in the phases in our path names
     unordered_map<string, int> sample_ploidys;
@@ -194,18 +194,20 @@ private:
     bool keep_conflicted_genotypes = false;
 
     // used to merge together similar traversals (to keep allele counts down)
-    // currently implemented as handle jaccard coefficient.  So 1 means only
+    // currently a length-weighted similarity (see weighted_traversal_similarity).  So 1 means only
     // merge if identical (which is what deconstruct has always done)
     double cluster_threshold = 1.0;
 
-    // activate the new nested decomposition mode, which is like the old include_nested
-    // (which lives in vcfoutputcaller) but with more of an effort to link
-    // the parent and child snarls, as well as better support for nested insertions
-    bool nested_decomposition = false;
+    // only apply cluster_threshold at sites whose core length is at least this many bp.  0
+    // disables the gate (so cluster_threshold applies at every site).  See
+    // VCFOutputCaller::allele_core_length for what "core length" means and why it, rather than the
+    // raw snarl interior, is the right measure -- it is what lets vg call and vg deconstruct gate
+    // the same variant the same way despite emitting differently flattened records.
+    int64_t cluster_min_allele_len = 0;
 
-    // use *-alleles to represent spanning alleles that do not cross site but do go around it
-    // ex: a big containing deletion
-    // only works with nested_decomposition
+    // use *-alleles to represent haplotypes that span the parent site but don't
+    // traverse the current nested site (e.g., a deletion that spans a nested SNP)
+    // only works with include_nested
     bool star_allele = false;
 };
 

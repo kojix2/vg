@@ -5,18 +5,20 @@
  */
 
 #include "nearest_offsets_in_paths.hpp"
+#include "../crash.hpp"
 
-//#define debug
+// #define debug
+// #define debug_algorithms
 
 namespace vg {
 namespace algorithms {
 
 using namespace std;
 
-path_offset_collection_t nearest_offsets_in_paths(const PathPositionHandleGraph* graph,
-                                                  const pos_t& pos,
-                                                  int64_t max_search,
-                                                  const std::function<bool(const path_handle_t&)>* path_filter) {
+path_offset_collection_t nearest_offsets_in_paths(const PathPositionHandleGraph* graph,  const pos_t& pos, int64_t max_search,
+                                                  const std::unordered_set<PathSense>& desired_senses,
+                                                  const std::function<bool(const path_handle_t&)>* path_filter,
+                                                  bool subtract_traversal_dist, pair<size_t, bool>* traversal_dist) {
     
     // init the return value
     // This is a map from path handle, to vector of offset and orientation pairs
@@ -45,8 +47,8 @@ path_offset_collection_t nearest_offsets_in_paths(const PathPositionHandleGraph*
         cerr << "traversing " << graph->get_id(here) << (graph->get_is_reverse(here) ? "-" : "+")
         << " in " << (search_left ? "leftward" : "rightward") << " direction at distance " << dist << endl;
 #endif
-        
-        for (const step_handle_t& step : graph->steps_of_handle(here)) {
+       
+        graph->for_each_step_of_sense(here, desired_senses, [&](const step_handle_t& step) {
             // For each path visit that occurs on this node
 #ifdef debug
             cerr << "handle is on step at path offset " << graph->get_position_of_step(step) << endl;
@@ -57,11 +59,11 @@ path_offset_collection_t nearest_offsets_in_paths(const PathPositionHandleGraph*
             if (path_filter && !(*path_filter)(path_handle)) {
                 // We are to ignore this path
 #ifdef debug
-                cerr << "handle is on ignored path " << graph->get_name(path_handle) << endl;
+                cerr << "handle is on ignored path " << graph->get_path_name(path_handle) << endl;
 #endif
-                continue;
+                return;
             }
-            
+
             // flip the handle back to the orientation it started in
             handle_t oriented = search_left ? graph->flip(here) : here;
             
@@ -72,10 +74,11 @@ path_offset_collection_t nearest_offsets_in_paths(const PathPositionHandleGraph*
             int64_t path_offset = graph->get_position_of_step(step);
             
             if (rev_on_path != search_left) {
-                path_offset += graph->get_length(oriented) + dist;
+                path_offset += graph->get_length(oriented);
             }
-            else {
-                path_offset -= dist;
+
+            if (subtract_traversal_dist) {
+                path_offset += (rev_on_path != search_left ? dist : -dist);
             }
             
 #ifdef debug
@@ -87,10 +90,14 @@ path_offset_collection_t nearest_offsets_in_paths(const PathPositionHandleGraph*
             
             // add in the search distance and add the result to the output
             return_val[path_handle].emplace_back(path_offset, rev_on_path);
-        }
+        });
         
         if (!return_val.empty()) {
             // we found the closest, we're done
+            if (traversal_dist) {
+                traversal_dist->first = max<int64_t>(dist, 0);
+                traversal_dist->second = search_left;
+            }
             break;
         }
         
@@ -119,7 +126,7 @@ map<string, vector<pair<size_t, bool>>> offsets_in_paths(const PathPositionHandl
     auto offsets = nearest_offsets_in_paths(graph, pos, -1);
     map<string, vector<pair<size_t, bool>>> named_offsets;
     for (pair<const path_handle_t, vector<pair<size_t, bool>>>& offset : offsets) {
-        named_offsets[graph->get_path_name(offset.first)] = move(offset.second);
+        named_offsets[graph->get_path_name(offset.first)] = std::move(offset.second);
     }
     return named_offsets;
 }

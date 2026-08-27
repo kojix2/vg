@@ -7,10 +7,17 @@
 #include <thread>
 #include <cstdio>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <cctype>
+#include <locale>
+// We don't define _GNU_SOURCE to get the cpuset functions since we will
+// already have it for libstdc++ on the platforms where we need them
+#include <sched.h>
 
+// For TruncatedBGZFError
+#include <vg/io/blocked_gzip_input_stream.hpp>
 
 // For setting the temporary directory in submodules.
 #include <gcsa/utils.h>
@@ -118,7 +125,7 @@ void choose_good_thread_count() {
     if (count == 0) {
         // First priority: OMP_NUM_THREADS
         const char* value = getenv("OMP_NUM_THREADS");
-        if (value) {
+        if (value && *value != '\0') {
             // Read the value. Throws if it isn't a legit number.
             count = std::stoi(value);
         }
@@ -141,6 +148,35 @@ void choose_good_thread_count() {
                 // May come out to 0, in which case it is ignored.
                 count = (int) ceil(quota / (double) period);
             }
+        }
+    }
+
+#if !defined(__APPLE__) && defined(_GNU_SOURCE)
+    if (count == 0) {
+        // Next priority: CPU affinity mask (used by Slurm)
+        cpu_set_t mask;
+        if (sched_getaffinity(getpid(), sizeof(cpu_set_t), &mask)) {
+            // TODO: If you have >1024 bits in your mask, glibc can't deal and you will get EINVAL.
+            // We're supposed to then try increasingly large dynamically-allocated CPU flag sets until we find one that works.
+            auto problem = errno;
+            logging::warn("vg") << "Cannot determine CPU count from affinity mask: " 
+                                << strerror(problem) << endl;
+        } else {
+            // We're also supposed to intersect this mask with the actual
+            // existing processors, in case somebody flags on way more
+            // processors than actually exist. But Linux doesn't seem to do
+            // that by default, so we don't worry about it.
+            count = CPU_COUNT(&mask);
+        }
+    }
+#endif
+
+    if (count == 0) {
+        // Next priority: SLURM_JOB_CPUS_PER_NODE
+        const char* value = getenv("SLURM_JOB_CPUS_PER_NODE");
+        if (value && *value != '\0') {
+            // Read the value. Throws if it isn't a legit number.
+            count = std::stoi(value);
         }
     }
 
@@ -193,6 +229,19 @@ bool starts_with(const std::string& value, const std::string& prefix) {
 #endif
 }
 
+bool ends_with(const std::string& value, const std::string& suffix) {
+#if __cplusplus > 201703L
+    // C++20 provides this
+    return value.ends_with(suffix);
+#else
+    // Before then, C++ is terrible and we have to do it ourselves.
+    if (value.size() < suffix.size()) {
+        return false;
+    }
+    return value.substr(value.length() - suffix.length()) == suffix;
+#endif
+}
+
 const std::string sha1sum(const std::string& data) {
     SHA1 checksum;
     checksum.update(data);
@@ -227,7 +276,27 @@ bool is_number(const std::string& s) {
                         [](char c) { return !std::isdigit(c); }) == s.end();
 }
 
-bool isATGC(const char& b) {
+std::string to_lower(const std::string& s) {
+    const std::locale c_locale("C");
+    std::string result;
+    result.reserve(s.size());
+    for (auto& c : s) {
+        result.push_back(std::tolower(c, c_locale));
+    }
+    return result;
+}
+
+std::string to_upper(const std::string& s) {
+    const std::locale c_locale("C");
+    std::string result;
+    result.reserve(s.size());
+    for (auto& c : s) {
+        result.push_back(std::toupper(c, c_locale));
+    }
+    return result;
+}
+
+bool isATGC(char b) {
     return (b == 'A' || b == 'T' || b == 'G' || b == 'C');
 }
 
@@ -571,22 +640,18 @@ string get_input_file_name(int& optind, int argc, char** argv, bool test_open) {
 
     if (optind >= argc) {
         // Complain that the user didn't specify a filename
-        cerr << "error:[get_input_file_name] specify input filename, or \"-\" for standard input" << endl;
-        exit(1);
+        logging::error("get_input_file_name") << "specify input filename, "
+                                              << "or \"-\" for standard input" << endl;
     }
     
     string file_name(argv[optind++]);
     
     if (file_name.empty()) {
-        cerr << "error:[get_input_file_name] specify a non-empty input filename" << endl;
-        exit(1);
+        logging::error("get_input_file_name") << "specify a non-empty input filename" << endl;
     }
 
-    if (test_open && file_name != "-") {
-        ifstream file_stream(file_name);
-        if (!file_stream) {
-            cerr << "error:[get_input_file_name] unable to open input file: " << file_name << endl;
-        }
+    if (test_open) {
+        require_exists(std::string("get_input_file_name"), file_name);
     }
     
     return file_name;
@@ -597,15 +662,13 @@ string get_output_file_name(int& optind, int argc, char** argv) {
 
     if (optind >= argc) {
         // Complain that the user didn't specify a filename
-        cerr << "error:[get_output_file_name] specify output filename" << endl;
-        exit(1);
+        logging::error("get_output_file_name") << "specify output filename" << endl;
     }
     
     string file_name(argv[optind++]);
     
     if (file_name.empty()) {
-        cerr << "error:[get_output_file_name] specify a non-empty output filename" << endl;
-        exit(1);
+        logging::error("get_output_file_name") << "specify a non-empty output filename" << endl;
     }
     
     return file_name;
@@ -613,22 +676,28 @@ string get_output_file_name(int& optind, int argc, char** argv) {
 }
 
 void get_input_file(const string& file_name, function<void(istream&)> callback) {
-
-    if (file_name == "-") {
-        // Just use standard input
-        callback(std::cin);
-    } else {
-        // Open a file
-        ifstream in;
-        in.open(file_name.c_str());
-        if (!in.is_open()) {
-            // The user gave us a bad filename
-            cerr << "error:[get_input_file] could not open file \"" << file_name << "\"" << endl;
-            exit(1);
-        }
-        callback(in);
-    }
     
+    try {
+        if (file_name == "-") {
+            // Just use standard input
+            callback(std::cin);
+        } else {
+            // Open a file
+            ifstream in;
+            in.open(file_name.c_str());
+            if (!in.is_open()) {
+                // The user gave us a bad filename
+                logging::error("get_input_file") << "could not open file \"" 
+                                                 << file_name << "\"" << endl;
+            }
+            callback(in);
+            
+        }
+    } catch(vg::io::TruncatedBGZFError& e) {
+        // If we find a truncated input while working on this file, it's likely to be this file's fault.
+       logging::error("get_input_file") << "detected truncated input while processing \"" 
+                                        << file_name << "\"" << endl;
+    }
 }
 
 pair<string, string> split_ext(const string& filename) {
@@ -658,12 +727,62 @@ string file_base_name(const string& filename) {
 }
 
 bool file_exists(const string& filename) {
-    // TODO: use C++17 features to actually poll existence.
-    // For now we see if we can open it.
-    ifstream in(filename);
-    return in.is_open();
+    if (filename == "-") {
+        // Standard input should be thought of as existing.
+        return true;
+    }
+    try {
+        return std::filesystem::exists(filename);
+    } catch (const std::filesystem::filesystem_error& e) {
+        logging::warn("file_exists") << "Unable to determine if " << filename << " exists: " << e.what() << std::endl;  
+        // If we can't tell it exists, it doesn't exist.
+        return false;
+    }
 }
 
+bool file_can_be_written(const string& filename) {
+    if (filename == "-") {
+        // Standard input should not be written to
+        return false;
+    }
+    // If it exists, check if we can write to it
+    // Doing this first means we won't accidentally overwrite it
+    if (file_exists(filename)) {
+        return access(filename.c_str(), W_OK) == 0;
+    }
+    // If this file doesn't exist, see if we can create it
+    ofstream out(filename);
+    if (out.is_open()) {
+        // We can write to it, so close it.
+        out.close();
+        return true;
+    } else {
+        // We can't write to it
+        return false;
+    }
+}
+
+string require_exists(const Logger& logger, const string& filename) {
+    if (!file_exists(filename)) {
+        logger.error() << "file \"" << filename << "\" does not exist" << endl;
+    }
+    return filename;
+}
+
+string require_non_gzipped(const Logger& logger, const string& filename) {
+    if (ends_with(filename, ".gz")) {
+        logger.error() << "file \"" << filename << "\" appears to be gzipped; "
+                       << "please decompress it before use" << endl;
+    }
+    return filename;
+}
+
+string ensure_writable(const Logger& logger, const string& filename) {
+    if (!file_can_be_written(filename)) {
+        logger.error() << "file \"" << filename << "\" cannot be written to" << endl;
+    }
+    return filename;
+}
     
 void create_ref_allele(vcflib::Variant& variant, const std::string& allele) {
     // Set the ref allele
@@ -853,6 +972,13 @@ unordered_map<id_t, id_t> overlay_node_translations(const unordered_map<id_t, id
     return overlaid;
 }
 
+// This just makes parse_pair easier
+template<>
+bool parse(const string& arg, string& dest) {
+    dest = arg;
+    return true;
+}
+
 template<>
 bool parse(const string& arg, double& dest) {
     size_t after;
@@ -861,9 +987,18 @@ bool parse(const string& arg, double& dest) {
 }
 
 template<>
+bool parse(const string& arg, float& dest) {
+    size_t after;
+    dest = std::stof(arg, &after);
+    return(after == arg.size());
+}
+
+
+template<>
 bool parse(const string& arg, std::regex& dest) {
     // This throsw std::regex_error if it can't parse.
-    // That contains a kind of useless error code that we can't turn itno a string without switching on all the values.
+    // That contains a kind of useless error code that we
+    // can't turn into a string without switching on all the values.
     dest = std::regex(arg);
     return true;
 }
@@ -902,4 +1037,35 @@ bool parse(const string& arg, pos_t& dest) {
     return true;
 }
 
+int set_thread_count(const Logger& logger, const string& arg, int max_threads) {
+    int num_threads = parse<int>(arg);
+    if (max_threads == 0) {
+        // If the user didn't specify a maximum, use the OMP default.
+        max_threads = omp_get_max_threads();
+    }
+    
+    if (num_threads <= 0) {
+        logger.error() << "Thread count (-t) must be a positive integer, not " << arg << endl;
+    } else if (num_threads > max_threads) {
+        // If the user asked for more threads than we can actually use, cap it.
+        logger.warn() << "Thread count (-t) is greater than the maximum number of threads available (" 
+                      << omp_get_max_threads() << "), capping to that value" << endl;
+        num_threads = omp_get_max_threads();
+    }
+    
+    omp_set_num_threads(num_threads);
+    return num_threads;
+}
+
+void assign_fastq_files(const Logger& logger, const string& input_filename, string& slot1, string& slot2) {
+    if (slot1.empty()) {
+        slot1 = require_exists(logger, input_filename);
+    }
+    else if (slot2.empty()) {
+        slot2 = require_exists(logger, input_filename);
+    }
+    else {
+        logger.error() << "Cannot specify more than two FASTQ files" << endl;
+    }
+}
 }

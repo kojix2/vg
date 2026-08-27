@@ -41,7 +41,6 @@
 using namespace vg;
 using namespace vg::subcommand;
 
-
 enum PruningMode { mode_prune, mode_restore, mode_unfold };
 
 struct PruningParameters
@@ -106,39 +105,41 @@ void print_defaults(const std::map<PruningMode, ValueType>& defaults) {
 void help_prune(char** argv) {
     std::cerr << "usage: " << argv[0] << " prune [options] <graph.vg> >[output.vg]" << std::endl;
     std::cerr << std::endl;
-    std::cerr << "Prunes the complex regions of the graph for GCSA2 indexing. Pruning the graph" << std::endl;
-    std::cerr << "removes embedded paths." << std::endl;
+    std::cerr << "Prunes the complex regions of the graph for GCSA2 indexing." << std::endl;
+    std::cerr << "Pruning the graph removes embedded paths." << std::endl;
     std::cerr << std::endl;
     std::cerr << "Pruning parameters:" << std::endl;
-    std::cerr << "    -k, --kmer-length N    kmer length used for pruning" << std::endl;
-    std::cerr << "                           "; print_defaults(PruningParameters::kmer_length);
-    std::cerr << "    -e, --edge-max N       remove the edges on kmers making > N edge choices" << std::endl;
-    std::cerr << "                           "; print_defaults(PruningParameters::edge_max);
-    std::cerr << "    -s, --subgraph-min N   remove subgraphs of < N bases" << std::endl;
-    std::cerr << "                           "; print_defaults(PruningParameters::subgraph_min);
-    std::cerr << "    -M, --max-degree N     if N > 0, remove nodes with degree > N before pruning" << std::endl;
-    std::cerr << "                           "; print_defaults(PruningParameters::max_degree);
+    std::cerr << "  -k, --kmer-length N    kmer length used for pruning" << std::endl;
+    std::cerr << "                         "; print_defaults(PruningParameters::kmer_length);
+    std::cerr << "  -e, --edge-max N       remove the edges on kmers making > N edge choices" << std::endl;
+    std::cerr << "                         "; print_defaults(PruningParameters::edge_max);
+    std::cerr << "  -s, --subgraph-min N   remove subgraphs of < N bases" << std::endl;
+    std::cerr << "                         "; print_defaults(PruningParameters::subgraph_min);
+    std::cerr << "  -M, --max-degree N     if N > 0, remove nodes with degree > N before pruning" << std::endl;
+    std::cerr << "                         "; print_defaults(PruningParameters::max_degree);
     std::cerr << std::endl;
     std::cerr << "Pruning modes (-P, -r, and -u are mutually exclusive):" << std::endl;
-    std::cerr << "    -P, --prune            simply prune the graph (default)" << std::endl;
-    std::cerr << "    -r, --restore-paths    restore the edges on non-alt paths" << std::endl;
-    std::cerr << "    -u, --unfold-paths     unfold non-alt paths and GBWT threads" << std::endl;
-    std::cerr << "    -v, --verify-paths     verify that the paths exist after pruning" << std::endl;
-    std::cerr << "                           (potentially very slow)" << std::endl;
+    std::cerr << "  -P, --prune            simply prune the graph (default)" << std::endl;
+    std::cerr << "  -r, --restore-paths    restore the edges on non-alt paths" << std::endl;
+    std::cerr << "  -u, --unfold-paths     unfold non-alt paths and GBWT threads" << std::endl;
+    std::cerr << "  -v, --verify-paths     verify that the paths exist after pruning" << std::endl;
+    std::cerr << "                         (potentially very slow)" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Unfolding options:" << std::endl;
-    std::cerr << "    -g, --gbwt-name FILE   unfold the threads from this GBWT index" << std::endl;
-    std::cerr << "    -m, --mapping FILE     store the node mapping for duplicates in this file (required with -u)" << std::endl;
-    std::cerr << "    -a, --append-mapping   append to the existing node mapping" << std::endl;
+    std::cerr << "  -g, --gbwt-name FILE   unfold the threads from this GBWT index" << std::endl;
+    std::cerr << "  -m, --mapping FILE     store node mapping for duplicates (required with -u)" << std::endl;
+    std::cerr << "  -a, --append-mapping   append to the existing node mapping" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Other options:" << std::endl;
-    std::cerr << "    -p, --progress         show progress" << std::endl;
-    std::cerr << "    -t, --threads N        use N threads (default: " << omp_get_max_threads() << ")" << std::endl;
-    std::cerr << "    -d, --dry-run          determine the validity of the combination of options" << std::endl;
+    std::cerr << "  -p, --progress         show progress" << std::endl;
+    std::cerr << "  -t, --threads N        use N threads [" << omp_get_max_threads() << "]" << std::endl;
+    std::cerr << "  -d, --dry-run          determine the validity of the combination of options" << std::endl;
+    std::cerr << "  -h, --help             print this help message to stderr and exit" << std::endl;
     std::cerr << std::endl;
 }
 
 int main_prune(int argc, char** argv) {
+    Logger logger("vg prune");
 
     if (argc == 2) {
         help_prune(argv);
@@ -183,7 +184,7 @@ int main_prune(int argc, char** argv) {
         };
 
         int option_index = 0;
-        c = getopt_long(argc, argv, "k:e:s:M:Pruvx:g:m:apt:dh", long_options, &option_index);
+        c = getopt_long(argc, argv, "k:e:s:M:Pruvxg:m:apt:dh?", long_options, &option_index);
         if (c == -1) { break; } // End of options.
 
         switch (c)
@@ -217,10 +218,10 @@ int main_prune(int argc, char** argv) {
             verify_paths = true;
             break;
         case 'x': // no longer needed
-            std::cerr << "warning: [vg prune] option --xg-name is no longer needed" << std::endl;
+            logger.warn() << "option --xg-name is no longer needed" << std::endl;
             break;
         case 'g':
-            gbwt_name = optarg;
+            gbwt_name = require_exists(logger, optarg);
             break;
         case 'm':
             mapping_name = optarg;
@@ -232,10 +233,7 @@ int main_prune(int argc, char** argv) {
             show_progress = true;
             break;
         case 't':
-            threads = parse<int>(optarg);
-            threads = std::min(threads, omp_get_max_threads());
-            threads = std::max(threads, 1);
-            omp_set_num_threads(threads);
+            threads = set_thread_count(logger, optarg);
             break;
         case 'd':
             dry_run = true;
@@ -249,6 +247,8 @@ int main_prune(int argc, char** argv) {
             std::abort();
         }
     }
+
+    omp_set_num_threads(threads);
     
     if (optind < argc) {
         // There's an input file specified.
@@ -271,60 +271,71 @@ int main_prune(int argc, char** argv) {
         max_degree = PruningParameters::max_degree[mode];
     }
     if (!(kmer_length > 0 && edge_max > 0)) {
-        std::cerr << "error: [vg prune] --kmer-length and --edge-max must be positive" << std::endl;
-        return 1;
+        logger.error() << "--kmer-length and --edge-max must be positive" << std::endl;
+    }
+
+    if (!mapping_name.empty()) {
+        if (append_mapping) {
+            // If appending, we need to check that the file exists
+            require_exists(logger, mapping_name);
+        } else {
+            // If not appending, we need to be able to write it
+            ensure_writable(logger, mapping_name);
+        }
+    } else if (append_mapping) {
+        // If appending, we need a mapping file
+       logger.error() << "cannot append to mapping file without specifying one with --mapping" << std::endl;
     }
 
     // Mode-specific checks.
     if (mode == mode_prune) {
         if (verify_paths) {
-            std::cerr << "error: [vg prune] mode " << mode_name(mode) << " does not have paths to verify" << std::endl;
-            return 1;
+            logger.error() << "mode " << mode_name(mode) << " does not have paths to verify" << std::endl;
         }
         if (!(gbwt_name.empty() && mapping_name.empty())) {
-            std::cerr << "error: [vg prune] mode " << mode_name(mode) << " does not use additional files" << std::endl;
-            return 1;
+            logger.error() << "mode " << mode_name(mode) << " does not use additional files" << std::endl;
         }
     }
     if (mode == mode_restore) {
         if (!(gbwt_name.empty() && mapping_name.empty())) {
-            std::cerr << "error: [vg prune] mode " << mode_name(mode) << " does not use additional files" << std::endl;
-            return 1;
+            logger.error() << "mode " << mode_name(mode) << " does not use additional files" << std::endl;
         }
     }
     if (mode == mode_unfold) {
         if (mapping_name.empty()) {
-            std::cerr << "error: [vg prune] mode --unfold requires a node mapping file specified with --mapping" << std::endl;
-            return 1;
+            logger.error() << "mode --unfold requires a node mapping file specified with --mapping" << std::endl;
         }
     }
 
     // Dry run.
     if (dry_run) {
-        std::cerr << "Pruning mode:   " << mode_name(mode) << std::endl;
-        std::cerr << "Parameters:     --kmer-length " << kmer_length << " --edge-max " << edge_max << " --subgraph-min " << subgraph_min << " --max-degree " << max_degree << std::endl;
-        std::cerr << "Options:        --threads " << omp_get_max_threads();
+        logger.info() << "Pruning mode:   " << mode_name(mode) << std::endl;
+        logger.info() << "Parameters:     --kmer-length " << kmer_length
+                      << " --edge-max " << edge_max << " --subgraph-min " << subgraph_min
+                      << " --max-degree " << max_degree << std::endl;
+        auto opt_info = logger.info();
+        opt_info << "Options:        --threads " << threads;
         if (verify_paths) {
-            std::cerr << " --verify-paths";
+            opt_info << " --verify-paths";
         }
         if (append_mapping) {
-            std::cerr << " --append_mapping";
+            opt_info << " --append_mapping";
         }
         if (show_progress) {
-            std::cerr << " --progress";
+            opt_info << " --progress";
         }
         if (dry_run) {
-            std::cerr << " --dry-run";
+            opt_info << " --dry-run";
         }
-        std::cerr << std::endl;
+        opt_info << std::endl;
         if (!vg_name.empty()) {
-            std::cerr << "VG:             " << (vg_name == "-" ? "(stdin)" : vg_name) << std::endl;
+            logger.info() << "VG:             " << (vg_name == "-" ? "(stdin)" : vg_name) << std::endl;
         }        
         if (!gbwt_name.empty()) {
-            std::cerr << "GBWT:           " << gbwt_name << std::endl;
+            logger.info() << "GBWT:           " << gbwt_name << std::endl;
         }
         if (!mapping_name.empty()) {
-            std::cerr << "Mapping:        " << mapping_name << std::endl;
+            logger.info() << "Mapping:        " << mapping_name << std::endl;
         }
         return 0;
     }
@@ -338,7 +349,8 @@ int main_prune(int argc, char** argv) {
     
     vg::id_t max_node_id = graph->max_node_id();
     if (show_progress) {
-        std::cerr << "Original graph " << vg_name << ": " << graph->get_node_count() << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
+        logger.info() << "Original graph " << vg_name << ": " << graph->get_node_count() 
+                      << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
     }
 
     // Remove the paths and build an XG index if needed.
@@ -354,7 +366,7 @@ int main_prune(int argc, char** argv) {
         }
         xg_index.from_path_handle_graph(*graph);
         if (show_progress) {
-            std::cerr << "Built a temporary XG index" << std::endl;
+            logger.info() << "Built a temporary XG index" << std::endl;
         }
     }
     
@@ -368,28 +380,28 @@ int main_prune(int argc, char** argv) {
     }
     
     if (show_progress) {
-        std::cerr << "Removed all paths" << std::endl;
+        logger.info() << "Removed all paths" << std::endl;
     }
 
     // Remove high-degree nodes.
     if (max_degree > 0) {
         algorithms::remove_high_degree_nodes(*graph, max_degree);
         if (show_progress) {
-            std::cerr << "Removed high-degree nodes: "
-                      << graph->get_node_count() << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
+            logger.info() << "Removed high-degree nodes: " << graph->get_node_count()
+                          << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
         }
     }
 
     // Prune the graph.
     algorithms::prune_complex_with_head_tail(*graph, kmer_length, edge_max);
     if (show_progress) {
-        std::cerr << "Pruned complex regions: "
-                  << graph->get_node_count() << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
+        logger.info() << "Pruned complex regions: " << graph->get_node_count()
+                      << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
     }
     algorithms::prune_short_subgraphs(*graph, subgraph_min);
     if (show_progress) {
-        std::cerr << "Removed small subgraphs: "
-                  << graph->get_node_count() << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
+        logger.info() << "Removed small subgraphs: " << graph->get_node_count()
+                      << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
     }
 
     // Restore the non-alt paths.
@@ -401,7 +413,7 @@ int main_prune(int argc, char** argv) {
         if (verify_paths) {
             size_t failures = unfolder.verify_paths(*graph, show_progress);
             if (failures > 0) {
-                std::cerr << "warning: [vg prune] verification failed for " << failures << " paths" << std::endl;
+                logger.warn() << "verification failed for " << failures << " paths" << std::endl;
             }
         }
     }
@@ -412,8 +424,7 @@ int main_prune(int argc, char** argv) {
             get_input_file(gbwt_name, [&](std::istream& in) {
                 gbwt_index = vg::io::VPKG::load_one<gbwt::GBWT>(in);
                 if (gbwt_index.get() == nullptr) {
-                    std::cerr << "[vg prune]: could not load GBWT" << std::endl;
-                    exit(1);
+                    logger.error() << "could not load GBWT" << std::endl;
                 }
             });
         } else {
@@ -432,7 +443,7 @@ int main_prune(int argc, char** argv) {
         if (verify_paths) {
             size_t failures = unfolder.verify_paths(*graph, show_progress);
             if (failures > 0) {
-                std::cerr << "warning: [vg prune] verification failed for " << failures << " paths" << std::endl;
+                logger.warn() << "verification failed for " << failures << " paths" << std::endl;
             }
         }
     }
@@ -441,8 +452,8 @@ int main_prune(int argc, char** argv) {
     
     vg::io::save_handle_graph(graph.get(), std::cout);
     if (show_progress) {
-        std::cerr << "Serialized the graph: "
-                  << graph->get_node_count() << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
+        logger.info() << "Serialized the graph: " << graph->get_node_count()
+                      << " nodes, " << graph->get_edge_count() << " edges" << std::endl;
     }
 
     return 0;

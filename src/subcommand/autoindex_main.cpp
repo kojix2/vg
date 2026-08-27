@@ -22,10 +22,9 @@ using namespace std;
 using namespace vg;
 using namespace vg::subcommand;
 
-int64_t parse_memory_usage(const string& mem_arg) {
+int64_t parse_memory_usage(const Logger& logger, const string& mem_arg) {
     if (mem_arg.empty()) {
-        cerr << "error:[vg autoindex] target memory usage arg is empty" << endl;
-        exit(1);
+        logger.error() << "target memory usage arg is empty" << endl;
     }
     string mem = mem_arg;
     if (mem.back() == 'B') {
@@ -48,8 +47,8 @@ int64_t parse_memory_usage(const string& mem_arg) {
         base = 1;
     }
     else {
-        cerr << "error:[vg autoindex] unrecognized unit for target memory usage: " << mem.back() << endl;
-        exit(1);
+        logger.error() << "unrecognized unit " << mem.back()
+                       << " for target memory usage: " << mem_arg << endl;
     }
     return parse<int64_t>(mem) * base;
 }
@@ -74,14 +73,13 @@ string mem_usage_string(int64_t mem) {
 };
 
 // expects a string of form "Index Registry Name:filepath1,filepath2,filepath3"
-pair<string, vector<string>> parse_provide_string(const string& str) {
+pair<string, vector<string>> parse_provide_string(const Logger& logger, const string& str) {
     
     pair<string, vector<string>> return_val;
     
     size_t i = str.find(':');
     if (i >= str.size()) {
-        cerr << "error: Couldn't parse index provide string: " << str << endl;
-        exit(1);
+        logger.error() << "Couldn't parse index provide string: " << str << endl;
     }
     return_val.first = str.substr(0, i);
     while (i < str.size()) {
@@ -90,56 +88,62 @@ pair<string, vector<string>> parse_provide_string(const string& str) {
         i = end;
     }
     if (return_val.second.empty()) {
-        cerr << "error: Couldn't parse index provide string: " << str << endl;
-        exit(1);
+        logger.error() << "Couldn't parse index provide string:" << str << endl;
     }
     return return_val;
 }
 
 void help_autoindex(char** argv) {
-    cerr
-    << "usage: " << argv[0] << " autoindex [options]" << endl
-    << "options:" << endl
-    << "  output:" << endl
-    << "    -p, --prefix PREFIX    prefix to use for all output (default: index)" << endl
-    << "    -w, --workflow NAME    workflow to produce indexes for, can be provided multiple" << endl
-    << "                           times. options: map, mpmap, rpvg, giraffe (default: map)" << endl
-    << "  input data:" << endl
-    << "    -r, --ref-fasta FILE   FASTA file containing the reference sequence (may repeat)" << endl
-    << "    -v, --vcf FILE         VCF file with sequence names matching -r (may repeat)" << endl
-    << "    -i, --ins-fasta FILE   FASTA file with sequences of INS variants from -v" << endl
-    << "    -g, --gfa FILE         GFA file to make a graph from" << endl
-    << "    -x, --tx-gff FILE      GTF/GFF file with transcript annotations (may repeat)" << endl
-    << "    -H, --hap-tx-gff FILE  GTF/GFF file with transcript annotations of a named haplotype (may repeat)" << endl
-    << "  configuration:" << endl
-    << "    -f, --gff-feature STR  GTF/GFF feature type (col. 3) to add to graph (default: " << IndexingParameters::gff_feature_name << ")" << endl
-    << "    -a, --gff-tx-tag STR   GTF/GFF tag (in col. 9) for transcript ID (default: " << IndexingParameters::gff_transcript_tag << ")" << endl
-    << "  logging and computation:" << endl
-    << "    -T, --tmp-dir DIR      temporary directory to use for intermediate files" << endl
-    << "    -M, --target-mem MEM   target max memory usage (not exact, formatted INT[kMG])" << endl
-    << "                           (default: 1/2 of available)" << endl
+    cerr << "usage: " << argv[0] << " autoindex [options]" << endl
+         << "output:" << endl
+         << "  -p, --prefix PREFIX    prefix to use for all output [index]" << endl
+         << "  -w, --workflow NAME    workflow to produce indexes for (may repeat) [map]" << endl
+         << "                         {map, mpmap, rpvg, sr-giraffe, lr-giraffe, sampling}" << endl
+         << "input data:" << endl
+         << "  -r, --ref-fasta FILE   FASTA file with the reference sequence (may repeat)" << endl
+         << "  -v, --vcf FILE         VCF file with sequence names matching -r (may repeat)" << endl
+         << "  -i, --ins-fasta FILE   FASTA file with sequences of INS variants from -v" << endl
+         << "  -g, --gfa FILE         GFA file to make a graph from (uncompressed)" << endl
+         << "  -G, --gbz FILE         GBZ file to make indexes from" << endl
+         << "  -x, --tx-gff FILE      GTF/GFF file with transcript annotations (may repeat)" << endl
+         << "  -H, --hap-tx-gff FILE  GTF/GFF file with transcript annotations " << endl
+         << "                         of a named haplotype (may repeat)" << endl
+         << "  -n, --no-guessing      do not guess that pre-existing files are indexes" << endl
+         << "                         i.e. force-regenerate any index not explicitly provided" << endl
+         << "configuration:" << endl
+         << "  -f, --gff-feature STR  GTF/GFF feature type (col. 3) to add to graph "
+                                      << "[" << IndexingParameters::gff_feature_name << "]" << endl
+         << "  -a, --gff-tx-tag STR   GTF/GFF tag (in col. 9) for ID "
+                                      << "[" << IndexingParameters::gff_transcript_tag << "]" << endl
+         << "logging and computation:" << endl
+         << "  -T, --tmp-dir DIR      temporary directory to use for intermediate files" << endl
+         << "  -M, --target-mem MEM   target max memory usage (not exact, formatted INT[kMG])" << endl
+         << "                         [1/2 of available]" << endl
 // TODO: hiding this now that we have rewinding options, since detailed args aren't really in the spirit of this subcommand
-//    << "    --gbwt-buffer-size NUM GBWT construction buffer size in millions of nodes; may need to be" << endl
-//    << "                           increased for graphs with long haplotypes (default: " << IndexingParameters::gbwt_insert_batch_size / gbwt::MILLION << ")" << endl
-//    << "    --gcsa-size-limit NUM  limit on size of GCSA2 temporary files on disk in bytes" << endl
-    << "    -t, --threads NUM      number of threads (default: all available)" << endl
-    << "    -V, --verbosity NUM    log to stderr (0 = none, 1 = basic, 2 = debug; default " << (int) IndexingParameters::verbosity << ")" << endl
-    //<< "    -d, --dot              print the dot-formatted graph of index recipes and exit" << endl
-    << "    -h, --help             print this help message to stderr and exit" << endl;
+//    << "  --gbwt-buffer-size NUM GBWT construction buffer size in millions of nodes; may need to be" << endl
+//    << "                              increased for graphs with long haplotypes "
+//                                   << "[" << IndexingParameters::gbwt_insert_batch_size / gbwt::MILLION << "]" << endl
+//    << "  --gcsa-size-limit NUM limit on size of GCSA2 temporary files on disk in bytes" << endl
+         << "  -t, --threads NUM      number of threads [all available]" << endl
+         << "  -V, --verbosity NUM    log to stderr {0 = none, 1 = basic, 2 = debug}"
+         <<                           "[" << (int) IndexingParameters::verbosity << "]" << endl
+       //<< "  -d, --dot              print the dot-formatted graph of index recipes and exit" << endl
+         << "  -h, --help             print this help message to stderr and exit" << endl;
 }
 
 int main_autoindex(int argc, char** argv) {
+    Logger logger("vg autoindex");
     
     if (argc == 2) {
         help_autoindex(argv);
         return 1;
     }
     
-#define OPT_KEEP_INTERMEDIATE 1000
-#define OPT_FORCE_UNPHASED 1001
-#define OPT_FORCE_PHASED 1002
-#define OPT_GBWT_BUFFER_SIZE 1003
-#define OPT_GCSA_SIZE_LIMIT 1004
+    constexpr int OPT_KEEP_INTERMEDIATE =  1000;
+    constexpr int OPT_FORCE_UNPHASED = 1001;
+    constexpr int OPT_FORCE_PHASED = 1002;
+    constexpr int OPT_GBWT_BUFFER_SIZE = 1003;
+    constexpr int OPT_GCSA_SIZE_LIMIT = 1004;
     
     // load the registry
     IndexRegistry registry = VGIndexes::get_vg_index_registry();
@@ -149,8 +153,10 @@ int main_autoindex(int argc, char** argv) {
     bool force_unphased = false;
     bool force_phased = false;
     int64_t target_mem_usage = IndexRegistry::get_system_memory() / 2;
+    bool allow_guessing = true;
     
     string gfa_name;
+    string gbz_name;
     
     int c;
     optind = 2; // force optind past command positional argument
@@ -163,8 +169,10 @@ int main_autoindex(int argc, char** argv) {
             {"vcf", required_argument, 0, 'v'},
             {"ins-fasta", required_argument, 0, 'i'},
             {"gfa", required_argument, 0, 'g'},
+            {"gbz", required_argument, 0, 'G'},
             {"tx-gff", required_argument, 0, 'x'},
             {"hap-tx-gff", required_argument, 0, 'H'},
+            {"no-guessing", no_argument, 0, 'n'},
             {"gff-feature", required_argument, 0, 'f'},
             {"gff-tx-tag", required_argument, 0, 'a'},
             {"provide", required_argument, 0, 'P'},
@@ -184,7 +192,7 @@ int main_autoindex(int argc, char** argv) {
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "p:w:r:v:i:g:x:H:a:P:R:f:M:T:t:dV:h",
+        c = getopt_long (argc, argv, "p:w:r:v:i:g:G:x:H:na:P:R:f:M:T:t:dV:h?",
                          long_options, &option_index);
 
         // Detect the end of the options.
@@ -199,46 +207,64 @@ int main_autoindex(int argc, char** argv) {
             case 'w':
                 if (optarg == string("map")) {
                     for (auto& target : VGIndexes::get_default_map_indexes()) {
-                        targets.emplace_back(move(target));
+                        targets.emplace_back(std::move(target));
                     }
                 }
                 else if (optarg == string("mpmap")) {
                     for (auto& target : VGIndexes::get_default_mpmap_indexes()) {
-                        targets.emplace_back(move(target));
+                        targets.emplace_back(std::move(target));
                     }
                 }
-                else if (optarg == string("giraffe")) {
-                    for (auto& target : VGIndexes::get_default_giraffe_indexes()) {
-                        targets.emplace_back(move(target));
+                else if (optarg == string("giraffe") || optarg == string("sr-giraffe")) {
+                    for (auto& target : VGIndexes::get_default_short_giraffe_indexes()) {
+                        targets.emplace_back(std::move(target));
+                    }
+                }
+                else if (optarg == string("lr-giraffe")) {
+                    for (auto& target : VGIndexes::get_default_long_giraffe_indexes()) {
+                        targets.emplace_back(std::move(target));
                     }
                 }
                 else if (optarg == string("rpvg")) {
                     for (auto& target : VGIndexes::get_default_rpvg_indexes()) {
-                        targets.emplace_back(move(target));
+                        targets.emplace_back(std::move(target));
+                    }
+                }
+                else if (optarg == string("sampling")) {
+                    for (auto& target : VGIndexes::get_default_haplotype_sampling_indexes()) {
+                        targets.emplace_back(std::move(target));
                     }
                 }
                 else {
-                    cerr << "error: Unrecognized workflow (-w): " << optarg << endl;
-                    return 1;
+                    logger.error() << "Unrecognized workflow (-w) \"" << optarg << "\"" << endl;
                 }
                 break;
             case 'r':
+                require_non_gzipped(logger, optarg);
                 registry.provide("Reference FASTA", optarg);
                 break;
             case 'v':
-                vcf_names.push_back(optarg);
+                vcf_names.push_back(require_exists(logger, optarg));
                 break;
             case 'i':
+                require_non_gzipped(logger, optarg);
                 registry.provide("Insertion Sequence FASTA", optarg);
                 break;
             case 'g':
-                gfa_name = optarg;
+                gfa_name = require_exists(logger, optarg);
+                require_non_gzipped(logger, gfa_name);
+                break;
+            case 'G':
+                gbz_name = require_exists(logger, optarg);
                 break;
             case 'x':
                 registry.provide("GTF/GFF", optarg);
                 break;
             case 'H':
                 registry.provide("Haplotype GTF/GFF", optarg);
+                break;
+            case 'n':
+                allow_guessing = false;
                 break;
             case 'f':
                 IndexingParameters::gff_feature_name = optarg;
@@ -248,15 +274,15 @@ int main_autoindex(int argc, char** argv) {
                 break;
             case 'P':
             {
-                auto parsed = parse_provide_string(optarg);
+                auto parsed = parse_provide_string(logger, optarg);
                 registry.provide(parsed.first, parsed.second);
                 break;
             }
             case 'R':
-                targets.emplace_back(optarg);
+                targets.emplace_back(ensure_writable(logger, optarg));
                 break;
             case 'M':
-                target_mem_usage = parse_memory_usage(optarg);
+                target_mem_usage = parse_memory_usage(logger, optarg);
                 break;
             case OPT_GBWT_BUFFER_SIZE:
                 IndexingParameters::gbwt_insert_batch_size = std::max(parse<size_t>(optarg), 1ul) * gbwt::MILLION;
@@ -265,14 +291,14 @@ int main_autoindex(int argc, char** argv) {
                 temp_file::set_dir(optarg);
                 break;
             case 't':
-                omp_set_num_threads(parse<int>(optarg));
+                set_thread_count(logger, optarg);
                 break;
             case 'V':
             {
                 int verbosity = parse<int>(optarg);
                 if (verbosity < IndexingParameters::None || verbosity > IndexingParameters::Debug) {
-                    cerr << "error: Verbosity (-V) must be integer in {0, 1, 2}: " << optarg << endl;
-                    return 1;
+                    logger.error() << "Verbosity (-V) must be integer in {0, 1, 2}, not \""
+                                   << optarg << "\"" << endl;
                 }
                 IndexingParameters::verbosity = (IndexingParameters::Verbosity) verbosity;
                 break;
@@ -292,20 +318,21 @@ int main_autoindex(int argc, char** argv) {
             case OPT_GCSA_SIZE_LIMIT:
                 IndexingParameters::gcsa_size_limit = parse<int64_t>(optarg);
                 break;
+            case '?':
             case 'h':
-                help_autoindex(argv);
-                return 0;
             default:
+                help_autoindex(argv);
                 return 1;
         }
     }
     
     if (IndexingParameters::verbosity >= IndexingParameters::Basic) {
-        cerr << "[vg autoindex] Executing command:";
+        auto info_msg = logger.info();
+        info_msg << "Executing command:";
         for (int i = 0; i < argc; ++i) {
-            cerr << " " << argv[i];
+            info_msg << " " << argv[i];
         }
-        cerr << endl;
+        info_msg << endl;
     }
     
     assert(!(force_phased && force_unphased));
@@ -339,6 +366,13 @@ int main_autoindex(int argc, char** argv) {
             registry.provide("Reference GFA", gfa_name);
         }
     }
+    if (!gbz_name.empty()) {
+        registry.provide("GBZ", gbz_name);
+        // Also mark this as the Giraffe GBZ so if we index for Giraffe we won't duplicate it.
+        // TODO: Why are these separate?
+        registry.provide("Giraffe GBZ", gbz_name);
+    }
+
 
     if (print_dot) {
         // don't index, just visualize the plan
@@ -355,14 +389,37 @@ int main_autoindex(int argc, char** argv) {
     // deduplicate
     sort(targets.begin(), targets.end());
     targets.resize(unique(targets.begin(), targets.end()) - targets.begin());
+
+    //Check if we can automatically load other indexes in the plan based on the names
+    if (allow_guessing) {
+        for (const IndexName& target : targets) {
+            if (!registry.available(target)) {
+                vector<string> inferred_file_names = registry.get_possible_filenames(target);
+                for (const string& filename : inferred_file_names) {
+                    if (target == "Giraffe GBZ" && !ends_with(filename, ".giraffe.gbz")) {
+                        // TODO: Giraffe GBZ indexes can be saved as .<sample>.gbz or .giraffe.gbz.
+                        // But we can't pick up .<sample>.gbz automatically without possibly mistaking a plain GBZ for a Giraffe one.
+                        // And we don't handle haplotype samplign in autoindex yet anyway.
+                        // So only find Giraffe GBZs.
+                        // TODO: Allow the siffixes to have Snakemake-style
+                        // wildcards that populate scopes on the files.
+                        continue;
+                    }
+                    if (file_exists(filename)) {
+                        logger.info() << "Guessing that " << filename << " is " << target << endl;
+                        registry.provide(target, filename);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     
     try {
         registry.make_indexes(targets);
     }
     catch (InsufficientInputException ex) {
-        cerr << "error:[vg autoindex] Input is not sufficient to create indexes" << endl;
-        cerr << ex.what();
-        return 1;
+        logger.error() << "Input is not sufficient to create indexes\n" << string(ex.what()) << endl;
     }
     
     return 0;
@@ -370,5 +427,6 @@ int main_autoindex(int argc, char** argv) {
 }
 
 // Register subcommand
-static Subcommand vg_autoindex("autoindex", "mapping tool-oriented index construction from interchange formats", PIPELINE, 1, main_autoindex);
+static Subcommand vg_autoindex("autoindex", "mapping tool-oriented index construction from interchange formats", 
+                               PIPELINE, 1, main_autoindex);
 

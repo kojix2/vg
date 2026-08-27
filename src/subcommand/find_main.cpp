@@ -1,4 +1,5 @@
 #include "subcommand.hpp"
+#include "../crash.hpp"
 #include "../utility.hpp"
 #include "../mapper.hpp"
 #include <vg/io/stream.hpp>
@@ -27,49 +28,64 @@ using namespace vg::io;
 void help_find(char** argv) {
     cerr << "usage: " << argv[0] << " find [options] >sub.vg" << endl
          << "options:" << endl
+         << "  -h, --help                  print this help message to stderr and exit" << endl
          << "graph features:" << endl
-         << "    -x, --xg-name FILE     use this xg index or graph (instead of rocksdb db)" << endl
-         << "    -n, --node ID          find node(s), return 1-hop context as graph" << endl
-         << "    -N, --node-list FILE   a white space or line delimited list of nodes to collect" << endl
-         << "        --mapping FILE     also include nodes that map to the selected node ids" << endl
-         << "    -e, --edges-end ID     return edges on end of node with ID" << endl
-         << "    -s, --edges-start ID   return edges on start of node with ID" << endl
-         << "    -c, --context STEPS    expand the context of the subgraph this many steps" << endl
-         << "    -L, --use-length       treat STEPS in -c or M in -r as a length in bases" << endl
-         << "    -P, --position-in PATH find the position of the node (specified by -n) in the given path" << endl
-         << "    -I, --list-paths       write out the path names in the index" << endl
-         << "    -r, --node-range N:M   get nodes from N to M" << endl
-         << "    -G, --gam GAM          accumulate the graph touched by the alignments in the GAM" << endl
-         << "    --connecting-start POS find the graph connecting from POS (node ID, + or -, node offset) to --connecting-end" << endl
-         << "    --connecting-end POS   find the graph connecting to POS (node ID, + or -, node offset) from --connecting-start" << endl
-         << "    --connecting-range INT traverse up to INT bases when going from --connecting-start to --connecting-end (default: 100)" << endl
+         << "  -x, --xg-name FILE          use this xg index or graph" << endl
+         << "  -n, --node ID               find node(s), return 1-hop context as graph" << endl
+         << "  -N, --node-list FILE        whitespace or line delimited list of nodes to grab" << endl
+         << "      --mapping FILE          include nodes mapping to the selected node IDs" << endl
+         << "  -e, --edges-end ID          return edges on end of node with ID" << endl
+         << "  -s, --edges-start ID        return edges on start of node with ID" << endl
+         << "  -c, --context STEPS         expand the context of the subgraph this many steps" << endl
+         << "  -L, --use-length            treat STEPS in -c or M in -r as a length in bases" << endl
+         << "  -P, --position-in PATH      find the position of -n node in the given path" << endl
+         << "  -I, --list-paths            write out the path names in the index" << endl
+         << "  -r, --node-range N:M        get nodes from N to M" << endl
+         << "  -G, --gam GAM               accumulate the graph touched by GAM's alignments" << endl
+         << "      --connecting-start POS  find graph from POS (node ID, + or -, node offset)" << endl
+         << "                              connecting to --connecting-end" << endl
+         << "      --connecting-end POS    find graph to POS (node ID, + or -, node offset)" << endl
+         << "                              connecting from --connecting-start" << endl
+         << "      --connecting-range INT  traverse up to INT bases when going " << endl
+         << "                              from --connecting-start to --connecting-end [100]" << endl
          << "subgraphs by path range:" << endl
-         << "    -p, --path TARGET      find the node(s) in the specified path range(s) TARGET=path[:pos1[-pos2]]" << endl
-         << "    -R, --path-bed FILE    read our targets from the given BED FILE" << endl
-         << "    -E, --path-dag         with -p or -R, gets any node in the partial order from pos1 to pos2, assumes id sorted DAG" << endl
-         << "    -W, --save-to PREFIX   instead of writing target subgraphs to stdout," << endl
-         << "                           write one per given target to a separate file named PREFIX[path]:[start]-[end].vg" << endl
-         << "    -K, --subgraph-k K     instead of graphs, write kmers from the subgraphs" << endl
-         << "    -H, --gbwt FILE        when enumerating kmers from subgraphs, determine their frequencies in this GBWT haplotype index" << endl
+         << "  -p, --path TARGET           find the node(s) in the specified path range(s)" << endl
+         << "                              TARGET=path[:pos1[-pos2]]" << endl
+         << "  -R, --path-bed FILE         read our targets from the given BED FILE" << endl
+         << "  -E, --path-dag              with -p or -R, gets any node in the partial order" << endl
+         << "                              from pos1 to pos2, assumes id sorted DAG" << endl
+         << "  -W, --save-to PREFIX        instead of writing target subgraphs to stdout," << endl
+         << "                              write one per given target to a separate file" << endl
+         << "                              named PREFIX[path]:[start]-[end].vg" << endl
+         << "  -K, --subgraph-k K          instead of graphs, write kmers from the subgraphs" << endl
+         << "  -H, --gbwt FILE             when enumerating kmers from subgraphs, determine" << endl
+         << "                              their frequencies in this GBWT haplotype index" << endl
          << "alignments:" << endl
-         << "    -l, --sorted-gam FILE  use this sorted, indexed GAM file" << endl
-         << "    -F, --sorted-gaf FILE  use this sorted, indexed GAF file" << endl
-         << "    -o, --alns-on N:M      write alignments which align to any of the nodes between N and M (inclusive)" << endl
-         << "    -A, --to-graph VG      get alignments to the provided subgraph" << endl
+         << "  -l, --sorted-gam FILE       use this sorted, indexed GAM file" << endl
+         << "  -F, --sorted-gaf FILE       use this sorted, indexed GAF file" << endl
+         << "  -o, --alns-on N:M           write alignments which align to any of the" << endl
+         << "                              nodes between N and M (inclusive)" << endl
+         << "  -A, --to-graph VG           get alignments to the provided subgraph" << endl
          << "sequences:" << endl
-         << "    -g, --gcsa FILE        use this GCSA2 index of the sequence space of the graph (required for sequence queries)" << endl
-         << "    -S, --sequence STR     search for sequence STR using" << endl
-         << "    -M, --mems STR         describe the super-maximal exact matches of the STR (gcsa2) in JSON" << endl
-         << "    -B, --reseed-length N  find non-super-maximal MEMs inside SMEMs of length at least N" << endl
-         << "    -f, --fast-reseed      use fast SMEM reseeding algorithm" << endl
-         << "    -Y, --max-mem N        the maximum length of the MEM (default: GCSA2 order)" << endl
-         << "    -Z, --min-mem N        the minimum length of the MEM (default: 1)" << endl
-         << "    -D, --distance         return distance on path between pair of nodes (-n). if -P not used, best path chosen heurstically" << endl
-         << "    -Q, --paths-named S    return all paths whose names are prefixed with S (multiple allowed)" << endl;
+         << "  -g, --gcsa FILE             use this GCSA2 (FILE) & LCP (FILE.lcp) indexes" << endl
+         << "                              of the graph's sequence space" << endl
+         << "                              (required for sequence queries)" << endl
+         << "  -S, --sequence STR          search for sequence STR" << endl
+         << "  -M, --mems STR              describe the super-maximal exact matches" << endl
+         << "                              of the STR (GCSA2) in JSON" << endl
+         << "  -B, --reseed-length N       find non-super-maximal MEMs inside SMEMs length>=N" << endl
+         << "  -f, --fast-reseed           use fast SMEM reseeding algorithm" << endl
+         << "  -Y, --max-mem N             maximum length of the MEM [GCSA2 order]" << endl
+         << "  -Z, --min-mem N             minimum length of the MEM [1]" << endl
+         << "  -D, --distance              return distance on path between pair of nodes (-n)" << endl
+         << "                              if -P not used, best path chosen heurstically" << endl
+         << "  -Q, --paths-named STR       return all paths with name prefix STR (may repeat)" << endl
+         << "                              (deprecated)" << endl;
 
 }
 
 int main_find(int argc, char** argv) {
+    Logger logger("vg find");
 
     if (argc == 2) {
         help_find(argv);
@@ -164,11 +180,12 @@ int main_find(int argc, char** argv) {
                 {"list-paths", no_argument, 0, 'I'},
                 {"subgraph-k", required_argument, 0, 'K'},
                 {"gbwt", required_argument, 0, 'H'},
+                {"help", no_argument, 0, 'h'},
                 {0, 0, 0, 0}
             };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "x:n:e:s:o:hc:LS:p:P:r:l:F:mg:M:B:fDG:N:A:Y:Z:IQ:ER:W:K:H:",
+        c = getopt_long (argc, argv, "x:n:e:s:o:h?c:LS:p:P:r:l:F:mg:M:B:fDG:N:A:Y:Z:IQ:ER:W:K:H:",
                          long_options, &option_index);
 
         // Detect the end of the options.
@@ -179,20 +196,23 @@ int main_find(int argc, char** argv) {
         {
 
         case 'x':
-            xg_name = optarg;
+            xg_name = require_exists(logger, optarg);
             break;
 
         case 'g':
-            gcsa_in = optarg;
-            break;
-
-        case 'S':
-            sequence = optarg;
+            gcsa_in = require_exists(logger, optarg);
+            // We need the LCP too
+            require_exists(logger, gcsa_in + ".lcp");
             break;
 
         case 'M':
-            sequence = optarg;
             get_mems = true;
+        case 'S': // fallthrough for -M too
+            if (!sequence.empty()) {
+                logger.warn() << "multiple sequences given with -S or -M; "
+                              << "only the last one will be used" << endl;
+            }
+            sequence = optarg;
             break;
             
         case 'B':
@@ -216,7 +236,7 @@ int main_find(int argc, char** argv) {
             break;
 
         case 'R':
-            bed_targets_file = optarg;
+            bed_targets_file = require_exists(logger, optarg);
             break;
 
         case 'E':
@@ -245,11 +265,11 @@ int main_find(int argc, char** argv) {
             break;
 
         case 'N':
-            node_list_file = optarg;
+            node_list_file = require_exists(logger, optarg);
             break;
 
         case OPT_MAPPING:
-            node_mapping_file = optarg;
+            node_mapping_file = require_exists(logger, optarg);
             break;
 
         case 'e':
@@ -265,11 +285,11 @@ int main_find(int argc, char** argv) {
             break;
         
         case 'l':
-            sorted_gam_name = optarg;
+            sorted_gam_name = require_exists(logger, optarg);
             break;
 
         case 'F':
-            sorted_gaf_name = optarg;
+            sorted_gaf_name = require_exists(logger, optarg);
             break;
 
         case 'I':
@@ -294,7 +314,7 @@ int main_find(int argc, char** argv) {
             break;
 
         case 'G':
-            gam_file = optarg;
+            gam_file = require_exists(logger, optarg);
             break;
             
         case OPT_CONNECTING_START:
@@ -310,7 +330,7 @@ int main_find(int argc, char** argv) {
             break;
 
         case 'A':
-            to_graph_file = optarg;
+            to_graph_file = require_exists(logger, optarg);
             break;
 
         case 'K':
@@ -318,7 +338,7 @@ int main_find(int argc, char** argv) {
             break;
 
         case 'H':
-            gbwt_name = optarg;
+            gbwt_name = require_exists(logger, optarg);
             break;
 
         case 'h':
@@ -332,38 +352,33 @@ int main_find(int argc, char** argv) {
         }
     }
     if (optind < argc) {
-        cerr << "[vg find] find does not accept positional arguments" << endl;
-        return 1;
+        logger.error() << "find does not accept positional arguments" << endl;
     }
 
     if (gcsa_in.empty() && xg_name.empty() && sorted_gam_name.empty() && sorted_gaf_name.empty()) {
-        cerr << "[vg find] find requires -g, -x, -l, or -F to know where to find its database" << endl;
-        return 1;
+        logger.error() << "find requires -g, -x, -l, or -F to know where to find its database" << endl;
     }
 
     if (context_size > 0 && use_length == true && xg_name.empty()) {
-        cerr << "[vg find] error, -L not supported without -x" << endl;
-        exit(1);
+        logger.error() << "-L not supported without -x" << endl;
     }
     
     if (xg_name.empty() && mem_reseed_length) {
-        cerr << "error:[vg find] SMEM reseeding requires an XG index. Provide XG index with -x." << endl;
-        exit(1);
+        logger.error() << "SMEM reseeding requires an XG index. Provide XG index with -x." << endl;
     }
     
     if ((id(connecting_start) == 0) != (id(connecting_end) == 0)) {
-        cerr << "error:[vg find] --connecting-start and --connecting-end must be specified together." << endl;
-        exit(1);
+        logger.error() << "--connecting-start and --connecting-end must be specified together." << endl;
+    }
+
+    if (gcsa_in.empty() && !sequence.empty()) {
+        logger.error() << "need GCSA index to query sequences" << endl;
     }
     
     // process input node list
     if (!node_list_file.empty()) {
         ifstream nli;
         nli.open(node_list_file);
-        if (!nli.good()){
-            cerr << "[vg find] error, unable to open the node list input file." << endl;
-            exit(1);
-        }
         string line;
         while (getline(nli, line)){
             for (auto& idstr : split_delims(line, " \t")) {
@@ -386,6 +401,28 @@ int main_find(int argc, char** argv) {
         }
     }
 
+    // Parse any targets
+    // handle targets from BED
+    if (!bed_targets_file.empty()) {
+        parse_bed_regions(bed_targets_file, targets);
+    }
+    // those given on the command line
+    for (auto& target : targets_str) {
+        Region region;
+        parse_region(target, region);
+        targets.push_back(region);
+    }
+
+    // Find out paths we will need to make position queries on, in case they
+    // aren't already the right sense.
+    std::unordered_set<std::string> required_position_paths;
+    for (const Region& r : targets) {
+        required_position_paths.insert(r.seq);
+    }
+    if (!path_name.empty()) {
+        required_position_paths.insert(path_name);
+    }
+    
     PathPositionHandleGraph* xindex = nullptr;
     unique_ptr<PathHandleGraph> path_handle_graph;
     bdsg::PathPositionOverlayHelper overlay_helper;
@@ -393,7 +430,7 @@ int main_find(int argc, char** argv) {
     if (!xg_name.empty()) {
         path_handle_graph = vg::io::VPKG::load_one<PathHandleGraph>(xg_name);
         input_gfa = dynamic_cast<GFAHandleGraph*>(path_handle_graph.get()) != nullptr;
-        xindex = overlay_helper.apply(path_handle_graph.get());
+        xindex = overlay_helper.apply(path_handle_graph.get(), required_position_paths);
 
         // Remove node ids that do not exist in the graph.
         std::vector<nid_t> final_ids;
@@ -401,7 +438,7 @@ int main_find(int argc, char** argv) {
             if (xindex->has_node(id)) {
                 final_ids.push_back(id);
             } else {
-                std::cerr << "warning: [vg find] no node with id " << id << " in the graph" << std::endl;
+                logger.warn() << "no node with id " << id << " in the graph" << endl;
             }
         }
         node_ids = final_ids;
@@ -421,8 +458,7 @@ int main_find(int argc, char** argv) {
         gbwt_index = vg::io::VPKG::load_one<gbwt::GBWT>(gbwt_name.c_str());
         if (gbwt_index.get() == nullptr) {
             // Complain if we couldn't.
-            cerr << "error:[vg find] unable to load gbwt index file" << endl;
-            return 1;
+            logger.error() << "unable to load GBWT index file " << gbwt_name << endl;
         }
     }
     
@@ -432,7 +468,7 @@ int main_find(int argc, char** argv) {
         // Load the GAM index
         gam_index = unique_ptr<GAMIndex>(new GAMIndex());
         get_input_file(sorted_gam_name + ".gai", [&](istream& in) {
-            // We get it form the appropriate .gai, which must exist
+            // We get it from the appropriate .gai, which must exist
             gam_index->load(in); 
         });
     }
@@ -440,17 +476,15 @@ int main_find(int argc, char** argv) {
     // load GAF index
     tbx_t *gaf_tbx = NULL;
     htsFile *gaf_fp = NULL;
-    if (!sorted_gaf_name.empty()){
+    if (!sorted_gaf_name.empty()) {
         gaf_tbx = tbx_index_load3(sorted_gaf_name.c_str(), NULL, 0);
-        if ( !gaf_tbx ){
-            cerr << "Could not load .tbi/.csi index of " << sorted_gaf_name << endl;
-            exit(1);
+        if ( !gaf_tbx ) {
+            logger.error() << "Could not load .tbi/.csi index of " << sorted_gaf_name << endl;
         }
         int nseq;
         gaf_fp = hts_open(sorted_gaf_name.c_str(),"r");
         if ( !gaf_fp ) {
-            cerr << "Could not open " << sorted_gaf_name << endl;
-            exit(1);
+            logger.error() << "Could not open " << sorted_gaf_name << endl;
         }
     }
     
@@ -487,8 +521,7 @@ int main_find(int argc, char** argv) {
                 tbx_itr_destroy(itr);
             }
         } else {
-            cerr << "error [vg find]: Cannot find alignments on range without a sorted GAM or GAF" << endl;
-            exit(1);
+            logger.error() << "Cannot find alignments on range without a sorted GAM or GAF" << endl;
         }
     }
     
@@ -498,7 +531,7 @@ int main_find(int argc, char** argv) {
         // Load up the graph
         auto graph = vg::io::VPKG::load_one<PathHandleGraph>(to_graph_file);
 
-        if (gam_index.get() != nullptr | !sorted_gaf_name.empty()) {
+        if (gam_index.get() != nullptr || !sorted_gaf_name.empty()) {
             // Get the ID ranges from the graph
             auto ranges = vg::algorithms::sorted_id_ranges(graph.get());
             // Throw out the graph
@@ -517,22 +550,15 @@ int main_find(int argc, char** argv) {
               
             } else if (!sorted_gaf_name.empty()) {
                 // Find in sorted GAF
-                // loop over ranges and print GAF records
-                for (auto range : ranges) {
-                    string reg = "{node}:" + convert(range.first) + "-" + convert(range.second);
-                    hts_itr_t *itr = tbx_itr_querys(gaf_tbx, reg.c_str());
-                    kstring_t str = {0,0,0};
-                    if ( itr ) {
-                        while (tbx_itr_next(gaf_fp, gaf_tbx, itr, &str) >= 0) {
-                            puts(str.s);
-                        }
-                        tbx_itr_destroy(itr);
-                    }
-                }
+                for_each_gaf_record_in_ranges(gaf_fp, gaf_tbx, ranges, [&](const std::string& record_string) {
+                    // For each unique matching GAF record's unparsed string
+
+                    // Handle the record (by printing it).
+                    std::cout << record_string << std::endl;
+                }); 
             }
         } else {
-            cerr << "error [vg find]: Cannot find alignments on graph without a sorted GAM" << endl;
-            exit(1);
+            logger.error() << "Cannot find alignments on graph without a sorted GAM" << endl;
         }
     }
 
@@ -584,12 +610,9 @@ int main_find(int argc, char** argv) {
             if (xindex->has_path(path_name) == false) {
                 // This path doesn't exist, and we'll get a segfault or worse if
                 // we go look for positions in it.
-                cerr << "[vg find] error, path \"" << path_name << "\" not found in index" << endl;
-                exit(1);
+                logger.error() << "path \"" << path_name << "\" not found in index" << endl;
             }
             
-            // Note: this isn't at all consistent with -P option with rocksdb, which couts a range
-            // and then mapping, but need this info right now for scripts/chunked_call
             path_handle_t path_handle = xindex->get_path_handle(path_name);
             for (auto node_id : node_ids) {
                 cout << node_id;
@@ -604,26 +627,16 @@ int main_find(int argc, char** argv) {
         }
         if (pairwise_distance) {
             if (node_ids.size() != 2) {
-                cerr << "[vg find] error, exactly 2 nodes (-n) required with -D" << endl;
-                exit(1);
+                logger.error() << "exactly 2 nodes (-n) required with -D" << endl;
             }
-            cout << vg::algorithms::min_approx_path_distance(dynamic_cast<PathPositionHandleGraph*>(&*xindex), make_pos_t(node_ids[0], false, 0), make_pos_t(node_ids[1], false, 0), 1000) << endl;
+            cout << vg::algorithms::min_approx_path_distance(dynamic_cast<PathPositionHandleGraph*>(&*xindex),
+                make_pos_t(node_ids[0], false, 0), make_pos_t(node_ids[1], false, 0), 1000) << endl;
             return 0;
         }
         if (list_path_names) {
             xindex->for_each_path_handle([&](path_handle_t path_handle) {
                     cout << xindex->get_path_name(path_handle) << endl;
                 });
-        }
-        // handle targets from BED
-        if (!bed_targets_file.empty()) {
-            parse_bed_regions(bed_targets_file, targets);
-        }
-        // those given on the command line
-        for (auto& target : targets_str) {
-            Region region;
-            parse_region(target, region);
-            targets.push_back(region);
         }
         if (!targets.empty()) {
             auto output_graph = get_output_graph();
@@ -652,8 +665,7 @@ int main_find(int argc, char** argv) {
                 // Grab each target region
                 if(xindex->has_path(target.seq) == false) { 
                     // Passing a nonexistent path to get_path_range produces Undefined Behavior
-                    cerr << "[vg find] error, path " << target.seq << " not found in index" << endl;
-                    exit(1);
+                    logger.error() << "path \"" << target.seq << "\" not found in index" << endl;
                 }
                 path_handle_t path_handle = xindex->get_path_handle(target.seq);
                 // no coordinates given, we do whole thing (0,-1)
@@ -683,8 +695,9 @@ int main_find(int argc, char** argv) {
                     ofstream out(s.str().c_str());
                     vg::io::save_handle_graph(&graph, out);
                     out.close();
-                    // reset our graph
-                    dynamic_cast<DeletableHandleGraph&>(graph).clear();
+                    // reset our graph so it has no nodes or paths anymore
+                    graph.clear();
+                    crash_unless(graph.get_path_count() == 0);
                 }
                 if (subgraph_k) {
                     prep_graph(); // don't forget to prep the graph, or the kmer set will be wrong[
@@ -702,14 +715,17 @@ int main_find(int argc, char** argv) {
                             for (auto& p : vg::algorithms::nearest_offsets_in_paths(xindex, walk.begin, subgraph_k*2)) {
                                 const uint64_t& start_p = p.second.front().first;
                                 const bool& start_rev = p.second.front().second;
-                                if (p.first == path_handle && (!start_rev && start_p >= target.start || start_rev && start_p <= target.end)) {
-                                    start_str = target.seq + ":" + std::to_string(start_p) + (p.second.front().second ? "-" : "+");
+                                if (p.first == path_handle && (!start_rev && start_p >= target.start 
+                                                               || start_rev && start_p <= target.end)) {
+                                    start_str = target.seq + ":" + std::to_string(start_p) 
+                                                + (p.second.front().second ? "-" : "+");
                                 }
                             }
                             for (auto& p : vg::algorithms::nearest_offsets_in_paths(xindex, walk.end, subgraph_k*2)) {
                                 const uint64_t& end_p = p.second.front().first;
                                 const bool& end_rev = p.second.front().second;
-                                if (p.first == path_handle && (!end_rev && end_p <= target.end || end_rev && end_p >= target.start)) {
+                                if (p.first == path_handle && (!end_rev && end_p <= target.end 
+                                                               || end_rev && end_p >= target.start)) {
                                     end_str = target.seq + ":" + std::to_string(end_p) + (p.second.front().second ? "-" : "+");
                                 }
                             }
@@ -764,8 +780,8 @@ int main_find(int argc, char** argv) {
             nid_t id_start=0, id_end=0;
             vector<string> parts = split_delims(range, ":");
             if (parts.size() == 1) {
-                cerr << "[vg find] error, format of range must be \"N:M\" where start id is N and end id is M, got " << range << endl;
-                exit(1);
+                logger.error() << "format of range must be \"N:M\" "
+                               << "where start id is N and end id is M; got " << range << endl;
             }
             convert(parts.front(), id_start);
             convert(parts.back(), id_end);
@@ -802,6 +818,7 @@ int main_find(int argc, char** argv) {
             vg::io::save_handle_graph(&graph, cout);
         }
         if (extract_paths) {
+            logger.warn() << "vg paths -Q/--paths-named is deprecated due to the partial Protobuf graph output format. Consider vg paths --extract-fasta instead." << std::endl;
             for (auto& pattern : extract_path_patterns) {
             
                 // We want to write uncompressed protobuf Graph objects containing our paths.
@@ -839,10 +856,6 @@ int main_find(int argc, char** argv) {
             } else {
                 ifstream in;
                 in.open(gam_file.c_str());
-                if(!in.is_open()) {
-                    cerr << "[vg find] error: could not open alignments file " << gam_file << endl;
-                    exit(1);
-                }
                 vg::io::for_each(in, lambda);
             }
             // now we have the nodes to get
@@ -854,6 +867,7 @@ int main_find(int argc, char** argv) {
             }
             vg::algorithms::expand_subgraph_by_steps(*xindex, graph, max(1, context_size)); // get connected edges
             vg::algorithms::add_connecting_edges_to_subgraph(*xindex, graph);
+            vg::algorithms::add_subpaths_to_subgraph(*xindex, graph);
             vg::io::save_handle_graph(&graph, cout);
         }
         if (id(connecting_start) != 0) {
@@ -868,17 +882,12 @@ int main_find(int argc, char** argv) {
     // todo cleanup if/else logic to allow only one function
 
     if (!sequence.empty()) {
-        if (gcsa_in.empty()) {
-            cerr << "error:[vg find] need GCSA index to query sequences" << endl;
-            return 1;
-        }
-        
         // Configure GCSA2 verbosity so it doesn't spit out loads of extra info
         gcsa::Verbosity::set(gcsa::Verbosity::SILENT);
         
         // Open it
         auto gcsa_index = vg::io::VPKG::load_one<gcsa::GCSA>(gcsa_in);
-        // default LCP is the gcsa base name +.lcp
+        // default LCP is the GCSA base name +.lcp
         auto lcp_index = vg::io::VPKG::load_one<gcsa::LCPArray>(gcsa_in + ".lcp");
         
         //range_type find(const char* pattern, size_type length) const;
@@ -895,12 +904,13 @@ int main_find(int argc, char** argv) {
                 }
             }
         } else {
-            // for mems we need to load up the gcsa and lcp structures into the mapper
+            // for MEMs we need to load up the GCSA and LCP structures into the mapper
             Mapper mapper(xindex, gcsa_index.get(), lcp_index.get());
             mapper.fast_reseed = use_fast_reseed;
             // get the mems
             double lcp_avg, fraction_filtered;
-            auto mems = mapper.find_mems_deep(sequence.begin(), sequence.end(), lcp_avg, fraction_filtered, max_mem_length, min_mem_length, mem_reseed_length);
+            auto mems = mapper.find_mems_deep(sequence.begin(), sequence.end(), lcp_avg, fraction_filtered,
+                                              max_mem_length, min_mem_length, mem_reseed_length);
             
             // dump them to stdout
             cout << mems_to_json(mems) << endl;

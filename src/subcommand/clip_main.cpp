@@ -17,39 +17,56 @@ using namespace vg::subcommand;
 using namespace vg::io;
 
 void help_clip(char** argv) {
-  cerr << "usage: " << argv[0] << " [options] <graph>" << endl
-       << "Chop out variation within path intervals of a vg graph" << endl
-       << endl
-       << "input options: " << endl
-       << "    -b, --bed FILE            BED regions corresponding to path intervals of the graph to target" << endl
-       << "    -r, --snarls FILE         Snarls from vg snarls (recomputed if not given unless -d and -P used)." << endl
-       << "depth clipping options: " << endl
-       << "    -d, --depth N             Clip out nodes and edges with path depth below N" << endl
-       << "stub clipping options:" << endl
-       << "    -s, --stubs               Clip out all stubs (nodes with degree-0 sides that aren't on reference)" << endl
-       << "    -S, --stubbify-paths      Clip out all edges necessary to ensure selected reference paths have exactly two stubs" << endl
-       << "snarl complexity clipping options: [default mode]" << endl
-       << "    -n, --max-nodes N         Only clip out snarls with > N nodes" << endl
-       << "    -e, --max-edges N         Only clip out snarls with > N edges" << endl
-       << "    -N  --max-nodes-shallow N Only clip out snarls with > N nodes not including nested snarls" << endl
-       << "    -E  --max-edges-shallow N Only clip out snarls with > N edges not including nested snarls" << endl
-       << "    -a, --max-avg-degree N    Only clip out snarls with average degree > N" << endl
-       << "    -l, --max-reflen-prop F   Ignore snarls whose reference traversal spans more than F (0<=F<=1) of the whole reference path" << endl
-       << "    -L, --max-reflen N        Ignore snarls whose reference traversal spans more than N bp" << endl
-       << "big deletion edge clipping options:" << endl
-       << "    -D, --max-deletion-edge N Clip out all edges whose endpoints have distance > N on a reference path" << endl
-       << "    -c, --context N           Search up to at most N steps from reference paths for candidate deletion edges [1]" << endl
-       << "general options: " << endl
-       << "    -P, --path-prefix STRING  Do not clip out alleles on paths beginning with given prefix (such references must be specified either with -P or -b). Multiple allowed" << endl
-       << "    -m, --min-fragment-len N  Don't write novel path fragment if it is less than N bp long" << endl
-       << "    -B, --output-bed          Write BED-style file of affected intervals instead of clipped graph. " << endl
-       << "                              Columns 4-9 are: snarl node-count edge-count shallow-node-count shallow-edge-count avg-degree" << endl
-       << "    -t, --threads N           number of threads to use [default: all available]" << endl
-       << "    -v, --verbose             Print some logging messages" << endl
-       << endl;
+    cerr << "usage: " << argv[0] << " [options] <graph>" << endl
+         << "Chop out variation within path intervals of a vg graph" << endl
+         << endl
+         << "input options: " << endl
+         << "  -b, --bed FILE             BED regions for path intervals of graph to target" << endl
+         << "  -r, --snarls FILE          snarls from vg snarls (recomputed if unspecified" << endl
+         << "                             and -n, -e, -N, -E, -a, -l, -L, or -D used)" << endl
+         << "depth clipping options: " << endl
+         << "  -d, --depth N              clip out nodes and edges with path depth below N" << endl
+         << "                             use snarl selection/BED options to target regions" << endl
+         << "stub clipping options:" << endl
+         << "  -s, --stubs                clip out all stubs, i.e. nodes with degree-0 sides" << endl
+         << "                             that aren't on reference" << endl
+         << "  -S, --stubbify-paths       clip out all edges neccessary so that selected" << endl
+         << "                             reference paths have exactly two stubs" << endl
+         << "snarl selection and clipping options:" << endl
+         << "  -n, --min-nodes N          clip out snarls with >N nodes" << endl
+         << "  -e, --min-edges N          clip out snarls with >N edges" << endl
+         << "  -i, --min-bases N          clip out snarls with >N bases" << endl     
+         << "  -N, --min-nodes-shallow N  clip out snarls with >N nodes," << endl
+         << "                             ignoring nested snarls" << endl
+         << "  -E, --min-edges-shallow N  clip out snarls with >N edges," << endl
+         << "                             ignoring nested snarls" << endl
+         << "  -a, --min-avg-degree N     clip out snarls with average degree > N" << endl
+         << "  -A, --min-reflen N         ignore snarls with reference traversal span < N bp" << endl     
+         << "  -l, --max-reflen-prop F    ignore snarls with reference traversal span > F" << endl
+         << "                             (0<=F<=1) of the whole reference path" << endl
+         << "  -L, --max-reflen N         ignore snarls with reference traversal span > N bp" << endl
+         << "  -g, --net-edges            only clip net-edges inside snarls" << endl
+         << "  -G, --top-net-edges        only clip net-edges inside top-level snarls" << endl
+         << "big deletion edge clipping options:" << endl
+         << "  -D, --max-deletion-edge N  clip out all edges whose endpoints have" << endl
+         << "                             distance > N on a reference path" << endl
+         << "  -c, --context N            search up to at most N steps from reference paths" << endl
+         << "                             for candidate deletion edges [1]" << endl
+         << "general options: " << endl
+         << "  -P, --path-prefix STR      do not clip out alleles on paths beginning with STR" << endl
+         << "                             (specify such references with -P or -b; may repeat)" << endl
+         << "  -m, --min-fragment-len N   don't write novel path fragment if < N bp long" << endl
+         << "  -B, --output-bed           write BED-style file of intervals," << endl
+         << "                             instead of clipped grap. columns 4-9 are:" << endl
+         << "                             snarl node-count edge-count shallow-node-count" << endl
+         << "                             shallow-edge-count avg-degree" << endl
+         << "  -t, --threads N            number of threads to use [all available]" << endl
+         << "  -v, --verbose              print some logging messages" << endl
+         << "  -h, --help                 print this help message to stderr and exit" << endl;
 }    
 
 int main_clip(int argc, char** argv) {
+    Logger logger("vg clip");
 
     string bed_path;
     string snarls_path;
@@ -61,13 +78,17 @@ int main_clip(int argc, char** argv) {
     bool stub_clipping = false;
     bool stubbify_reference = false;
 
-    size_t max_nodes = 0;
-    size_t max_edges = 0;
-    size_t max_nodes_shallow = 0;
-    size_t max_edges_shallow = 0;
-    double max_avg_degree = 0.;
-    double max_reflen_prop = numeric_limits<double>::max();
+    size_t min_nodes = 0;
+    size_t min_edges = 0;
+    size_t min_bases = 0;
+    size_t min_nodes_shallow = 0;
+    size_t min_edges_shallow = 0;
+    double min_avg_degree = 0.;
+    size_t min_reflen = 0;
+    double max_reflen_prop = 1.;    
     size_t max_reflen = numeric_limits<size_t>::max();
+    bool only_net_edges = false;
+    bool only_top_net_edges = false;
     bool out_bed = false;
     bool snarl_option = false;
     
@@ -89,27 +110,31 @@ int main_clip(int argc, char** argv) {
             {"depth", required_argument, 0, 'd'},
             {"stubs", no_argument, 0, 's'},
             {"stubbify-paths", no_argument, 0, 'S'},
-            {"max-nodes", required_argument, 0, 'n'},
-            {"max-edges", required_argument, 0, 'e'},
-            {"max-nodes-shallow", required_argument, 0, 'N'},
-            {"max-edges-shallow", required_argument, 0, 'E'},
-            {"max-avg-degree", required_argument, 0, 'a'},
+            {"min-nodes", required_argument, 0, 'n'},
+            {"min-edges", required_argument, 0, 'e'},
+            {"min-bases", required_argument, 0, 'i'},
+            {"min-nodes-shallow", required_argument, 0, 'N'},
+            {"min-edges-shallow", required_argument, 0, 'E'},
+            {"min-avg-degree", required_argument, 0, 'a'},
             {"max-reflen-prop", required_argument, 0, 'l'},
             {"max-reflen", required_argument, 0, 'L'},
-            {"max-deletion", required_argument, 0, 'D'},
+            {"min-reflen", required_argument, 0, 'A'},
+            {"net-edges", no_argument, 0, 'g'},
+            {"top-net-edges", no_argument, 0, 'G'},            
+            {"max-deletion-edge", required_argument, 0, 'D'},
             {"context", required_argument, 0, 'c'},
             {"path-prefix", required_argument, 0, 'P'},
             {"snarls", required_argument, 0, 'r'},
             {"min-fragment-len", required_argument, 0, 'm'},
             {"output-bed", no_argument, 0, 'B'},
             {"threads", required_argument, 0, 't'},
-            {"verbose", required_argument, 0, 'v'},
+            {"verbose", no_argument, 0, 'v'},
             {0, 0, 0, 0}
 
         };
         int option_index = 0;
-        c = getopt_long (argc, argv, "hb:d:sSn:e:N:E:a:l:L:D:c:P:r:m:Bt:v",
-                long_options, &option_index);
+        c = getopt_long (argc, argv, "h?b:d:sSn:e:i:N:E:a:l:L:A:gGD:c:P:r:m:Bt:v",
+                         long_options, &option_index);
 
         // Detect the end of the options.
         if (c == -1)
@@ -121,9 +146,9 @@ int main_clip(int argc, char** argv) {
         case '?':
         case 'h':
             help_clip(argv);
-            return 0;
+            return 1;
         case 'b':
-            bed_path = optarg;
+            bed_path = require_exists(logger, optarg);
             break;
         case 'd':
             min_depth = parse<size_t>(optarg);
@@ -135,23 +160,27 @@ int main_clip(int argc, char** argv) {
             stubbify_reference = true;
             break;            
         case 'n':
-            max_nodes = parse<size_t>(optarg);
+            min_nodes = parse<size_t>(optarg);
             snarl_option = true;
             break;
         case 'e':
-            max_edges = parse<size_t>(optarg);
+            min_edges = parse<size_t>(optarg);
             snarl_option = true;
             break;
+        case 'i':
+            min_bases = parse<size_t>(optarg);
+            snarl_option = true;
+            break;            
         case 'N':
-            max_nodes_shallow = parse<size_t>(optarg);
+            min_nodes_shallow = parse<size_t>(optarg);
             snarl_option = true;
             break;
         case 'E':
-            max_edges_shallow = parse<size_t>(optarg);
+            min_edges_shallow = parse<size_t>(optarg);
             snarl_option = true;
             break;            
         case 'a':
-            max_avg_degree = parse<double>(optarg);
+            min_avg_degree = parse<double>(optarg);
             snarl_option = true;
             break;
         case 'l':
@@ -162,6 +191,16 @@ int main_clip(int argc, char** argv) {
             max_reflen = parse<size_t>(optarg);
             snarl_option = true;
             break;
+        case 'A':
+            min_reflen = parse<size_t>(optarg);
+            snarl_option = true;
+            break;            
+        case 'g':
+            only_net_edges = true;
+            break;
+        case 'G':
+            only_top_net_edges = true;
+            break;                        
         case 'D':
             max_deletion = parse<size_t>(optarg);
             break;
@@ -172,7 +211,7 @@ int main_clip(int argc, char** argv) {
             ref_prefixes.push_back(optarg);
             break;
         case 'r':
-            snarls_path = optarg;
+            snarls_path = require_exists(logger, optarg);
             break;
         case 'm':
             min_fragment_len = parse<int>(optarg);
@@ -184,50 +223,37 @@ int main_clip(int argc, char** argv) {
             verbose = true;
             break;
         case 't':
-        {
-            int num_threads = parse<int>(optarg);
-            if (num_threads <= 0) {
-                cerr << "error:[vg clip] Thread count (-t) set to " << num_threads << ", must set to a positive integer." << endl;
-                exit(1);
-            }
-            omp_set_num_threads(num_threads);
-            break;
-        }            
+            set_thread_count(logger, optarg);
+            break;       
         default:
             abort();
         }
     }
 
     if (bed_path.empty() == ref_prefixes.empty()) {
-        cerr << "error:[vg-clip] Reference intervals must be specified with one of -b or -P" << endl;
-        return 1;
+        logger.error() << "Reference intervals must be specified with one of -b or -P" << endl;
     }
 
-    if ((min_depth >= 0 || max_deletion >= 0 || stub_clipping || stubbify_reference) && (snarl_option || out_bed)) {
-        cerr << "error:[vg-clip] bed output (-B) and snarl complexity options (-n, -e, -N, -E, -a, -l, -L) cannot be used with -d, -D, -s or -S" << endl;
-        return 1;
-    }
-
-    // to do: I think it could be a good idea to combine these options
-    if (min_depth >= 0 && max_deletion >= 0) {
-        cerr << "error:[vg-clip] -d cannot (yet?) be used with -D" << endl;
-        return 1;
+    if ((max_deletion >= 0 || stub_clipping || stubbify_reference) && (snarl_option || out_bed)) {
+        logger.error() << "BED output (-B) and snarl complexity options (-n, -e, -N, -E, -a, -l, -L, -A) "
+                       << "cannot be used with -D, -s or -S" << endl;
     }
 
     // ditto about combining
     if ((stub_clipping || stubbify_reference) && (min_depth >= 0 || max_deletion >= 0)) {
-        cerr << "error:[vg-clip] -s and -S cannot (yet?) be used with -d or -D" << endl;
-        return 1;
+        logger.error() << "-s and -S cannot (yet?) be used with -d or -D" << endl;
     }
     
     if (context_steps >= 0 && max_deletion < 0) {
-        cerr << "error:[vg-clip] -c can only be used with -D" << endl;
-        return 1;
+        logger.error() << "-c can only be used with -D" << endl;
     }
 
     if (stubbify_reference && ref_prefixes.empty()) {
-        cerr << "error:[vg-clip] -S can only be used with -P" << endl;
-        return 1;
+        logger.error() << "-S can only be used with -P" << endl;
+    }
+
+    if (only_net_edges && only_top_net_edges) {
+        logger.error() << "-g and -G cannot be used together: choose one" << endl;
     }
 
     // default to same
@@ -250,41 +276,61 @@ int main_clip(int argc, char** argv) {
     bool need_pp = !(bed_path.empty() && (min_depth >= 0 || max_deletion >= 0 || stub_clipping));
 
     // need snarls if input regions are provided, or doing snarl based clipping
-    bool need_snarls = !bed_path.empty() || (min_depth < 0 && max_deletion < 0 && !stub_clipping);
+    bool need_snarls = snarl_option || !bed_path.empty();
 
-    if (need_pp) {
-        pp_graph = overlay_helper.apply(graph.get());
+    // TODO: FIX!!  shouldn't need pp without BED coordinates
+    need_pp = need_pp || need_snarls;
+
+    if (!bed_path.empty()) {
+        // load the BED file
+        parse_bed_regions(bed_path, bed_regions);
         if (verbose) {
-            cerr << "[vg clip]: Computed path position overlay of input graph" << endl;
+            logger.info() << "Loaded " << bed_regions.size() << " BED regions" << endl;
+        }
+    }
+    
+    // It's going to be a little expensive to find the paths with basenames
+    // matching the prefixes (algorithmically, if not in practice), so we fill
+    // them in once and then re-use them.
+    std::vector<std::string> graph_paths_matched;
+    if (need_pp) {
+        // Figure out the paths we're going to need regions on.
+        std::unordered_set<std::string> position_path_names;
+        
+        for (const Region& region : bed_regions) {
+            // For each region already defined (from the BED), we need its sequence indexed
+            position_path_names.insert(region.seq);
+        }
+        
+        if (!ref_prefixes.empty()) {
+            // If we want all paths matching some prefixes
+            graph->for_each_path_handle([&](path_handle_t path_handle) {
+                // Look at all ther paths
+                std::string path_name = graph->get_path_name(path_handle);
+                subrange_t subrange;
+                // And get their base path names
+                path_name = Paths::strip_subrange(path_name, &subrange);
+                for (const string& ref_prefix : ref_prefixes) {
+                    if (path_name.compare(0, ref_prefix.length(), ref_prefix) == 0) {
+                        // And make sure they're indexed if they match the prefix.
+                        position_path_names.insert(path_name);
+                        // And remember them to then index all of
+                        graph_paths_matched.emplace_back(std::move(path_name));
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Get the overlay, indexing all the paths we will need to care about 
+        pp_graph = overlay_helper.apply(graph.get(), position_path_names);
+        if (verbose) {
+            logger.info() << "Computed path position overlay of input graph" << endl;
         }
     }
 
-    if (need_snarls) {
-        // Load or compute the snarls which are required for targetting bed regions
-        if (!snarls_path.empty()) {
-            ifstream snarl_file(snarls_path.c_str());
-            if (!snarl_file) {
-                cerr << "Error [vg clip]: Unable to load snarls file: " << snarls_path << endl;
-                return 1;
-            }
-            snarl_manager = vg::io::VPKG::load_one<SnarlManager>(snarl_file);
-            if (verbose) {
-                cerr << "[vg clip]: Loaded " << snarl_manager->num_snarls() << " snarls" << endl;
-            }
-        } else {
-            IntegratedSnarlFinder finder(*graph);
-            snarl_manager = unique_ptr<SnarlManager>(new SnarlManager(std::move(finder.find_snarls_parallel())));
-            if (verbose) {
-                cerr << "[vg clip]: Computed " << snarl_manager->num_snarls() << " snarls" << endl;
-            }
-        }
-        
-        // load the bed file
+    if (need_snarls) {        
         if (!bed_path.empty()) {
-            parse_bed_regions(bed_path, bed_regions);
-            if (verbose) {
-                cerr << "[vg clip]: Loaded " << bed_regions.size() << " BED regions" << endl;
-            }
             // contig names left in this set are *not* in the graph
             unordered_set<string> contig_set;
             for (const Region& region : bed_regions) {
@@ -305,49 +351,75 @@ int main_clip(int argc, char** argv) {
             }
             if (bed_regions_in_graph.size() != bed_regions.size()) {
                 if (verbose) {
-                    cerr << "[vg clip]: Dropped " << (bed_regions.size() - bed_regions_in_graph.size()) << " BED regions whose sequence names do not correspond to paths in the graph" << endl;
+                    logger.info() << "Dropped " << (bed_regions.size() - bed_regions_in_graph.size()) 
+                                  << " BED regions whose sequence names "
+                                  << "do not correspond to paths in the graph" << endl;
                 }
                 if (bed_regions_in_graph.empty()) {
-                    cerr << "warning:[vg-clip] No BED region found that lies on path in graph (use vg paths -Lv to list paths that are in the graph)" << endl;
+                    logger.warn() << "No BED region found that lies on path in graph "
+                                  << "(use vg paths -Lv to list paths that are in the graph)" << endl;
                 }
             }
             swap(bed_regions, bed_regions_in_graph);
         } else {
             assert(need_pp);
             assert(!ref_prefixes.empty());
-            // load the bed regions from the reference path prefix
-            pp_graph->for_each_path_handle([&](path_handle_t path_handle) {
-                    string path_name = pp_graph->get_path_name(path_handle);
-                    subrange_t subrange;
-                    path_name = Paths::strip_subrange(path_name, &subrange);
-                    int64_t offset = subrange == PathMetadata::NO_SUBRANGE ? 0 : subrange.first;
-                    for (const string& ref_prefix : ref_prefixes) {
-                        if (path_name.compare(0, ref_prefix.length(), ref_prefix) == 0) {
-                            Region region = {path_name, offset, offset + (int64_t)pp_graph->get_path_length(path_handle) - 1};
-                            bed_regions.push_back(region);
-                            break;
-                        }
-                    }
-                });
+            
+            for (auto& path_name : graph_paths_matched) {
+                path_handle_t path_handle = pp_graph->get_path_handle(path_name);
+                // Fill in the BED regions from the paths matching the
+                // prefixes, now that we can get the lengths.
+                std::string base_name = get_path_base_name(*pp_graph, path_handle);
+                int64_t offset = get_path_base_offset(*pp_graph, path_handle);
+                Region region = {base_name, offset, offset + (int64_t)pp_graph->get_path_length(path_handle) - 1};
+                bed_regions.push_back(region);
+            }
+
             if (verbose) {
-                cerr << "[vg clip]: Inferred " << bed_regions.size() << " BED regions from paths in the graph" << endl;
+                logger.info() << "Inferred " << bed_regions.size() 
+                              << " BED regions from paths in the graph" << endl;
+            }
+        }
+        // Load or compute the snarls which are required for targetting BED regions
+        if (!snarls_path.empty()) {
+            ifstream snarl_file(snarls_path.c_str());
+            snarl_manager = vg::io::VPKG::load_one<SnarlManager>(snarl_file);
+            if (verbose) {
+                logger.info() << "Loaded " << snarl_manager->num_snarls() << " snarls" << endl;
+            }
+        } else {
+            std::unordered_map<nid_t, size_t> extra_node_weight;
+            constexpr size_t EXTRA_WEIGHT = 10000000000;
+            for (const Region& region : bed_regions) {
+                path_handle_t path_handle = graph->get_path_handle(region.seq);
+                extra_node_weight[graph->get_id(graph->get_handle_of_step(graph->path_begin(path_handle)))] += EXTRA_WEIGHT;
+                extra_node_weight[graph->get_id(graph->get_handle_of_step(graph->path_back(path_handle)))] += EXTRA_WEIGHT;
+            }
+            IntegratedSnarlFinder finder(*graph, extra_node_weight);
+            snarl_manager = unique_ptr<SnarlManager>(new SnarlManager(std::move(finder.find_snarls_parallel())));
+            if (verbose) {
+                logger.info() << "Computed " << snarl_manager->num_snarls() << " snarls" << endl;
             }
         }
     }        
-
-    if (min_depth >= 0) {
+    
+    if (min_depth >= 0 && max_deletion < 0) {
         // run the depth clipping       
-        if (bed_path.empty()) {            
+        if (bed_regions.empty()) {            
             // do the whole graph
             clip_low_depth_nodes_and_edges(graph.get(), min_depth, ref_prefixes, min_fragment_len, verbose);
         } else {
             // do the contained snarls
-            clip_contained_low_depth_nodes_and_edges(graph.get(), pp_graph, bed_regions, *snarl_manager, false, min_depth, min_fragment_len, verbose);
+            clip_contained_low_depth_nodes_and_edges(graph.get(), pp_graph, bed_regions, *snarl_manager, false, 
+                                                     min_depth, min_fragment_len, min_nodes, min_edges, min_bases,
+                                                     min_nodes_shallow, min_edges_shallow, min_avg_degree, min_reflen,
+                                                     max_reflen_prop, max_reflen, only_net_edges || only_top_net_edges,
+                                                     only_top_net_edges, out_bed, verbose);
         }
         
     } else if (max_deletion >= 0) {
         // run the deletion edge clipping on the whole graph
-        clip_deletion_edges(graph.get(), max_deletion, context_steps, ref_prefixes, min_fragment_len, verbose);
+        clip_deletion_edges(graph.get(), max_deletion, context_steps, min_depth, ref_prefixes, min_fragment_len, verbose);
     } else if (stub_clipping || stubbify_reference) {
         // run the stub clipping
         if (bed_path.empty()) {            
@@ -367,7 +439,9 @@ int main_clip(int argc, char** argv) {
     }else {
         // run the alt-allele clipping
         clip_contained_snarls(graph.get(), pp_graph, bed_regions, *snarl_manager, false, min_fragment_len,
-                              max_nodes, max_edges, max_nodes_shallow, max_edges_shallow, max_avg_degree, max_reflen_prop, max_reflen, out_bed, verbose);
+                              min_nodes, min_edges, min_bases, min_nodes_shallow, min_edges_shallow,
+                              min_avg_degree, min_reflen, max_reflen_prop, max_reflen,
+                              only_net_edges || only_top_net_edges, only_top_net_edges, out_bed, verbose);
     }
 
     // write the graph

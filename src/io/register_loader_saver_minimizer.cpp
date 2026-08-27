@@ -12,7 +12,6 @@ namespace vg {
 
 namespace io {
 
-using namespace std;
 using namespace vg::io;
 
 void register_loader_saver_minimizer() {
@@ -20,12 +19,17 @@ void register_loader_saver_minimizer() {
     std::string magic_string(reinterpret_cast<char*>(&magic_number), sizeof(magic_number));
 
     Registry::register_bare_loader_saver_with_magic<gbwtgraph::DefaultMinimizerIndex>("MinimizerIndex", magic_string, [](istream& input) -> void* {
-        gbwtgraph::DefaultMinimizerIndex* index = new gbwtgraph::DefaultMinimizerIndex();
+        gbwtgraph::DefaultMinimizerIndex* index = new gbwtgraph::DefaultMinimizerIndex(0); // Payload size will be set during deserialization.
+
+        // Load it. In case of a failure, this will:
+        // * Throw an exception if data is unacceptable.
+        // * Fail silently if reading the input fails.
+        // The exceptions are derived from std::runtime_error.
         index->deserialize(input);
-        
-        // Return the index so the caller owns it.
-        return static_cast<void*>(index);
+
+        return reinterpret_cast<void*>(index);
     }, [](const void* index_void, ostream& output) {
+        // This will fail silently if writing to the output stream fails.
         assert(index_void != nullptr);
         static_cast<const gbwtgraph::DefaultMinimizerIndex*>(index_void)->serialize(output);
     });

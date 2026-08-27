@@ -25,7 +25,7 @@
  * Subcommands get passed all of argv, so they have to skip past their names
  * when parsing arguments.
  *
- * To make a subcommand, do something like this in a cpp file in this
+ * To make a subcommand, do something like this in a *_main.cpp file in this
  * "subcommand" directory:
  * 
  *     #include "subcommand.hpp"
@@ -38,6 +38,8 @@
  *     static Subcommand vg_frobnicate("frobnicate", "frobnicate nodes and edges",
  *         main_frobnicate);
  * 
+ * All src/subcommand/{subcommand}_main.cpp files must pass the checks
+ * (formatting etc.) in scripts/lint.py as part of an automated test.
  */
  
 #include <map>
@@ -63,6 +65,17 @@ enum CommandCategory {
     /// Some commands we're trying to move away from
     DEPRECATED
 };
+
+const static std::map<std::string, std::string> REMOVED_CMD_MESSAGES{
+    {"explode", std::string("Please use \"vg chunk -C source.vg -b part_dir/component\" "
+                            "for the same* functionality as \"vg explode source.vg part_dir\"\n"
+                            "* (unlike explode, the output directory must already exist when running chunk)")
+    },
+    {"msga", std::string("vg msga was an early prototype for constructing genome graphs "
+                         "from multiple sequence alignments, but VG team members have developed "
+                         "improved graph construction algorithms in Cactus and PGGB, "
+                         "and several other tools have been developed by other groups.")}
+ };
 
 /// Define a way to print the titles of the different categories
 std::ostream& operator<<(std::ostream& out, const CommandCategory& category);

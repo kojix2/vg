@@ -5,9 +5,17 @@
 
 #include "explainer.hpp"
 
+#include "log.hpp"
+
 #include <structures/union_find.hpp>
 
+#include <handlegraph/algorithms/copy_graph.hpp>
+#include <bdsg/hash_graph.hpp>
+
 #include <sstream>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 
 namespace vg {
 
@@ -15,7 +23,11 @@ std::atomic<size_t> Explainer::next_explanation_number {0};
 
 bool Explainer::save_explanations = false;
 
-Explainer::Explainer() : explanation_number(Explainer::next_explanation_number++) {
+thread_local std::string Explainer::current_context = "";
+
+thread_local size_t Explainer::next_context_explanation_number {0};
+
+Explainer::Explainer(bool enabled) : explanation_number(get_new_explanation_number()), enabled(enabled) {
     // Nothing to do!
 }
 
@@ -23,11 +35,95 @@ Explainer::~Explainer() {
     // Nothing to do!
 }
 
-ProblemDumpExplainer::ProblemDumpExplainer(const std::string& name) : Explainer() {
-    if (!Explainer::save_explanations) {
+void Explainer::set_context(const std::string& context) {
+    if (save_explanations) {
+        current_context = context;
+        // Reset the counter for the context.
+        next_context_explanation_number = 0;
+    }
+}
+
+void Explainer::clear_context() {
+    if (save_explanations) {
+        current_context.clear();
+    }
+}
+
+size_t Explainer::get_new_explanation_number() {
+    if (current_context.empty()) {
+        // Use the global numbering
+        return Explainer::next_explanation_number++;
+    } else {
+        // Use the per-thread numbering
+        return Explainer::next_context_explanation_number++;
+    }
+}
+
+
+std::string Explainer::make_filename(const std::string& base_name, const std::string& extension) {
+    if (current_context.empty()) {
+        // No context: use simple filename
+        return base_name + extension;
+    } else {
+        // Sanitize context to replace characters that might be problematic in filenames
+        std::string safe_context = current_context;
+        for (char& c : safe_context) {
+            if (c == '/' || c == '\\') {
+                c = '_';
+            }
+        }
+
+        // Create directory for this context if it doesn't exist
+        std::string dir_name = "explanation_" + safe_context;
+        int ret = mkdir(dir_name.c_str(), 0755);
+        int mkdir_error = errno;
+        // It's OK if the directory already exists (EEXIST)
+        if (ret != 0 && mkdir_error != EEXIST) {
+            // But if anything else happens, stop with an error.
+            logging::error("Explainer::make_filename") << "failed to create directory " << dir_name << ": " << strerror(mkdir_error) << std::endl;
+        }
+
+        // Return the full path in the context's directory
+        return dir_name + "/" + base_name + extension;
+    }
+}
+
+TSVExplainer::TSVExplainer(bool enabled, const std::string& name) : Explainer(enabled) {
+    if (!explaining()) {
         return;
     }
-    out.open(name + std::to_string(explanation_number) + ".json");
+    // Use the helper to create the filename with appropriate directory structure
+    std::string base_name = name + std::to_string(explanation_number);
+    std::string filename = make_filename(base_name, ".tsv");
+    out.open(filename);
+}
+TSVExplainer::~TSVExplainer() {
+    if (need_line) {
+        // Newline-terminate the last line before closing.
+        out << std::endl;
+    }
+}
+
+void TSVExplainer::line() {
+    if (!explaining()) {
+        return;
+    }
+    if (need_line) {
+        // There's a previous line to put this new line after.
+        out << std::endl;
+    }
+    need_line = true;
+    // First value on the line does not need a tab.
+    need_tab = false;
+}
+
+ProblemDumpExplainer::ProblemDumpExplainer(bool enabled, const std::string& name) : Explainer(enabled) {
+    if (!explaining()) {
+        return;
+    }
+    std::string base_name = name + std::to_string(explanation_number);
+    std::string filename = make_filename(base_name, ".json");
+    out.open(filename);
 }
 
 ProblemDumpExplainer::~ProblemDumpExplainer() {
@@ -35,7 +131,7 @@ ProblemDumpExplainer::~ProblemDumpExplainer() {
 }
 
 void ProblemDumpExplainer::object_start() {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     comma();
@@ -43,7 +139,7 @@ void ProblemDumpExplainer::object_start() {
 }
 
 void ProblemDumpExplainer::object_end() {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     out << "}";
@@ -51,7 +147,7 @@ void ProblemDumpExplainer::object_end() {
 }
 
 void ProblemDumpExplainer::array_start() {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     comma();
@@ -59,7 +155,7 @@ void ProblemDumpExplainer::array_start() {
 }
 
 void ProblemDumpExplainer::array_end() {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     out << "]";
@@ -67,7 +163,7 @@ void ProblemDumpExplainer::array_end() {
 }
 
 void ProblemDumpExplainer::key(const std::string& k) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     comma();
@@ -75,7 +171,7 @@ void ProblemDumpExplainer::key(const std::string& k) {
 }
 
 void ProblemDumpExplainer::value(const std::string& v) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     comma();
@@ -84,7 +180,7 @@ void ProblemDumpExplainer::value(const std::string& v) {
 }
 
 void ProblemDumpExplainer::value(double v) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     comma();
@@ -93,7 +189,7 @@ void ProblemDumpExplainer::value(double v) {
 }
 
 void ProblemDumpExplainer::value(size_t v) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     comma();
@@ -102,7 +198,7 @@ void ProblemDumpExplainer::value(size_t v) {
 }
 
 void ProblemDumpExplainer::value(int v) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     comma();
@@ -111,7 +207,7 @@ void ProblemDumpExplainer::value(int v) {
 }
 
 void ProblemDumpExplainer::value(bool v) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     comma();
@@ -120,7 +216,7 @@ void ProblemDumpExplainer::value(bool v) {
 }
 
 void ProblemDumpExplainer::value(vg::id_t v) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     comma();
@@ -129,7 +225,7 @@ void ProblemDumpExplainer::value(vg::id_t v) {
 }
 
 void ProblemDumpExplainer::value(const pos_t& v) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     object_start();
@@ -147,7 +243,7 @@ void ProblemDumpExplainer::value(const pos_t& v) {
 }
 
 void ProblemDumpExplainer::value(const HandleGraph& v) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     object_start();
@@ -187,7 +283,7 @@ void ProblemDumpExplainer::value(const HandleGraph& v) {
 }
 
 void ProblemDumpExplainer::value(const handle_t& v, const HandleGraph& context) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     // Implement via pos_t serialization.
@@ -196,33 +292,33 @@ void ProblemDumpExplainer::value(const handle_t& v, const HandleGraph& context) 
 
 const size_t DiagramExplainer::MAX_DISPLAYED_SUGGESTIONS_PER_CATEGORY {5};
 
-DiagramExplainer::DiagramExplainer() : Explainer() {
+DiagramExplainer::DiagramExplainer(bool enabled) : Explainer(enabled) {
     // Nothing to do!
 }
 
 DiagramExplainer::~DiagramExplainer() {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     write_connected_components();
 }
 
 void DiagramExplainer::add_globals(const annotation_t& annotations) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     std::copy(annotations.begin(), annotations.end(), std::back_inserter(globals));
 }
 
 void DiagramExplainer::add_node(const std::string& id, const annotation_t& annotations) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     nodes.emplace(id, annotations);
 }
 
 void DiagramExplainer::ensure_node(const std::string& id, const annotation_t& annotations) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     auto found = nodes.find(id);
@@ -232,14 +328,14 @@ void DiagramExplainer::ensure_node(const std::string& id, const annotation_t& an
 }
 
 void DiagramExplainer::add_edge(const std::string& a_id, const std::string& b_id, const annotation_t& annotations) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     edges.emplace(std::make_pair(a_id, b_id), annotations);
 }
 
 void DiagramExplainer::ensure_edge(const std::string& a_id, const std::string& b_id, const annotation_t& annotations) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
     auto key = std::make_pair(a_id, b_id);
@@ -250,7 +346,7 @@ void DiagramExplainer::ensure_edge(const std::string& a_id, const std::string& b
 }
 
 void DiagramExplainer::suggest_edge(const std::string& a_id, const std::string& b_id, const std::string& category, double importance, const annotation_t& annotations) {
-    if (!Explainer::save_explanations) {
+    if (!explaining()) {
         return;
     }
 
@@ -325,49 +421,65 @@ void DiagramExplainer::write_connected_components() const {
         id_to_index.emplace(it->first, node_order.size());
         node_order.push_back(it);
     }
-    
+
     // Compose connected components
     structures::UnionFind components(node_order.size());
-    
+
     for_each_edge([&](const edge_ref_t& edge) {
         // Connect connected components for each edge
         components.union_groups(id_to_index.at(std::get<0>(edge)), id_to_index.at(std::get<1>(edge)));
     });
-    
+
     std::unordered_map<size_t, std::ofstream> files_by_group;
     for (size_t i = 0; i < node_order.size(); i++) {
         // For each node
-        
+
         // Make sure we have a file for the connected component it goes in
         size_t group = components.find_group(i);
         auto file_it = files_by_group.find(group);
         if (file_it == files_by_group.end()) {
             // We need to open and set up a new file
-            std::stringstream name_stream;
-            name_stream << "graph" << explanation_number << "-" << files_by_group.size() << ".dot";
-            file_it = files_by_group.emplace_hint(file_it, group, name_stream.str());
-            
+            std::stringstream base_name_stream;
+            base_name_stream << "graph" << explanation_number << "-" << files_by_group.size();
+            std::string filename = make_filename(base_name_stream.str(), ".dot");
+            file_it = files_by_group.emplace_hint(file_it, group, filename);
+
             // Start off with the heading
             file_it->second << "digraph explanation {" << std::endl;
             // And any globals
             write_globals(file_it->second, globals);
         }
-        
+
         // Write the node
         write_node(file_it->second, node_order[i]->first, node_order[i]->second);
     }
-    
+
     for_each_edge([&](const edge_ref_t& edge) {
         // Add each edge to the file for its group
         size_t group = components.find_group(id_to_index.at(std::get<0>(edge)));
         write_edge(files_by_group.at(group), std::get<0>(edge), std::get<1>(edge), std::get<2>(edge));
     });
-    
+
     for (auto& kv : files_by_group) {
         // Close out all the files
         kv.second << "}" << std::endl;
         kv.second.close();
     }
+}
+
+SubgraphExplainer::SubgraphExplainer(bool enabled): Explainer(enabled) {
+    // Nothing to do!
+}
+
+void SubgraphExplainer::subgraph(const HandleGraph& graph) {
+    if (!explaining()) {
+        return;
+    }
+    std::string base_name = "subgraph" + std::to_string(explanation_number);
+    std::string filename = make_filename(base_name, ".vg");
+    bdsg::HashGraph to_save;
+    handlealgs::copy_handle_graph(&graph, &to_save);
+    to_save.serialize(filename);
 }
 
 }

@@ -5,7 +5,7 @@ BASH_TAP_ROOT=../deps/bash-tap
 
 PATH=../bin:$PATH # for vg
 
-plan tests 49
+plan tests 66
 
 rm auto.*
 
@@ -16,6 +16,15 @@ is $(ls auto.xg | wc -l) 1 "autoindexing makes an XG for vg map"
 is $(ls auto.gcsa* | wc -l) 2 "autoindexing makes a GCSA2/LCP pair for vg map"
 vg sim -x auto.xg -n 20 -a -l 10 | vg map -d auto -t 1 -G - > /dev/null
 is $(echo $?) 0 "basic autoindexing results can be used by vg map"
+
+old_xg_creation_time=`ls -l --time-style=full-is auto.xg | tr -s ' ' | cut -d ' ' -f7`
+vg autoindex -p auto -w map -r tiny/tiny.fa -v tiny/tiny.vcf.gz --force-unphased --no-guessing
+cur_xg_creation_time=`ls -l --time-style=full-is auto.xg | tr -s ' ' | cut -d ' ' -f7`
+same_time="no"
+if [ "$old_xg_creation_time" == "$cur_xg_creation_time" ]; then
+    same_time="yes"
+fi
+is "$same_time" "no" "autoindexing with --no-guessing overwrites existing files"
 
 rm auto.*
 
@@ -109,10 +118,34 @@ rm auto.*
 
 vg autoindex -p auto -w giraffe -r tiny/tiny.fa -v tiny/tiny.vcf.gz 
 is $(echo $?) 0 "autoindexing successfully completes indexing for vg giraffe with unchunked input"
-is $(ls auto.* | wc -l) 3 "autoindexing creates 3 inputs for vg giraffe"
+is $(ls auto.* | wc -l) 4 "autoindexing creates 4 inputs for vg giraffe"
+is "$(vg describe auto.giraffe.gbz | grep -c 'pggname =')" 1 "GBZ has a graph name"
+is "$(vg describe auto.shortread.withzip.min | grep 'pggname =')" "$(vg describe auto.giraffe.gbz | grep 'pggname =')" "graph name was copied to minimizer index"
 vg construct -r tiny/tiny.fa -v tiny/tiny.vcf.gz > t.vg
 vg index -x t.xg t.vg
-vg sim -x t.xg -n 20 -a -l 10 | vg giraffe -Z auto.giraffe.gbz -m auto.min -d auto.dist -G - > /dev/null
+vg sim -x t.xg -n 20 -a -l 10 | vg giraffe -Z auto.giraffe.gbz -m auto.shortread.withzip.min -z auto.shortread.zipcodes -d auto.dist -G - > /dev/null
+is $(echo $?) 0 "basic autoindexing results can be used by vg giraffe"
+
+rm auto.*
+rm t.*
+
+vg autoindex -p auto -w sr-giraffe -r tiny/tiny.fa -v tiny/tiny.vcf.gz 
+is $(echo $?) 0 "autoindexing successfully completes indexing for vg giraffe with unchunked input"
+is $(ls auto.* | wc -l) 4 "autoindexing creates 4 inputs for short read vg giraffe"
+vg construct -r tiny/tiny.fa -v tiny/tiny.vcf.gz > t.vg
+vg index -x t.xg t.vg
+vg sim -x t.xg -n 20 -a -l 10 | vg giraffe -Z auto.giraffe.gbz -m auto.shortread.withzip.min -z auto.shortread.zipcodes -d auto.dist -G - > /dev/null
+is $(echo $?) 0 "basic autoindexing results can be used by vg giraffe"
+
+rm auto.*
+rm t.*
+
+vg autoindex -p auto -w lr-giraffe -r tiny/tiny.fa -v tiny/tiny.vcf.gz 
+is $(echo $?) 0 "autoindexing successfully completes indexing for vg giraffe with unchunked input"
+is $(ls auto.* | wc -l) 4 "autoindexing creates 4 inputs for long read vg giraffe"
+vg construct -r tiny/tiny.fa -v tiny/tiny.vcf.gz > t.vg
+vg index -x t.xg t.vg
+vg sim -x t.xg -n 20 -a -l 10 | vg giraffe -Z auto.giraffe.gbz -m auto.longread.withzip.min -z auto.longread.zipcodes -d auto.dist -G - > /dev/null
 is $(echo $?) 0 "basic autoindexing results can be used by vg giraffe"
 
 rm auto.*
@@ -120,18 +153,29 @@ rm t.*
 
 vg autoindex -p auto -w giraffe -g graphs/gfa_with_w_lines.gfa 
 is $(echo $?) 0 "autoindexing successfully completes indexing for vg giraffe with GFA input with W-lines"
-is $(ls auto.* | wc -l) 3 "autoindexing creates 3 inputs for vg giraffe from GFA input"
+is $(ls auto.* | wc -l) 4 "autoindexing creates 4 inputs for vg giraffe from GFA input"
+is "$(vg describe auto.giraffe.gbz | grep -c 'pggname =')" 1 "GBZ has a graph name"
+is "$(vg describe auto.shortread.withzip.min | grep 'pggname =')" "$(vg describe auto.giraffe.gbz | grep 'pggname =')" "graph name was copied to minimizer index"
 vg convert -g graphs/gfa_with_w_lines.gfa -x > g.xg
-vg sim -x g.xg -n 20 -a -l 4 | vg giraffe -Z auto.giraffe.gbz -m auto.min -d auto.dist -G - > /dev/null
+vg sim -x g.xg -n 20 -a -l 4 | vg giraffe -Z auto.giraffe.gbz -m auto.shortread.withzip.min -z auto.shortread.zipcodes -d auto.dist -G - > /dev/null
 is $(echo $?) 0 "GFA autoindexing results can be used by vg giraffe"
 
 rm auto.*
 rm g.xg
 
+vg autoindex -p auto -w giraffe -g graphs/components_walks_compressed.gfa
+is $(echo $?) 0 "autoindexing successfully completes indexing for vg giraffe with grammar-compressed GFA input"
+vg gbwt -G graphs/components_walks_compressed.gfa -g expected.gbz
+cmp expected.gbz auto.giraffe.gbz
+is $(echo $?) 0 "vg autoindex handles grammar-compressed GFA input correctly"
+
+rm auto.*
+rm expected.gbz
+
 vg autoindex -p auto -w giraffe -g graphs/named_with_walk.gfa 
 is $(echo $?) 0 "autoindexing successfully completes on a GFA with named segments and W-lines"
 printf '@read\nGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGATTACACATTAGGGGGGGGGGGGGGGGGGGGGGGGGGGG\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n' > read.fq
-vg giraffe -Z auto.giraffe.gbz -m auto.min -d auto.dist -f read.fq --named-coordinates > read.gam
+vg giraffe -Z auto.giraffe.gbz -m auto.shortread.withzip.min -d auto.dist -f read.fq --named-coordinates > read.gam
 is "$(vg view -aj read.gam | jq -r '.path.mapping[].position.name')" "Ishmael" "GFA segment names are available in output GAM when a walk exists"
 
 rm auto.*
@@ -140,20 +184,39 @@ rm read.fq read.gam
 vg autoindex -p auto -w giraffe -g graphs/named.gfa 
 is $(echo $?) 0 "autoindexing successfully completes on a GFA with named segments and no W-lines"
 printf '@read\nGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGATTACACATTAGGGGGGGGGGGGGGGGGGGGGGGGGGGG\n+\nHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH\n' > read.fq
-vg giraffe -Z auto.giraffe.gbz -m auto.min -d auto.dist -f read.fq --named-coordinates > read.gam
+vg giraffe -Z auto.giraffe.gbz -m auto.shortread.withzip.min -d auto.dist -f read.fq --named-coordinates > read.gam
 is "$(vg view -aj read.gam | jq -r '.path.mapping[].position.name')" "Ishmael" "GFA segment names are available in output GAM when no walks exist"
 
 # reduce disk limit to 1MB to trigger it during k-mer generation
 is "$(vg autoindex -p auto -w map --gcsa-size-limit 1000000 -g graphs/linked_cycles.gfa 2>&1 | grep Rewind | wc -l)" 1 "Running out of room during k-mer enumeration triggers a rewind"
 is "$(echo $?)" 0 "Indexing is successful after rewinding from k-mer generation"
 
+rm -f auto.gcsa auto.gcsa.lcp
+
 # reduce disk limit to 2MB to trigger it during doubling steps
 is "$(vg autoindex -p auto -w map --gcsa-size-limit 2000000 -g graphs/linked_cycles.gfa 2>&1 | grep Rewind | wc -l)" 1 "Running out of room during GCSA2 indexing triggers a rewind"
 is "$(echo $?)" 0 "Indexing is successful after rewinding from GCSA2 indexing"
+
+rm -f auto.gcsa auto.gcsa.lcp
 
 # use the memory limit to trigger a rewide
 is "$(vg autoindex -p auto -w map -M 512M -g graphs/linked_cycles.gfa 2>&1 | grep Rewind | wc -l)" 1 "Running out of memory during GCSA2 indexing triggers a rewind"
 is "$(echo $?)" 0 "Indexing is successful after rewinding from GCSA2 indexing"
 
 rm auto.*
+
+# index a graph with oversized snarls
+vg index -j auto.dist --snarl-limit 5 graphs/chain-clip.gfa 2> log.txt
+is "$(grep 'oversized snarls' log.txt | wc -l)" 1 "graph has oversized snarls"
+vg autoindex -p auto -w lr-giraffe --gfa graphs/chain-clip.gfa
+is "$(echo $?)" 0 "autoindexing successfully completes indexing of graph with oversized snarls"
+
+rm auto.* log.txt
+
+vg autoindex -p auto -w sampling --gfa graphs/gfa_with_reference.gfa
+is "$(echo $?)" 0 "autoindexing successfully completes indexing for haplotype sampling"
+vg haplotypes -i auto.hapl -k haplotype-sampling/HG003.kff -g sampled.gbz auto.gbz
+is "$(echo $?)" 0 "haplotype sampling indexes can be used"
+
+rm auto.* sampled.gbz
 rm read.fq read.gam

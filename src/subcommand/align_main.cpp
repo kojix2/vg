@@ -20,6 +20,7 @@
 #include "../dagified_graph.hpp"
 #include "../ssw_aligner.hpp"
 #include "../aligner.hpp"
+#include "../minimizer_mapper.hpp"
 #include <vg/io/stream.hpp>
 #include <vg/io/vpkg.hpp>
 
@@ -30,23 +31,28 @@ using namespace vg::subcommand;
 void help_align(char** argv) {
     cerr << "usage: " << argv[0] << " align [options] <graph.vg> >alignments.gam" << endl
          << "options:" << endl
-         << "    -s, --sequence STR    align a string to the graph in graph.vg using partial order alignment" << endl
-         << "    -Q, --seq-name STR    name the sequence using this value" << endl
-         << "    -j, --json            output alignments in JSON format (default GAM)" << endl
-         << "    -m, --match N         use this match score (default: 1)" << endl
-         << "    -M, --mismatch N      use this mismatch penalty (default: 4)" << endl
-         << "    --score-matrix FILE   read a 5x5 integer substitution scoring matrix from a file" << endl
-         << "    -g, --gap-open N      use this gap open penalty (default: 6)" << endl
-         << "    -e, --gap-extend N    use this gap extension penalty (default: 1)" << endl
-         << "    -T, --full-l-bonus N  provide this bonus for alignments that are full length (default: 5)" << endl
-         << "    -b, --banded-global   use the banded global alignment algorithm" << endl
-         << "    -p, --pinned          pin the (local) alignment traceback to the optimal edge of the graph" << endl
-         << "    -L, --pin-left        pin the first rather than last bases of the graph and sequence" << endl
-         << "    -r, --reference STR   don't use an input graph--- run SSW alignment between -s and -r" << endl
-         << "    -D, --debug           print out score matrices and other debugging info" << endl;
+         << "  -s, --sequence STR       align STR to the graph using partial order alignment" << endl
+         << "  -Q, --seq-name STR       name the sequence using this value" << endl
+         << "  -j, --json               output alignments in JSON format (default GAM)" << endl
+         << "  -m, --match N            use this match score [1]" << endl
+         << "  -M, --mismatch N         use this mismatch penalty [4]" << endl
+         << "      --score-matrix FILE  use this 5x5 integer substitution scoring matrix" << endl
+         << "  -g, --gap-open N         use this gap open penalty [6]" << endl
+         << "  -e, --gap-extend N       use this gap extension penalty [1]" << endl
+         << "  -T, --full-l-bonus N     use this bonus for full length alignments [5]" << endl
+         << "  -b, --banded-global      use the banded global alignment algorithm" << endl
+         << "  -p, --pinned             pin the (local) alignment traceback to" << endl
+         << "                           the optimal edge of the graph" << endl
+         << "  -L, --pin-left           pin first instead of last bases of the graph/sequence" << endl
+         << "  -w, --between POS,POS    align the sequence between the two positions," << endl
+         << "                           specified as node ID, + or -, offset" << endl
+         << "  -r, --reference STR      don't use a graph: run SSW alignment between -s / -r" << endl
+         << "  -D, --debug              print out score matrices and other debugging info" << endl
+         << "  -h, --help               print this help message to stderr and exit" << endl;
 }
 
 int main_align(int argc, char** argv) {
+    Logger logger("vg align");
 
     string seq;
     string seq_name;
@@ -56,7 +62,7 @@ int main_align(int argc, char** argv) {
         return 1;
     }
 
-    #define OPT_SCORE_MATRIX 1000
+    constexpr int OPT_SCORE_MATRIX = 1000;
     string matrix_file_name;
     bool print_cigar = false;
     bool output_json = false;
@@ -70,6 +76,8 @@ int main_align(int argc, char** argv) {
     bool banded_global = false;
     bool pinned_alignment = false;
     bool pin_left = false;
+    pos_t left_anchor;
+    pos_t right_anchor;
 
     int c;
     optind = 2; // force optind past command positional argument
@@ -79,7 +87,7 @@ int main_align(int argc, char** argv) {
             /* These options set a flag. */
             //{"verbose", no_argument,       &verbose_flag, 1},
             {"sequence", required_argument, 0, 's'},
-            {"seq-name", no_argument, 0, 'Q'},
+            {"seq-name", required_argument, 0, 'Q'},
             {"json", no_argument, 0, 'j'},
             {"match", required_argument, 0, 'm'},
             {"mismatch", required_argument, 0, 'M'},
@@ -92,12 +100,14 @@ int main_align(int argc, char** argv) {
             {"full-l-bonus", required_argument, 0, 'T'},
             {"pinned", no_argument, 0, 'p'},
             {"pin-left", no_argument, 0, 'L'},
+            {"between", required_argument, 0, 'w'},
+            {"help", no_argument, 0, 'h'},
             {0, 0, 0, 0}
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "s:jhQ:m:M:g:e:Dr:F:O:bT:pL",
-                long_options, &option_index);
+        c = getopt_long (argc, argv, "s:jh?Q:m:M:g:e:Dr:bT:pLw:",
+                         long_options, &option_index);
 
         /* Detect the end of the options. */
         if (c == -1)
@@ -138,11 +148,7 @@ int main_align(int argc, char** argv) {
             break;
 
         case OPT_SCORE_MATRIX:
-            matrix_file_name = optarg;
-            if (matrix_file_name.empty()) {
-                cerr << "error:[vg align] Must provide matrix file with --matrix-file." << endl;
-                exit(1);
-            }
+            matrix_file_name = require_exists(logger, optarg);
             break;
 
         case 'r':
@@ -165,6 +171,10 @@ int main_align(int argc, char** argv) {
             pin_left = true;
             break;
 
+        case 'w':
+            tie(left_anchor, right_anchor) = parse_pair<pos_t, pos_t>(logger, optarg, ',', "--rename");
+            break;
+
         case 'h':
         case '?':
             /* getopt_long already printed an error message. */
@@ -174,6 +184,20 @@ int main_align(int argc, char** argv) {
 
         default:
             abort ();
+        }
+    }
+
+    vg::Explainer::save_explanations = debug;
+
+    if (!vg::is_empty(left_anchor) || !vg::is_empty(right_anchor)) {
+        if (!ref_seq.empty()) {
+            logger.error() << "Cannot align between positions when using a reference sequence." << std::endl;
+        }
+        if (pinned_alignment) {
+            logger.error() << "Aligning between positions always uses pinned alignment." << std::endl;
+        }
+        if (banded_global) {
+            logger.error() << "Aligning between positions always uses banded global alignment." << std::endl;
         }
     }
 
@@ -188,18 +212,12 @@ int main_align(int argc, char** argv) {
     ifstream matrix_stream;
     if (!matrix_file_name.empty()) {
       matrix_stream.open(matrix_file_name);
-      if (!matrix_stream) {
-          cerr << "error:[vg align] Cannot open scoring matrix file " << matrix_file_name << endl;
-          exit(1);
-      }
     }
-    
 
     Alignment alignment;
     if (!ref_seq.empty()) {
         if (!matrix_file_name.empty()) {
-            cerr << "error:[vg align] Custom scoring matrix not supported in reference sequence mode " << endl;
-            exit(1);
+            logger.error() << "Custom scoring matrix not supported in reference sequence mode" << std::endl;
         }
         SSWAligner ssw = SSWAligner(match, mismatch, gap_open, gap_extend);
         alignment = ssw.align(seq, ref_seq);
@@ -226,29 +244,43 @@ int main_align(int argc, char** argv) {
         Aligner aligner = Aligner(score_matrix, gap_open, gap_extend, full_length_bonus, vg::default_gc_content);
         
         free(score_matrix);
-        
-        // put everything on the forward strand
-        StrandSplitGraph split(&(*graph));
-        
-        // dagify it as far as we might ever want
-        DagifiedGraph dag(&split, seq.size() + aligner.longest_detectable_gap(seq.size(), seq.size() / 2));
-        
+
         alignment.set_sequence(seq);
-        if (pinned_alignment) {
-            aligner.align_pinned(alignment, dag, pin_left);
-        }
-        else if (banded_global) {
-            aligner.align_global_banded(alignment, dag, 1, true);
-        }
-        else {
-            aligner.align(alignment, dag, true);
-        }
+
+        if (!vg::is_empty(left_anchor) || !vg::is_empty(right_anchor)) {
+            // Align between positions
+            
+            // Pick some plausible extraction parameters.
+            size_t max_path_length = seq.size() * 2;
+            size_t max_gap_length = seq.size() / 2;
+            MinimizerMapper::align_sequence_between_consistently(left_anchor, right_anchor, max_path_length, 
+                max_gap_length, graph.get(), &aligner, alignment, seq_name.empty() ? nullptr : &seq_name);
+
+        } else {
+            // Align directly to the full provided graph.
         
-        // translate back from the overlays
-        translate_oriented_node_ids(*alignment.mutable_path(), [&](vg::id_t node_id) {
-            handle_t under = split.get_underlying_handle(dag.get_underlying_handle(dag.get_handle(node_id)));
-            return make_pair(graph->get_id(under), graph->get_is_reverse(under));
-        });
+            // put everything on the forward strand
+            StrandSplitGraph split(graph.get());
+            
+            // dagify it as far as we might ever want
+            DagifiedGraph dag(&split, seq.size() + aligner.scorer->longest_detectable_gap(seq.size(), seq.size() / 2));
+            
+            if (pinned_alignment) {
+                aligner.align_pinned(alignment, dag, pin_left);
+            }
+            else if (banded_global) {
+                aligner.align_global_banded(alignment, dag, 1, true);
+            }
+            else {
+                aligner.align(alignment, dag, true);
+            }
+            
+            // translate back from the overlays
+            translate_oriented_node_ids(*alignment.mutable_path(), [&](vg::id_t node_id) {
+                handle_t under = split.get_underlying_handle(dag.get_underlying_handle(dag.get_handle(node_id)));
+                return make_pair(graph->get_id(under), graph->get_is_reverse(under));
+            });
+        }
     }
 
     if (!seq_name.empty()) {
@@ -256,7 +288,7 @@ int main_align(int argc, char** argv) {
     }
 
     if (output_json) {
-        cout << pb2json(alignment) << endl;
+        cout << pb2json(alignment) << std::endl;
     } else {
         function<Alignment(size_t)> lambda =
             [&alignment] (size_t n) {

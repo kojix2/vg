@@ -5,7 +5,7 @@ BASH_TAP_ROOT=../deps/bash-tap
 
 PATH=../bin:$PATH # for vg
 
-plan tests 29
+plan tests 32
 
 vg construct -m 1000 -r small/x.fa -v small/x.vcf.gz >x.vg
 is $? 0 "construction"
@@ -68,7 +68,9 @@ is $(vg find -A <(vg find -N <(seq 37 52 ) -x x.xg ) --sorted-gam x.sorted.gam |
 
 rm -rf x.gam x.sorted.gam x.sorted.gam.gai
 
-is $(vg find -G small/x-s1337-n1.gam -x x.xg | vg view - | grep ATTAGCCATGTGACTTTGAACAAGTTAGTTAATCTCTCTGAACTTCAGTT | wc -l) 1 "the index can be queried using GAM alignments"
+is "$(vg find -G small/x-s1337-n1.gam -x x.xg | vg view - | grep ATTAGCCATGTGACTTTGAACAAGTTAGTTAATCTCTCTGAACTTCAGTT | wc -l)" "1" "the index can be queried using GAM alignments"
+
+is "$(vg find -G small/x-s1337-n1.gam -x x.xg | vg paths --list -x -)" "x[121-272]" "querying the index with GAM alignments finds relevant subpaths"
 
 rm -rf x.vg x.xg x.gcsa{,.lcp}
 
@@ -112,7 +114,7 @@ rm -f t.xg t.vg t.x:30:35.vg t.x:10:20.vg q.x:30:35.vg q.x:10:20.vg t.bed
 
 vg construct -r small/xy.fa -v small/xy2.vcf.gz -R x -C -a > x.vg 2> /dev/null
 vg index -x x.xg x.vg
-vg index -G x.gbwt -v small/xy2.vcf.gz x.vg
+vg gbwt -v small/xy2.vcf.gz -o x.gbwt -x x.vg
 is $(vg find -p x -x x.xg -K 16 -H x.gbwt | cut -f 5 | sort | uniq -c  | tail -n 1 | awk '{ print $1 }') 1510 "we find the expected number of kmers with haplotype frequency equal to 2"
 rm -f x.vg x.xg x.gbwt
 
@@ -120,11 +122,13 @@ vg convert -gp tiny/tiny.gfa | vg find -x - -n 1 -c 2 | vg convert -f - | vg ids
 vg find -x tiny/tiny.gfa -n 1 -c 2| vg ids -s - | sort > found2.gfa
 diff found1.gfa found2.gfa
 is $? 0 "GFA i/o for find -n consistent with converting both ways"
+vg find -x tiny/tiny.gfaz -n 1 -c 2 >/dev/null
+is $? 0 "find accepts GFAZ graph input"
 
 
 # Find nodes that map to the provided ids
 vg construct -m 32 -r small/xy.fa -v small/xy2.vcf.gz -R x -C -a > x.vg 2> /dev/null
-vg index -G x.gbwt -v small/xy2.vcf.gz x.vg
+vg gbwt -v small/xy2.vcf.gz -o x.gbwt -x x.vg
 vg prune -u -m x.mapping -g x.gbwt -e 1 x.vg > x.unfolded.vg
 
 rm -f expected.gfa
@@ -140,3 +144,9 @@ is $? 0 "find nodes that map to the provided node ids"
 
 rm -f x.vg x.gbwt x.mapping x.unfolded.vg
 rm -f expected.gfa found.gfa
+
+# We wish we could test specifically for which paths are indexed, but we can't.
+# So we test to make sure at least paths that shouldn't normally be indexed are
+# indexed when asked about.
+is "$(vg find -n 5 -P sample1#1#chr1#0 -x graphs/gfa_with_reference.gfa | cut -f2)" "4" "vg find can find positions along non-reference paths asked about specifically"
+

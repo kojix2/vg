@@ -14,6 +14,7 @@
 #include "utility.hpp"
 #include "types.hpp"
 #include "position.hpp"
+#include "region.hpp"
 #include "nodetraversal.hpp"
 
 //#define debug
@@ -255,6 +256,16 @@ int path_to_length(const Path& path);
 int path_from_length(const Path& path);
 int mapping_to_length(const Mapping& m);
 int mapping_from_length(const Mapping& m);
+/// Get the leading softclip from a Mapping, whether it is coalesced or not.
+int softclip_start(const Mapping& mapping);
+/// Get the trailing softclip from a Mapping, whether it is coalesced or not.
+int softclip_end(const Mapping& mapping);
+/// Get the leading softclip from a Path, assuming it is coalesced into a
+/// single Edit
+int softclip_start(const Path& path);
+/// Get the trailing softclip from a Path, assuming it is coalesced into a
+/// single Edit
+int softclip_end(const Path& path);
 Position first_path_position(const Path& path);
 Position last_path_position(const Path& path);
 int to_length(const Mapping& m);
@@ -289,8 +300,15 @@ void reverse_complement_path_in_place(Path* path,
                                       const function<int64_t(id_t)>& node_length);
 /// Simplify the path for addition as new material in the graph. Remove any
 /// mappings that are merely single deletions, merge adjacent edits of the same
-/// type, strip leading and trailing deletion edits on mappings, and make sure no
-/// mappings have missing positions.
+/// type, strip leading and trailing deletion edits on mappings (adjusting
+/// positions), and make sure no mappings have missing positions.
+///
+/// Note that this removes deletions at the start and end of Mappings, so code
+/// that handles simplified Alignments needs to handle offsets on internal
+/// Mappings.
+///
+/// If trim_internal_deletions is false, refrains from creating internal skips
+/// of deleted sequence. 
 Path simplify(const Path& p, bool trim_internal_deletions = true);
 /// Merge adjacent edits of the same type, strip leading and trailing deletion
 /// edits (while updating positions if necessary), and makes sure position is
@@ -320,7 +338,10 @@ pair<mapping_t, mapping_t> cut_mapping(const mapping_t& m, const Position& pos);
 // divide mapping at reference-relative offset (as measure in from_length)
 pair<Mapping, Mapping> cut_mapping_offset(const Mapping& m, size_t offset);
 pair<mapping_t, mapping_t> cut_mapping_offset(const mapping_t& m, size_t offset);
-// divide mapping at target-relative offset (as measured in to_length)
+/// Divide mapping at target-relative offset (as measured in to_length).
+///
+/// Deletions at the cut point (which are 0 target-relative bases long) always
+/// end up in the first piece.
 pair<Mapping, Mapping> cut_mapping(const Mapping& m, size_t offset);
 pair<mapping_t, mapping_t> cut_mapping(const mapping_t& m, size_t offset);
 // divide path at reference-relative position
@@ -335,7 +356,7 @@ bool adjacent_mappings(const Mapping& m1, const Mapping& m2);
 // Return true if a mapping is a perfect match (i.e. contains no non-match edits)
 bool mapping_is_match(const Mapping& m);
 double divergence(const Mapping& m);
-// Return the identity for the path: perfect matches over total length.
+// Return the identity for the path: perfect matches over total length, ignoring soft clips.
 // For zero-length paths, returns 0.
 double identity(const Path& path);
 // compare the agreement between two alignments
@@ -372,6 +393,63 @@ Path path_from_path_handle(const PathHandleGraph& graph, path_handle_t path_hand
 
 // Wrap a Path in an Alignment
 Alignment alignment_from_path(const HandleGraph& graph, const Path& path);
+
+////
+// Functions for working with path subranges.
+// TODO: Move to libhandlegraph
+////
+
+/// Find the subpath containing the given region (possibly a full base path, or
+/// itself a part of a subpath) and return true, or return false if no such
+/// subpath can be found.
+///
+/// Interprets the Region as 0-based, end-inclusive.
+///
+/// If one or both region coordinates are -1, and a path with the exact name is
+/// found, and there are no further subpaths of that path, fills them in from
+/// that path.
+bool find_containing_subpath(const PathPositionHandleGraph& graph, Region& region, path_handle_t& path);
+
+/// Find the subpaths overlapping the given Region (possibly a full base path,
+/// or itself a part of a subpath) and iterate over them.
+///
+/// Calls the callback with each relevant subpath (possibly the base path), and
+/// the 0-based start and past-end offsets along the subpath that intersect the
+/// provided Region. Again, the offsets are in the space of the *subpath*; to
+/// get the offset of the subpath *relative to* the base path, use
+/// get_path_base_offset().
+///
+/// Iteratee returns false to stop.
+///
+/// If one or both region coordinates are -1, and a path with the exact name is
+/// found, and there are no further subpaths of that path, fills them in from
+/// that path. Otherwise, interprets them as meaning to go all the way to the
+/// start/end of the base path. The Region is modified after the callback calls
+/// are complete.
+///
+/// Interprets the Region as 0-based, end-inclusive.
+///
+/// Returns true if we reached the end, and false if asked to stop.
+bool for_each_overlapping_subpath(const PathPositionHandleGraph& graph, Region& region, const std::function<bool(const path_handle_t& path, size_t start_offset, size_t past_end_offset)>& iteratee);
+
+/// Run the given iteratee for each path that is either the path with the given
+/// name (if present), or a subrange of a path with the given name as the base
+/// name (otherwise).
+///
+/// If a path and subpaths both exist, only look at the full path.
+///
+/// If the name describes a subpath, look only at that subpath.
+///
+/// Iteratee returns false to stop.
+///
+/// Returns true if we reached the end, and false if asked to stop.
+bool for_each_subpath_of(const PathPositionHandleGraph& graph, const string& path_name, const std::function<bool(const path_handle_t& path)>& iteratee);
+
+/// Returns the base path name for this path (i.e. the path's name without any subrange).
+std::string get_path_base_name(const PathPositionHandleGraph& graph, const path_handle_t& path);
+
+/// Returns the offset along the base path for this path (0 if it's a full base path or a fragment starting at 0).
+size_t get_path_base_offset(const PathPositionHandleGraph& graph, const path_handle_t& path);
 
 
 /*
@@ -483,6 +561,8 @@ int corresponding_from_length(const path_t& path, int to_length, bool from_end);
 string debug_string(const path_t& path);
 string debug_string(const path_mapping_t& mapping);
 string debug_string(const edit_t& edit);
+
+string debug_cigar_string(const path_t& path);
 
 /*
  * Implementations of inline methods

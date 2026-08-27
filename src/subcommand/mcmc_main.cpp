@@ -1,5 +1,6 @@
 /**
- * \file mcmc_main.cpp: GFA (Graph Alignment Format) Fast Emitter: a new mapper that will be *extremely* fast once we actually write it
+ * \file mcmc_main.cpp: GFA (Graph Alignment Format) Fast Emitter:
+ * a new mapper that will be *extremely* fast once we actually write it
  */
 
 #include <omp.h>
@@ -26,23 +27,26 @@ using namespace vg;
 using namespace vg::subcommand;
 
 void help_mcmc(char** argv) {
-    cerr
-    << "usage: " << argv[0] << " mcmc [options] multipath_alns.mgam graph.vg sites.snarls > graph_with_paths.vg" << endl
-    << "Finds haplotypes based on reads using MCMC methods" << endl
-    << endl
-    << "basic options:" << endl
-    << "  -i, --iteration-number INT        tells us the number of iterations to run mcmc_genotyper with" <<endl
-    << "  -r, --seed INT                    the seed we will use for the random number generator " << endl
-    << "  -s, --sample NAME                 sample name [default=SAMPLE]" << endl
-    << "  -p  --ref-path NAME               reference path to call on (multipile allowed.  defaults to all paths)"<< endl
-    << "  -o, --ref-offset N                offset in reference path (multiple allowed, 1 per path)" << endl
-    << "  -l, --ref-length N                override length of reference in the contig field of output VCF" << endl
-    << "  -v, --vcf-out FILE                write VCF output to this file" << endl
-    << "  -b, --burn-in INT                 number of iterations to run original sample proposal only" <<endl
-    << "  -g, --gamma-freq INT              the frequency (every n iterations) for which to re-make the gamma set (starts after burn-in)" <<endl;
+    cerr << "usage: " << argv[0] << " mcmc [options] multipath_alns.mgam graph.vg sites.snarls > graph_with_paths.vg" << endl
+         << "Finds haplotypes based on reads using MCMC methods" << endl
+         << "DEPRECATED: known to have issues but not under development" << endl
+         << endl
+         << "basic options:" << endl
+         << "  -i, --iteration-number INT  run mcmc_genotyper with INT iterations" << endl
+         << "  -r, --seed INT              seed for the random number generator" << endl
+         << "  -s, --sample NAME           sample name [SAMPLE]" << endl
+         << "  -p, --ref-path NAME         reference path to call on (may repeat) [all]"<< endl
+         << "  -o, --ref-offset N          offset in reference path (may repeat; 1 per path)" << endl
+         << "  -l, --ref-length N          override reference length for output VCF contig" << endl
+         << "  -v, --vcf-out FILE          write VCF output to this file" << endl
+         << "  -b, --burn-in INT           run original sample proposal for INT interations" << endl
+         << "  -g, --gamma-freq INT        the frequency (every n iterations) for which to" << endl
+         << "                              re-make the gamma set (starts after burn-in)" << endl
+         << "  -h, --help                  print this help message to stderr and exit" << endl;
 }
 
 int main_mcmc(int argc, char** argv) {
+    Logger logger("vg mcmc");
 
     vector<string> ref_paths;
     vector<size_t> ref_path_offsets;
@@ -82,7 +86,7 @@ int main_mcmc(int argc, char** argv) {
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hi:s:p:o:l:r:v:b:g:",
+        c = getopt_long (argc, argv, "h?i:s:p:o:l:r:v:b:g:",
                          long_options, &option_index);
 
 
@@ -111,7 +115,7 @@ int main_mcmc(int argc, char** argv) {
                 sample_name = optarg;
                 break;  
             case 'v':
-                vcf_out = optarg;
+                vcf_out = ensure_writable(logger, optarg);
                 break;
             case 'b':
                 burn_in = parse<int>(optarg);
@@ -159,36 +163,39 @@ int main_mcmc(int argc, char** argv) {
     //convert to VG graph if needed
     ensure_vg();
 
-    if(vg_graph == nullptr || vg_graph == 0){
-        cerr << "Graph is NULL" <<endl;
-        exit(1);
+    if(vg_graph == nullptr || vg_graph == 0) {
+        logger.error() << "Graph is NULL" << endl;
     }
-    PathPositionHandleGraph* graph = nullptr;
-    graph = overlay_helper.apply(vg_graph);
-    
      
     // Check our paths
     for (const string& ref_path : ref_paths) {
-        if (!graph->has_path(ref_path)) {
-            cerr << "error [vg call]: Reference path \"" << ref_path << "\" not found in graph" << endl;
-            return 1;
+        if (!vg_graph->has_path(ref_path)) {
+            logger.error() << "Reference path \"" << ref_path << "\" not found in graph" << endl;
         }
     }
-    
     // Check our offsets
     if (ref_path_offsets.size() != 0 && ref_path_offsets.size() != ref_paths.size()) {
-        cerr << "error [vg call]: when using -o, the same number paths must be given with -p" << endl;
-        return 1;
+        logger.error() << "when using -o, the same number paths must be given with -p" << endl;
     }
     // Check our ref lengths
     if (ref_path_lengths.size() != 0 && ref_path_lengths.size() != ref_paths.size()) {
-        cerr << "error [vg call]: when using -l, the same number paths must be given with -p" << endl;
-        return 1;
+        logger.error() << "when using -l, the same number paths must be given with -p" << endl;
     }
 
-    // No paths specified: use them all
+    PathPositionHandleGraph* graph = nullptr;
+    {
+        // Path-position index all the extra paths we need to work on, plus the
+        // reference and generic paths.
+        std::unordered_set<std::string> target_paths;
+        for (auto& name : ref_paths) {
+            target_paths.insert(name);
+        }
+        graph = overlay_helper.apply(vg_graph, target_paths);
+    }
+
+    // No paths specified: use all the reference and generic paths
     if (ref_paths.empty()) {
-        graph->for_each_path_handle([&](path_handle_t path_handle) {
+        graph->for_each_path_of_sense({PathSense::REFERENCE, PathSense::GENERIC}, [&](path_handle_t path_handle) {
                 const string& name = graph->get_path_name(path_handle);
                 if (!Paths::is_alt(name)) {
                     ref_paths.push_back(name);
@@ -196,7 +203,7 @@ int main_mcmc(int argc, char** argv) {
             });
    
     }
-    
+
     // Check if VCF output file is specified 
     ofstream vcf_file_out;
     if(!vcf_out.empty()){
@@ -238,7 +245,7 @@ int main_mcmc(int argc, char** argv) {
     // Write header to ofstream  
     vcf_file_out << mcmc_caller.vcf_header(*graph, ref_paths, ref_path_lengths);
     
-    //current implimentation is writing vcf record after each variant processed
+    //current implimentation is writing VCF record after each variant processed
     mcmc_caller.call_top_level_snarls();
 
     // mcmc_caller.write_variants(cerr);
@@ -254,6 +261,6 @@ int main_mcmc(int argc, char** argv) {
 }
 
 // Register subcommand
-static Subcommand vg_mcmc("mcmc", "Finds haplotypes based on reads using MCMC methods", DEVELOPMENT, main_mcmc);
+static Subcommand vg_mcmc("mcmc", "find haplotypes based on reads using MCMC methods", DEPRECATED, main_mcmc);
 
 

@@ -1,6 +1,6 @@
 # Dockerfile for shipping just the vg binary you have
 # Run with DOCKER_BUILDKIT=1 to avoid shipping the whole vg directory as context
-FROM ubuntu:18.04
+FROM ubuntu:22.04
 MAINTAINER vgteam
 
 WORKDIR /vg
@@ -15,7 +15,6 @@ ENV DEBCONF_NONINTERACTIVE_SEEN true
 
 # Install dependencies for scripts
 RUN apt-get -qq -y update && \
-    apt-get -qq -y upgrade && \
     apt-get -qq -y install --no-upgrade \
     numactl \
     python3-matplotlib \

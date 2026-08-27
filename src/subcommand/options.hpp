@@ -10,7 +10,7 @@
  *
  * Set up each option in the group with add_option(), add_range() (for an
  * option that can be cycled through a range of values for a grid search), or
- * add_flag(). Every option always has a logn option name; short option
+ * add_flag(). Every option always has a long option name; short option
  * character is optional and comes after it. Options take a pointer-to-member
  * into the group's type (where the value will be ultimately written) and a
  * default value, a help stiring, and an optional "validator function" which
@@ -86,6 +86,7 @@
  */
 
 #include "../utility.hpp"
+#include "../log.hpp"
 
 #include <map>
 #include <functional>
@@ -102,22 +103,37 @@ namespace subcommand {
  *
  * Each link in the chain works like a digit place in a number, and ticking increments the number.
  * This lets us do gird search over a bunch of values of different types without a bunch of nexted loops.
+ *
+ * May not move after chain() has been called on it! So we make it immovable.
  */
 struct TickChainLink {
-    /// This will be called when we want to reset_chain what we are chained onto.
-    std::function<void(void)> reset_chain_parent = []() {
+
+    TickChainLink() = default;
+    TickChainLink(const TickChainLink& other) = delete;
+    TickChainLink(TickChainLink&& other) = delete;
+    TickChainLink& operator=(const TickChainLink& other) = delete;
+    TickChainLink& operator=(TickChainLink&& other) = delete;
+    virtual ~TickChainLink() = default;
+
+    /// This will be called when we want to reset_along_chain what we are chained onto.
+    std::function<void(void)> reset_along_chain_parent = []() {
     };
-    /// This will be called when we need to tick_chain our parent
-    std::function<bool(void)> tick_chain_parent = []() {
+    /// This will be called when we need to tick_along_chain our parent
+    std::function<bool(void)> tick_along_chain_parent = []() {
         return false;
     };
     
     /// Reset the chain to its initial values.
     virtual void reset_chain();
-    
+
     /// Tick the chain. Return true if there's still a value for the chain, and
     /// false if the chain is out of values.
+    /// Should be called on the last item in the chain.
+    /// May delegate to a different item (for e.g. groups).
     virtual bool tick_chain();
+
+    /// Return true if this link never changes. We assume we are static by default.
+    virtual bool is_static() const;
     
     /// Add a thing to the chain after us.
     /// Return that thing.
@@ -126,6 +142,17 @@ struct TickChainLink {
     /// Get a function that runs another function for each combination of
     /// values for this Range and all Ranges it has been chained onto.
     virtual std::function<void(const std::function<void(void)>&)> get_iterator();
+
+protected:
+    /// Tick the chain. Return true if there's still a value for the chain, and
+    /// false if the chain is out of values.
+    /// Should be called by tick_chain() or a child.
+    /// May not delegate to a different item.
+    virtual bool tick_along_chain();
+
+    /// Reset along the chain, making this item and all parents take on their
+    /// initial values.
+    virtual void reset_along_chain();
 };
 
 }
@@ -141,7 +168,7 @@ namespace vg {
 /**
  * Tickable link that represents a single value or a range of values.
  * Range rusn from start to <=end, going up by step.
- * You can set the range to s aingle value or to a full range, and when you read it you see the current value.
+ * You can set the range to a single value or to a full range, and when you read it you see the current value.
  */
 template<typename Number>
 struct Range : public subcommand::TickChainLink {
@@ -219,6 +246,8 @@ struct Range : public subcommand::TickChainLink {
         
         return true;
     }
+
+
     
     /// Convert to Number with the current value
     operator Number() const {
@@ -236,9 +265,9 @@ struct Range : public subcommand::TickChainLink {
     }
     
     /// Start us and all the things we are chained onto at their start values
-    void reset_chain() {
+    void reset_along_chain() {
         reset();
-        reset_chain_parent();
+        reset_along_chain_parent();
     }
     
     /// Increment our value.
@@ -248,25 +277,24 @@ struct Range : public subcommand::TickChainLink {
             // We are at the end
             return false;
         }
-        
+        auto old_here = here;
         here += step;
-        if ((step > 0 && here > end) || (step < 0 && here < end)) {
-            // We have passed the end (for things like double)
+        if ((step > 0 && (here > end || old_here >= here)) || (step < 0 && (here < end || old_here <= here))) {
+            // We have passed the end (for things like double), or done an overflow
             return false;
         }
-        
         return true;
     }
     
     /// Increment our value.
-    /// If it overflows, tick_chain whatever we are chained onto, and reset and succeed if that succeeds.
-    bool tick_chain() {
+    /// If it overflows, tick_along_chain whatever we are chained onto, and reset and succeed if that succeeds.
+    bool tick_along_chain() {
         if (tick()) {
             // We could change
             return true;
         } else {
             // We couldn't change.
-            if (tick_chain_parent()) {
+            if (tick_along_chain_parent()) {
                 // We have a parent we could advance.
                 reset();
                 return true;
@@ -275,6 +303,12 @@ struct Range : public subcommand::TickChainLink {
                 return false;
             }
         }
+    }
+
+    /// Declare we are static if the range is one element.
+    bool is_static() const {
+        // Would we pass the end or overflow if we ticked from start?
+        return (start == end) || (step > 0 && (start + step > end || start + step <= start)) || (step < 0 && (start + step < end || start + step >= start));
     }
 };
 
@@ -384,9 +418,19 @@ struct BaseValuation {
     /// Make a new BaseValuation for the given option
     BaseValuation(const std::string& option);
     virtual ~BaseValuation() = default;
-    
+
+    /// BaseValuations can be cloned, retaining their derived type.
+    virtual std::unique_ptr<BaseValuation> clone() const = 0;
+
     /// Long option to give a value to
     std::string option;
+
+protected:
+    // BaseValuations are copyable and assignable, but only as part of derived classes
+    BaseValuation(const BaseValuation& other) = default;
+    BaseValuation(BaseValuation&& other) = default;
+    BaseValuation& operator=(const BaseValuation& other) = default;
+    BaseValuation& operator=(BaseValuation&& other) = default;
 };
 
 /**
@@ -395,15 +439,31 @@ struct BaseValuation {
 template<typename T>
 struct Valuation : public BaseValuation {
     /// Make a preset entry that sets the given long option to the given value.
-    Valuation(const std::string& option, const T& value) : BaseValuation(option), value(value) {
-        // Nothing to do
-    }
-    
+    Valuation(const std::string& option, const T& value);
     virtual ~Valuation() = default;
 
+    /// Valuations can be cloned, retaining their derived type.
+    virtual std::unique_ptr<BaseValuation> clone() const;
+
+    // Valuations are copyable and assignable.
+    Valuation(const Valuation<T>& other) = default;
+    Valuation(Valuation<T>&& other) = default;
+    Valuation<T>& operator=(const Valuation<T>& other) = default;
+    Valuation<T>& operator=(Valuation<T>&& other) = default;
+    
     /// Value for the option
     T value;
 };
+
+template<typename T>
+Valuation<T>::Valuation(const std::string& option, const T& value): BaseValuation(option), value(value) {
+    // Nothing to do
+}
+
+template<typename T>
+std::unique_ptr<BaseValuation> Valuation<T>::clone() const {
+    return std::unique_ptr<BaseValuation>(new Valuation<T>(option, value));
+}
 
 /// Function type used to validate arguments. Throw std::domain_error if not allowed, explaining why.
 template<typename T>
@@ -415,11 +475,24 @@ extern const ValidatorFunction<double> double_is_positive;
 /// Validate that a double is not negative, or throw std::domain_error
 extern const ValidatorFunction<double> double_is_nonnegative;
 
+/// Validate that a double is a fraction between 0 and 1, inclusive, or throw std::domain_error
+extern const ValidatorFunction<double> double_is_fraction;
+
 /// Validate that a size_t is not zero, or throw std::domain_error
 extern const ValidatorFunction<size_t> size_t_is_nonzero;
 
+/// Validate that a size_t is positive, or throw std::domain_error;
+extern const ValidatorFunction<size_t> size_t_is_positive;
+
 /// Validate that an int is not negative, or throw std::domain_error;
 extern const ValidatorFunction<int> int_is_nonnegative;
+
+/// Represents a pringing format for options
+enum class OptionFormat {
+    SLUG,
+    JSON,
+    CLI
+};
 
 /**
  * Interface for a command-line argument that goes into a field on an object of
@@ -452,23 +525,42 @@ struct BaseArgSpec : public TickChainLink {
     virtual void query(BaseValuation& entry) const = 0;
     /// Apply the value to the right field of the given object.
     virtual void apply(Receiver& receiver) const = 0;
-     /// Print value to the given stream after the given separator.
-    virtual void print_value(ostream& out, const char* sep = "") const = 0;
+    /// Print value to the given stream after the given separator.
+    /// Returns true if any output was produced.
+    virtual bool print_value(ostream& out, const char* sep = "") const = 0;
     /// Print value metavar placeholder to the given stream after the given separator.
     virtual void print_metavar(ostream& out, const char* sep = "") const = 0;
     /// Print default value to the given stream, if appropriate.
     virtual void print_default(ostream& out) const = 0;
-    /// Print option and value to the given stream, without newlines, between the given separators.
-    /// If slug is set, use short option if available and don't include spaces.
-    virtual void print(ostream& out, const char* sep = "", const char* after = "", bool slug = false) const {
-        out << sep;
-        if (slug && short_option != '\0') {
-            out << "-" << short_option;
-        } else {
-            out << "--" << option;
+    /// Print option and value to the given stream, without newlines, using the given prefix and format.
+    /// If slug is set, only print if variable, use short option if available and don't include spaces.
+    /// Returns true if any output was produced.
+    virtual bool print(ostream& out, const char* before = "", OptionFormat format = OptionFormat::CLI) const {
+        if (format == OptionFormat::SLUG && this->is_static()) {
+            // We never change, so exclude from the slug
+            return false;
         }
-        this->print_value(out, slug ? "" : " ");
-        out << after;
+        out << before;
+        bool to_return = !(strlen(before) == 0);
+        if (format == OptionFormat::JSON) {
+            out << "\"";
+            to_return = true;
+        }
+        if (format == OptionFormat::SLUG && this->short_option != '\0') {
+            out << "-" << this->short_option;
+            to_return = true;
+        } else {
+            out << (format == OptionFormat::JSON ? "" : "--") << this->option;
+        }
+        if (format == OptionFormat::JSON) {
+            out << "\":";
+        }
+        to_return |= this->print_value(out, format == OptionFormat::CLI ? " " : "");
+        if (format == OptionFormat::CLI) {
+            out << endl;
+            to_return = true;
+        }
+        return to_return;
     }
     /// Get the getopt structure for this option. Option must outlive it and not move.
     virtual struct option get_option_struct() const = 0;
@@ -595,13 +687,13 @@ struct ValueArgSpec : public ArgSpec<T, Receiver> {
             this->validator(this->value);
             this->value_set = true;
         } catch (std::domain_error& e) {
-            cerr << "error: option ";
+            auto err_msg = logging::error("optarg parse()");
+            err_msg << "error: option ";
                 if (this->short_option) {
-                    cerr << "-" << this->short_option << "/";
+                    err_msg << "-" << this->short_option << "/";
                 }
-                cerr << "--" << this->option << " ";
-                cerr << e.what() << endl;
-                exit(1);
+            err_msg << "--" << this->option << " ";
+            err_msg << e.what() << endl;
         }
     }
     
@@ -611,7 +703,7 @@ struct ValueArgSpec : public ArgSpec<T, Receiver> {
     virtual void print_metavar(ostream& out, const char* sep = "") const {
         out << sep << get_metavar<T>();
     }
-    virtual void print_value(ostream& out, const char* sep = "") const {
+    virtual bool print_value(ostream& out, const char* sep = "") const {
         out << sep;
         if (std::is_integral<T>::value) {
             // Looks like a char, so print it as a number.
@@ -620,6 +712,7 @@ struct ValueArgSpec : public ArgSpec<T, Receiver> {
         } else {
             out << value;
         }
+        return true;
     }
     virtual void print_default(ostream& out) const {
         out << " [";
@@ -650,6 +743,10 @@ struct RangeArgSpec : public ValueArgSpec<T, Receiver, Range<T>> {
     
     using ValueArgSpec<T, Receiver, Range<T>>::ValueArgSpec;
     virtual ~RangeArgSpec() = default;
+
+    virtual bool is_static() const {
+        return this->value.is_static();
+    }
     
     virtual TickChainLink& chain(TickChainLink& next) {
         // Wire our value range into the chain.
@@ -677,24 +774,91 @@ struct FlagArgSpec : public ValueArgSpec<bool, Receiver> {
     virtual void print_metavar(ostream& out, const char* sep = "") const {
         // Don't do anything
     }
-    virtual void print_value(ostream& out, const char* sep = "") const {
+    virtual bool print_value(ostream& out, const char* sep = "") const {
         // Don't do anything
+        return false;
     }
     virtual void print_default(ostream& out) const {
         // Don't do anything
     }
-    virtual void print(ostream& out, const char* sep = "", const char* after = "", bool slug = false) const {
+    virtual bool print(ostream& out, const char* before = "", OptionFormat format = OptionFormat::CLI) const {
         // Override print to just print the flag when used
         if (this->value != this->default_value) {
-            out << sep;
-            if (slug && this->short_option != '\0') {
+            if (format == OptionFormat::JSON) {
+                out << "\"";
+            }
+            out << before;
+            if (format == OptionFormat::SLUG && this->short_option != '\0') {
                 out << "-" << this->short_option;
             } else {
-                out << "--" << this->option;
+                out << (format == OptionFormat::JSON ? "" : "--") << this->option;
             }
-            out << after;
+            if (format == OptionFormat::JSON) {
+                // In JSON we always mark the option as true due to being passed.
+                out << "\":true";
+            }
+            if (format == OptionFormat::CLI) {
+                out << endl;
+            }
+            return true;
         }
+        return false;
     }
+    virtual struct option get_option_struct() const {
+        return {this->option.c_str(), no_argument, 0, this->option_id};
+    }
+};
+
+/**
+ * Definition structure for the negation counterpart of a flag (e.g. --no-XXX
+ * for --XXX, or --XXX for --no-XXX). Has its own option name, ID, and help
+ * text, but uses the primary FlagArgSpec's storage when parsed.
+ */
+template<typename Receiver>
+struct NegationFlagArgSpec : public BaseArgSpec<Receiver> {
+    /// The primary flag whose storage we manipulate.
+    FlagArgSpec<Receiver>* primary;
+
+    NegationFlagArgSpec(const std::string& option, const std::string& help,
+                        FlagArgSpec<Receiver>* primary)
+        : BaseArgSpec<Receiver>(option, help), primary(primary) {}
+    virtual ~NegationFlagArgSpec() = default;
+
+    virtual void parse(const char* optarg) {
+        // Set the primary flag back to its default value.
+        primary->set_value(primary->default_value);
+    }
+
+    // Negation is not preset/set/query-able — use the primary option name.
+    virtual void preset(const BaseValuation& entry) {}
+    virtual void set(const BaseValuation& entry) {}
+    virtual void query(BaseValuation& entry) const {}
+
+    // Primary handles apply.
+    virtual void apply(Receiver& receiver) const {}
+
+    virtual bool print_value(ostream& out, const char* sep = "") const { return false; }
+    virtual void print_metavar(ostream& out, const char* sep = "") const {}
+    virtual void print_default(ostream& out) const {}
+
+    /// Print when the negation is in effect (value was explicitly set back to
+    /// default by the user).
+    virtual bool print(ostream& out, const char* before = "",
+                       OptionFormat format = OptionFormat::CLI) const {
+        if (primary->get_value() == primary->default_value && primary->was_set()) {
+            // The negation is in effect — print it
+            if (format == OptionFormat::JSON) {
+                out << before << "\"" << this->option << "\":true";
+            } else if (format == OptionFormat::SLUG) {
+                out << before << "--" << this->option;
+            } else {
+                out << before << "--" << this->option << endl;
+            }
+            return true;
+        }
+        return false;
+    }
+
     virtual struct option get_option_struct() const {
         return {this->option.c_str(), no_argument, 0, this->option_id};
     }
@@ -719,14 +883,13 @@ struct BaseOptionGroup : public TickChainLink {
     /// otherwies.
     virtual bool set(const BaseValuation& entry) = 0;
     
-    /// Fill in entry with the value of the correspondign option, if we have
+    /// Fill in entry with the value of the corresponding option, if we have
     /// that option. If so, return true.
     virtual bool query(BaseValuation& entry) const = 0;
     
-    /// Print all options set.
-    /// By default, prints one option per line.
-    /// If slug is set, prints short options, all on one line.
-    virtual void print_options(ostream& out, bool slug = false) const = 0;
+    /// Print all options set, in the given format. Returns true if any output
+    /// was produced.
+    virtual bool print_options(ostream& out, OptionFormat format = OptionFormat::CLI) const = 0;
     
     /// Get help, in the form of pairs of options and descriptions.
     /// Headings are descriptions without options.
@@ -782,56 +945,96 @@ struct OptionGroup : public BaseOptionGroup {
             // Just chain through
             return TickChainLink::chain(next);
         } else {
-            // Chain us to first arg, and last arg to next.
-            TickChainLink::chain(*args.front());
+            // We are already chained to first arg, so chain last arg to next.
             args.back()->chain(next);
             return next;
         }
     }
-    
-    // We need to take default_value by value, and not by reference, because we
-    // often want to pass stuff that is constexpr and trying to use a reference
-    // will make us try to link against it.
-    // TODO: C++17 fixes this, so fix when we use that.
-    
-    /// Add a new option that goes to the given field, with the given default.
-    template<typename T, typename Spec = ValueArgSpec<T, Receiver>>
-    void add_option(const std::string& name, char short_option, T Receiver::*dest, T default_value, const std::string& help, const ValidatorFunction<T>& validator = [](const T& ignored) {}) {
-        args.emplace_back(new Spec(name, short_option, dest, default_value, help, validator));
-        if (args.size() > 1) {
+
+    virtual void reset_chain() {
+        if (args.empty()) {
+            TickChainLink::reset_chain();
+        } else {
+            // Delegate tick to the real end of the chain
+            args.back()->reset_chain();
+        } 
+    }
+
+    virtual bool tick_chain() {
+        if (!args.empty()) {
+            // Delegate tick to the real end of the chain
+            return args.back()->tick_chain();
+        }
+        return false;
+    }
+
+    /// Take ownership of the given allocated BaseArgSpec, and attach it as part of the group.
+    /// TODO: Should this be private?
+    void attach_option(BaseArgSpec<Receiver>* spec) {
+        // Args will own this
+        args.emplace_back(spec);
+        if (args.size() == 1) {
+            // Chain us to first arg
+            TickChainLink::chain(*spec);
+        } else {
             // Chain onto previous option
-            args[args.size() - 2]->chain(*args[args.size() - 1]);
+            args[args.size() - 2]->chain(*spec);
         }
         // Index it by option ID
-        id_to_index.emplace(args[args.size() - 1]->option_id, args.size() - 1);
+        id_to_index.emplace(spec->option_id, args.size() - 1);
         // And option name
-        option_to_index.emplace(args[args.size() - 1]->option, args.size() - 1);
+        option_to_index.emplace(spec->option, args.size() - 1);
+    }
+
+    /// Add a new option that goes to the given field, with the given default.
+    template<typename T, typename Spec = ValueArgSpec<T, Receiver>>
+    Spec* add_option(const std::string& name, char short_option, T Receiver::*dest, const T& default_value, const std::string& help, const ValidatorFunction<T>& validator = [](const T& ignored) {}) {
+        Spec* spec = new Spec(name, short_option, dest, default_value, help, validator);
+        attach_option(spec);
+        return spec; 
     }
     
     /// Add a new option that goes to the given field, with the given default.
     template<typename T, typename Spec = ValueArgSpec<T, Receiver>>
-    void add_option(const std::string& name, T Receiver::*dest, T default_value, const std::string& help, const ValidatorFunction<T>& validator = [](const T& ignored) {}) {
-        add_option<T, Spec>(name, '\0', dest, default_value, help, validator);
+    Spec* add_option(const std::string& name, T Receiver::*dest, const T& default_value, const std::string& help, const ValidatorFunction<T>& validator = [](const T& ignored) {}) {
+        return add_option<T, Spec>(name, '\0', dest, default_value, help, validator);
     }
     
     /// Add a new option that handles range values
     template<typename T>
-    void add_range(const std::string& name, char short_option, T Receiver::*dest, T default_value, const std::string& help, const ValidatorFunction<T>& validator = [](const T& ignored) {}) {
-        add_option<T, RangeArgSpec<T, Receiver>>(name, short_option, dest, default_value, help, validator);
+    RangeArgSpec<T, Receiver>* add_range(const std::string& name, char short_option, T Receiver::*dest, const T& default_value, const std::string& help, const ValidatorFunction<T>& validator = [](const T& ignored) {}) {
+        return add_option<T, RangeArgSpec<T, Receiver>>(name, short_option, dest, default_value, help, validator);
     }
     /// Add a new option that handles range values
     template<typename T>
-    void add_range(const std::string& name, T Receiver::*dest, T default_value, const std::string& help, const ValidatorFunction<T>& validator = [](const T& ignored) {}) {
+    void add_range(const std::string& name, T Receiver::*dest, const T& default_value, const std::string& help, const ValidatorFunction<T>& validator = [](const T& ignored) {}) {
         add_range<T>(name, '\0', dest, default_value, help, validator);
     }
     
-    /// Add a new option that is a boolean flag
-    void add_flag(const std::string& name, char short_option, bool Receiver::*dest, bool default_value, const std::string& help, const ValidatorFunction<bool>& validator = [](const bool& ignored) {}) {
-        add_option<bool, FlagArgSpec<Receiver>>(name, short_option, dest, default_value, help, validator);
+    /// Add a new option that is a boolean flag, and auto-generate a negation
+    /// counterpart (--no-XXX for --XXX, or --XXX for --no-XXX).
+    std::pair<FlagArgSpec<Receiver>*, NegationFlagArgSpec<Receiver>*> add_flag(const std::string& name, char short_option, bool Receiver::*dest, bool default_value, const std::string& help, const ValidatorFunction<bool>& validator = [](const bool& ignored) {}) {
+        
+        auto primary = add_option<bool, FlagArgSpec<Receiver>>(name, short_option, dest, default_value, help, validator);
+
+        // Auto-generate negation counterpart
+        std::string neg_name;
+        if (name.size() > 3 && name.substr(0, 3) == "no-") {
+            neg_name = name.substr(3);
+        } else {
+            neg_name = "no-" + name;
+        }
+        std::string neg_help = "opposite of --" + name;
+        auto negation = new NegationFlagArgSpec<Receiver>(neg_name, neg_help, primary);
+        attach_option(negation);
+
+        return {primary, negation};
     }
-    /// Add a new option that is a boolean flag
-    void add_flag(const std::string& name, bool Receiver::*dest, bool default_value, const std::string& help, const ValidatorFunction<bool>& validator = [](const bool& ignored) {}) {
-        add_flag(name, '\0', dest, default_value, help, validator);
+
+    /// Add a new option that is a boolean flag, and auto-generate a negation
+    /// counterpart (--no-XXX for --XXX, or --XXX for --no-XXX).
+    std::pair<FlagArgSpec<Receiver>*, NegationFlagArgSpec<Receiver>*> add_flag(const std::string& name, bool Receiver::*dest, bool default_value, const std::string& help, const ValidatorFunction<bool>& validator = [](const bool& ignored) {}) {
+        return add_flag(name, '\0', dest, default_value, help, validator);
     }
     
     /// Parse the given option ID, with the given value if needed.
@@ -884,19 +1087,31 @@ struct OptionGroup : public BaseOptionGroup {
         }
     }
     
-    /// Print all options set, one per line
-    virtual void print_options(ostream& out, bool slug = false) const {
-        if (slug) {
+    /// Print all options set
+    virtual bool print_options(ostream& out, OptionFormat format = OptionFormat::CLI) const {
+        bool to_return = false;
+        if (format == OptionFormat::SLUG) {
             for (auto& arg : args) {
                 // Print unseparated short options
-                arg->print(out, "", "", true);
+                if (!arg->is_static()) {
+                    to_return |= arg->print(out, "", format);
+                }
+            }
+        } else if (format == OptionFormat::JSON) {
+            bool first = true;
+            for (auto& arg : args) {
+                bool printed_anything = arg->print(out, first ? "" : ",", format);
+                // If this produces no output, stay in first mode.
+                first &= !printed_anything;
+                to_return |= printed_anything;
             }
         } else {
             for (auto& arg : args) {
                 // Print long options, one per line
-                arg->print(out, "", "\n");
+                to_return |= arg->print(out, "", format);
             }
         }
+        return to_return;
     }
     
     /// Apply all flags to the receiver
@@ -967,7 +1182,8 @@ struct OptionGroup : public BaseOptionGroup {
     
     /// Heading we will appear under in the help.
     std::string heading;
-    /// Holds the argument definitions and parsing destinations
+    /// Holds the argument definitions and parsing destinations. Because they
+    /// are chained up and point to each other, they can't move.
     std::vector<std::unique_ptr<BaseArgSpec<Receiver>>> args;
     /// Map from option ID to option index
     std::unordered_map<int, size_t> id_to_index;
@@ -990,8 +1206,8 @@ struct GroupedOptionGroup : public BaseOptionGroup {
     GroupedOptionGroup() = default;
     GroupedOptionGroup(const GroupedOptionGroup& other) = delete;
     GroupedOptionGroup& operator=(GroupedOptionGroup& other) = delete;
-    GroupedOptionGroup(GroupedOptionGroup&& other) = default;
-    GroupedOptionGroup& operator=(GroupedOptionGroup&& other) = default;
+    GroupedOptionGroup(GroupedOptionGroup&& other) = delete;
+    GroupedOptionGroup& operator=(GroupedOptionGroup&& other) = delete;
     virtual ~GroupedOptionGroup() = default;
 
     /// Create a new child group with a new heading, which we can add options
@@ -1000,7 +1216,10 @@ struct GroupedOptionGroup : public BaseOptionGroup {
     OptionGroup<Receiver>& add_group(const std::string& heading) {
         OptionGroup<Receiver>* new_group = new OptionGroup<Receiver>(heading);
         subgroups.emplace_back(new_group);
-        if (subgroups.size() > 1) {
+        if (subgroups.size() == 1) {
+            // Chain us to first group
+            TickChainLink::chain(*subgroups.front());
+        } else {
             // Chain the groups
             subgroups[subgroups.size() - 2]->chain(*subgroups[subgroups.size() - 1]);
         }
@@ -1026,6 +1245,12 @@ struct GroupedOptionGroup : public BaseOptionGroup {
     
     /// Chain through all subgroups 
     virtual TickChainLink& chain(TickChainLink& next);
+
+    /// Delegate reset to last subgroup
+    virtual void reset_chain();
+
+    /// Delegate tick to last subgroup
+    virtual bool tick_chain();
     
     virtual bool parse(int option_id, const char* optarg); 
     
@@ -1035,7 +1260,7 @@ struct GroupedOptionGroup : public BaseOptionGroup {
     
     virtual bool query(BaseValuation& entry) const;
     
-    virtual void print_options(ostream& out, bool slug = false) const;
+    virtual bool print_options(ostream& out, OptionFormat format = OptionFormat::CLI) const;
     
     virtual std::vector<std::pair<std::string, std::string>> get_help() const;
     
@@ -1055,26 +1280,56 @@ struct GroupedOptionGroup : public BaseOptionGroup {
  * apply(root_option_group) to apply it.
  */
 struct Preset {
+    
+    Preset() = default;
+
+    // Presets are copyable and assignable
+    inline Preset(const Preset& other);
+    Preset(Preset&& other) = default;
+    inline Preset& operator=(const Preset& other);
+    Preset& operator=(Preset&& other) = default;
+
     /// As part of this preset, set the given option to the given value.
     template<typename T>
-    Preset& add_entry(const std::string& option, const T& value) {
-        Valuation<T>* entry = new Valuation<T>(option, value);
-        entries.emplace_back(entry);
-        return *this;
-    }
+    Preset& add_entry(const std::string& option, const T& value);
     
     /// Apply stored presets to the given parser
-    void apply(BaseOptionGroup& parser) const {
-        for (auto& entry : entries) {
-            // Apply the entry
-            bool applied = parser.preset(*entry);
-            // Make sure it worked
-            assert(applied);
-        }
-    }
+    inline void apply(BaseOptionGroup& parser) const;
     
     std::vector<std::unique_ptr<BaseValuation>> entries;
 };
+
+inline Preset::Preset(const Preset& other) {
+    // Delegate to copy assignment
+    *this = other;
+}
+
+inline Preset& Preset::operator=(const Preset& other) {
+    entries.clear();
+    entries.reserve(other.entries.size());
+    for (auto& e : other.entries) {
+        entries.emplace_back(std::move(e->clone()));
+    }
+    return *this;
+}
+
+template<typename T>
+Preset& Preset::add_entry(const std::string& option, const T& value) {
+    Valuation<T>* entry = new Valuation<T>(option, value);
+    entries.emplace_back(entry);
+    return *this;
+}
+
+inline void Preset::apply(BaseOptionGroup& parser) const {
+    for (auto& entry : entries) {
+        // Apply the entry
+        bool applied = parser.preset(*entry);
+        // Make sure it worked
+        if (!applied) {
+            logging::error("Preset::apply") << "Could not apply preset for " << entry->option << std::endl; 
+        }
+    }
+}
 
 /**
  * Print a table of rows, with each column starting at the same character on the line.

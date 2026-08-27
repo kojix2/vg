@@ -35,7 +35,9 @@ public:
      */
     SurjectingAlignmentEmitter(const PathPositionHandleGraph* graph,
         unordered_set<path_handle_t> paths, unique_ptr<AlignmentEmitter>&& backing,
-        bool prune_suspicious_anchors = false);
+        bool prune_suspicious_anchors = false, bool add_graph_alignment_tag = false,
+        bool report_supplementary = false, bool add_off_ref_position_tag = false,
+        bool left_align = false);
    
     ///  Force full length alignment in surjection resolution 
     bool surject_subpath_global = true;
@@ -60,6 +62,9 @@ public:
     /// Both ends of each pair must have the same number of mappings.
     virtual void emit_mapped_pairs(vector<vector<Alignment>>&& alns1_batch,
         vector<vector<Alignment>>&& alns2_batch, vector<int64_t>&& tlen_limit_batch);
+
+    /// Emit some extra type-tagged data, if the backing format supports it.
+    virtual void emit_extra_message(const std::string& tag, std::string&& data);
     
 protected:
     /// Surjector used to do the surjection
@@ -71,8 +76,12 @@ protected:
     /// AlignmentEmitter to emit to once done
     unique_ptr<AlignmentEmitter> backing;
     
-    /// Surject alignments in place.
+    /// Surject unpaired alignments in place.
     void surject_alignments_in_place(vector<Alignment>& alns) const;
+    
+    /// Surject paired alignments in place and separate out supplementary alignments
+    void surject_paired_alignments_in_place(vector<Alignment>& alns1, vector<Alignment>& alns2,
+                                            vector<Alignment>& supplementary_alns) const;
     
     
     

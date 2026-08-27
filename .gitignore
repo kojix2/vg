@@ -8,7 +8,7 @@ share/
 include/
 obj/
 cpp/
-.pre-build
+pre-build.log
 src/vg_git_version.hpp
 src/vg_environment_version.hpp
 *.o
@@ -23,6 +23,9 @@ test/.*
 test/*.lcp
 test/*/*.lcp
 test/**/*.index/
+test/wiki-data/mock-hs37d5/graphs/
+test/wiki-data/mock-hs37d5/indexes/
+test/wiki-data/mock-hs37d5/logs/
 trash
 src/*.gch
 .vscode
@@ -48,3 +51,4 @@ debug_main.cpp
 /*.fa
 /*.gfa
 .vscode/*
+.cache/*

@@ -1,15 +1,17 @@
 /**
- * \file giraffe_main.cpp: G(ir)AF (Graph Alignment Format) Fast Emitter: a fast short-read-to-haplotypes mapper
+ * \file giraffe_main.cpp: G(ir)AF (Graph Alignment Format) Fast Emitter: a fast read-to-haplotypes mapper
  */
 
 #include <omp.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <fstream>
 #include <iostream>
 #include <cassert>
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <optional>
 #include <vector>
 #include <unordered_set>
 #include <chrono>
@@ -26,12 +28,12 @@
 #include "../hts_alignment_emitter.hpp"
 #include "../minimizer_mapper.hpp"
 #include "../index_registry.hpp"
+#include "../utility.hpp"
 #include "../watchdog.hpp"
 #include "../crash.hpp"
 #include <bdsg/overlays/overlay_helper.hpp>
 
 #include "../gbwtgraph_helper.hpp"
-#include "../recombinator.hpp"
 
 #include <gbwtgraph/gbz.h>
 #include <gbwtgraph/minimizer.h>
@@ -40,6 +42,12 @@
 
 #ifdef USE_CALLGRIND
 #include <valgrind/callgrind.h>
+#endif
+
+//#define USE_MEMORY_PROFILING
+
+#ifdef USE_MEMORY_PROFILING
+#include "../config/allocator_config.hpp"
 #endif
 
 #include <sys/ioctl.h>
@@ -53,15 +61,28 @@ static long perf_event_open(struct perf_event_attr* hw_event, pid_t pid, int cpu
 }
 #endif
 
+//#define debug
+
 using namespace std;
 using namespace vg;
 using namespace vg::subcommand;
+
+static Logger logger("vg giraffe");
 
 /// Options struct for options for the Giraffe driver (i.e. this file)
 struct GiraffeMainOptions {
     /// How long should we wait while mapping a read before complaining, in seconds.
     static constexpr size_t default_watchdog_timeout = 10;
     size_t watchdog_timeout = default_watchdog_timeout;
+    /// Should we log all the reads we map?
+    static constexpr bool default_log_reads = false;
+    bool log_reads = default_log_reads;
+    /// How many reads to send to a thread at a time
+    static constexpr size_t default_batch_size = vg::io::DEFAULT_PARALLEL_BATCHSIZE;
+    size_t batch_size = default_batch_size;
+    /// Should we prune low-complexity anchors when surjecting?
+    static constexpr bool default_prune_low_cplx = false;
+    bool prune_low_cplx = default_prune_low_cplx;
 };
 
 /// Options struct for scoring-related parameters. Defaults are in aligner.hpp.
@@ -73,20 +94,38 @@ struct ScoringOptions {
     int8_t full_length_bonus = default_full_length_bonus;
 };
 
-static GroupedOptionGroup get_options() {
-    GroupedOptionGroup parser;
+static std::unique_ptr<GroupedOptionGroup> get_options() {
+    std::unique_ptr<GroupedOptionGroup> parser(new GroupedOptionGroup());
     
     // Configure Giraffe program settings
-    auto& main_opts = parser.add_group<GiraffeMainOptions>("program options");
+    auto& main_opts = parser->add_group<GiraffeMainOptions>("program options");
     main_opts.add_range(
         "watchdog-timeout", 
         &GiraffeMainOptions::watchdog_timeout,
         GiraffeMainOptions::default_watchdog_timeout,
         "complain after INT seconds working on a read or read pair"
     );
-    
+    main_opts.add_flag(
+        "log-reads",
+        &GiraffeMainOptions::log_reads,
+        GiraffeMainOptions::default_log_reads,
+        "log each read being mapped"
+    );
+    main_opts.add_range(
+        "batch-size", 'B',
+        &GiraffeMainOptions::batch_size,
+        GiraffeMainOptions::default_batch_size,
+        "complain after INT seconds working on a read or read pair"
+    );
+    main_opts.add_flag(
+        "prune-low-cplx", 'P',
+        &GiraffeMainOptions::prune_low_cplx,
+        GiraffeMainOptions::default_prune_low_cplx,
+        "prune short and low complexity anchors during linear format realignment (on by default for long reads)"
+    );
+
     // Configure scoring
-    auto& scoring_opts = parser.add_group<ScoringOptions>("scoring options");
+    auto& scoring_opts = parser->add_group<ScoringOptions>("scoring options");
     scoring_opts.add_range(
         "match",
         &ScoringOptions::match,
@@ -119,16 +158,22 @@ static GroupedOptionGroup get_options() {
     );
 
     // Configure output settings on the MinimizerMapper
-    auto& result_opts = parser.add_group<MinimizerMapper>("result options");
+    auto& result_opts = parser->add_group<MinimizerMapper>("result options");
     result_opts.add_range(
         "max-multimaps", 'M',
         &MinimizerMapper::max_multimaps,
         MinimizerMapper::default_max_multimaps,
         "produce up to INT alignments for each read"
     );
+    result_opts.add_flag(
+        "supplementary",
+        &MinimizerMapper::find_supplementaries,
+        MinimizerMapper::default_find_supplementaries,
+        "identify and report supplementary alignments"
+    );
     
     // Configure normal Giraffe mapping computation
-    auto& comp_opts = parser.add_group<MinimizerMapper>("computational parameters");
+    auto& comp_opts = parser->add_group<MinimizerMapper>("computational parameters");
     comp_opts.add_range(
         "hit-cap", 'c',
         &MinimizerMapper::hit_cap,
@@ -139,7 +184,8 @@ static GroupedOptionGroup get_options() {
         "hard-hit-cap", 'C',
         &MinimizerMapper::hard_hit_cap,
         MinimizerMapper::default_hard_hit_cap,
-        "ignore all minimizers with more than INT hits"
+        "ignore all minimizers with more than INT hits",
+        size_t_is_positive
     );
     comp_opts.add_range(
         "score-fraction", 'F',
@@ -151,8 +197,13 @@ static GroupedOptionGroup get_options() {
         "max-min", 'U',
         &MinimizerMapper::max_unique_min,
         MinimizerMapper::default_max_unique_min,
-        "use at most INT minimizers",
-        size_t_is_nonzero
+        "use at most INT minimizers, 0 for no limit"
+    );
+    comp_opts.add_range(
+        "min-coverage-flank",
+        &MinimizerMapper::minimizer_coverage_flank,
+        MinimizerMapper::default_minimizer_coverage_flank,
+        "when trying to cover the read with minimizers, count INT towards the coverage of each minimizer on each side"
     );
     comp_opts.add_range(
         "num-bp-per-min",
@@ -161,16 +212,36 @@ static GroupedOptionGroup get_options() {
         "use maximum of number minimizers calculated by READ_LENGTH / INT and --max-min"
     );
     comp_opts.add_range(
+        "downsample-window-length",
+        &MinimizerMapper::minimizer_downsampling_max_window_length,
+        MinimizerMapper::default_minimizer_downsampling_max_window_length,
+        "maximum window length for downsampling"
+    );
+    comp_opts.add_range(
+        "downsample-window-count",
+        &MinimizerMapper::minimizer_downsampling_window_count,
+        MinimizerMapper::default_minimizer_downsampling_window_count,
+        "downsample minimizers with windows of length read_length/INT, 0 for no downsampling"
+    );
+    comp_opts.add_range(
         "distance-limit", 'D',
         &MinimizerMapper::distance_limit,
         MinimizerMapper::default_distance_limit,
         "cluster using this distance limit"
     );
     comp_opts.add_range(
+        "min-extensions",
+        &MinimizerMapper::min_extensions,
+        MinimizerMapper::default_min_extensions,
+        "extend at least INT clusters",
+        size_t_is_positive
+    );
+    comp_opts.add_range(
         "max-extensions", 'e',
         &MinimizerMapper::max_extensions,
         MinimizerMapper::default_max_extensions,
-        "extend up to INT clusters"
+        "extend up to INT clusters",
+        size_t_is_positive
     );
     comp_opts.add_range(
         "max-alignments", 'a',
@@ -198,6 +269,12 @@ static GroupedOptionGroup get_options() {
         MinimizerMapper::default_cluster_coverage_threshold,
         "only extend clusters if they are within FLOAT of the best read coverage",
         double_is_nonnegative
+    );
+    comp_opts.add_range(
+        "max-extension-mismatches",
+        &MinimizerMapper::max_extension_mismatches,
+        MinimizerMapper::default_max_extension_mismatches,
+        "maximum number of mismatches to pass through in a gapless extension"
     );
     comp_opts.add_range(
         "extension-score", 'v',
@@ -255,9 +332,33 @@ static GroupedOptionGroup get_options() {
         MinimizerMapper::default_rescue_seed_limit,
         "attempt rescue with at most INT seeds"
     );
+    comp_opts.add_flag(
+        "explored-cap",
+        &MinimizerMapper::use_explored_cap,
+        MinimizerMapper::default_use_explored_cap,
+        "use explored minimizer layout cap on mapping quality"
+    );
+    comp_opts.add_range(
+        "mapq-score-window",
+        &MinimizerMapper::mapq_score_window,
+        MinimizerMapper::default_mapq_score_window,
+        "window to rescale score to for mapping quality, or 0 if not used"
+    );
+    comp_opts.add_range(
+        "mapq-score-scale",
+        &MinimizerMapper::mapq_score_scale,
+        MinimizerMapper::default_mapq_score_scale,
+        "scale scores for mapping quality"
+    );
+    comp_opts.add_range(
+        "min-mapq0-score",
+        &MinimizerMapper::min_mapq0_score,
+        MinimizerMapper::default_min_mapq0_score,
+        "discard MAPQ 0 alignments with scores lower than threshold"
+    );
     
     // Configure chaining
-    auto& chaining_opts = parser.add_group<MinimizerMapper>("long-read/chaining parameters");
+    auto& chaining_opts = parser->add_group<MinimizerMapper>("long-read/chaining parameters");
     chaining_opts.add_flag(
         "align-from-chains",
         &MinimizerMapper::align_from_chains,
@@ -265,46 +366,114 @@ static GroupedOptionGroup get_options() {
         "chain up extensions to create alignments, instead of doing each separately"
     );
     chaining_opts.add_range(
-        "chaining-cluster-distance",
-        &MinimizerMapper::chaining_cluster_distance,
-        MinimizerMapper::default_chaining_cluster_distance,
-        "maximum distance to cluster over before chaining"
+        "zipcode-tree-score-threshold",
+        &MinimizerMapper::zipcode_tree_score_threshold,
+        MinimizerMapper::default_zipcode_tree_score_threshold,
+        "only chain trees if they are within INT of the best score",
+        double_is_nonnegative
     );
     chaining_opts.add_range(
-        "precluster-connection-coverage-threshold",
-        &MinimizerMapper::precluster_connection_coverage_threshold,
-        MinimizerMapper::default_precluster_connection_coverage_threshold,
-        "threshold of precluster pair coverage below the base, after which to stop reseeding between preclusters"
+        "pad-zipcode-tree-score-threshold",
+        &MinimizerMapper::pad_zipcode_tree_score_threshold,
+        MinimizerMapper::default_pad_zipcode_tree_score_threshold,
+        "also chain trees within INT of above threshold to get a second-best cluster",
+        double_is_nonnegative
     );
     chaining_opts.add_range(
-        "min-precluster-connections",
-        &MinimizerMapper::min_precluster_connections,
-        MinimizerMapper::default_min_precluster_connections,
-        "minimum number of precluster connections to reseed over"
+        "zipcode-tree-coverage-threshold",
+        &MinimizerMapper::zipcode_tree_coverage_threshold,
+        MinimizerMapper::default_zipcode_tree_coverage_threshold,
+        "only chain trees if they are within FLOAT of the best read coverage",
+        double_is_nonnegative
     );
     chaining_opts.add_range(
-        "max-precluster-connections",
-        &MinimizerMapper::max_precluster_connections,
-        MinimizerMapper::default_max_precluster_connections,
-        "maximum number of precluster connections to reseed over"
+        "zipcode-tree-scale",
+        &MinimizerMapper::zipcode_tree_scale,
+        MinimizerMapper::default_zipcode_tree_scale,
+        "at what fraction of the read length should zipcode trees be split up"
     );
     chaining_opts.add_range(
-        "max-lookback-bases",
-        &MinimizerMapper::max_lookback_bases,
-        MinimizerMapper::default_max_lookback_bases,
-        "maximum distance to look back when chaining"
+        "gapless-extension-limit",
+        &MinimizerMapper::gapless_extension_limit,
+        MinimizerMapper::default_gapless_extension_limit,
+        "do gapless extension to seeds in a tree before chaining if the read length is less than this"
     );
     chaining_opts.add_range(
-        "min-lookback-items",
-        &MinimizerMapper::min_lookback_items,
-        MinimizerMapper::default_min_lookback_items,
-        "minimum items to consider coming from when chaining"
+        "min-chaining-problems",
+        &MinimizerMapper::min_chaining_problems,
+        MinimizerMapper::default_min_chaining_problems,
+        "ignore score threshold to get this many chaining problems",
+        int_is_nonnegative
     );
     chaining_opts.add_range(
-        "lookback-item-hard-cap",
-        &MinimizerMapper::lookback_item_hard_cap,
-        MinimizerMapper::default_lookback_item_hard_cap,
-        "maximum items to consider coming from when chaining"
+        "max-chaining-problems",
+        &MinimizerMapper::max_chaining_problems,
+        MinimizerMapper::default_max_chaining_problems,
+        "do no more than this many chaining problems",
+        int_is_nonnegative
+    );
+    chaining_opts.add_range(
+        "max-graph-lookback-bases",
+        &MinimizerMapper::max_graph_lookback_bases,
+        MinimizerMapper::default_max_graph_lookback_bases,
+        "maximum distance to look back in the graph when chaining"
+    );
+    chaining_opts.add_range(
+        "max-graph-lookback-bases-per-base",
+        &MinimizerMapper::max_graph_lookback_bases_per_base,
+        MinimizerMapper::default_max_graph_lookback_bases_per_base,
+        "maximum distance to look back in the graph when chaining, per read base"
+    );
+    chaining_opts.add_range(
+        "max-read-lookback-bases",
+        &MinimizerMapper::max_read_lookback_bases,
+        MinimizerMapper::default_max_read_lookback_bases,
+        "maximum distance to look back in the read when chaining"
+    );
+    chaining_opts.add_range(
+        "max-read-lookback-bases-per-base",
+        &MinimizerMapper::max_read_lookback_bases_per_base,
+        MinimizerMapper::default_max_read_lookback_bases_per_base,
+        "maximum distance to look back in the read when chaining, per read base"
+    );
+    chaining_opts.add_range(
+        "max-indel-bases",
+        &MinimizerMapper::max_indel_bases,
+        MinimizerMapper::default_max_indel_bases,
+        "maximum indel length in a transition when chaining"
+    );
+    chaining_opts.add_range(
+        "max-indel-bases-per-base",
+        &MinimizerMapper::max_indel_bases_per_base,
+        MinimizerMapper::default_max_indel_bases_per_base,
+        "maximum indel length in a transition when chaining, per read base"
+    );
+    chaining_opts.add_range(
+        "item-bonus",
+        &MinimizerMapper::item_bonus,
+        MinimizerMapper::default_item_bonus,
+        "bonus for taking each item when chaining"
+    );
+    chaining_opts.add_range(
+        "gap-scale",
+        &MinimizerMapper::gap_scale,
+        MinimizerMapper::default_gap_scale,
+        "scale for gap scores when chaining",
+        double_is_nonnegative
+    );
+    chaining_opts.add_range(
+        "rec-penalty",
+        &MinimizerMapper::rec_penalty,
+        MinimizerMapper::default_rec_penalty,
+        "penalty for a recombination in recombination-aware mode",
+        int_is_nonnegative
+    );
+    chaining_opts.add_range(
+        "rec-consistency-bonus",
+        &MinimizerMapper::rec_consistency_bonus,
+        MinimizerMapper::default_rec_consistency_bonus,
+        "untracked bonus for chains staying consistent with haplotypes to avoid recombinations in recombination-aware mode",
+        int_is_nonnegative
     );
     
     chaining_opts.add_range(
@@ -315,38 +484,152 @@ static GroupedOptionGroup get_options() {
         double_is_nonnegative
     );
     chaining_opts.add_range(
-        "min-chains",
-        &MinimizerMapper::min_chains,
-        MinimizerMapper::default_min_chains,
-        "ignore score threshold to get this many chains aligned",
+        "target-alignment-attempts",
+        &MinimizerMapper::target_alignment_attempts,
+        MinimizerMapper::default_target_alignment_attempts,
+        "ignore score threshold (but not min score) to get this many chains aligned",
         int_is_nonnegative
     );
-   chaining_opts.add_range(
-        "chain-min-score",
-        &MinimizerMapper::chain_min_score,
-        MinimizerMapper::default_chain_min_score,
-        "do not align chains with less than this score",
+    chaining_opts.add_range(
+        "min-chain-score-per-base",
+        &MinimizerMapper::min_chain_score_per_base,
+        MinimizerMapper::default_min_chain_score_per_base,
+        "do not align chains with less than this score per read base",
+        double_is_nonnegative
+    );
+    chaining_opts.add_range(
+        "max-min-chain-score",
+        &MinimizerMapper::max_min_chain_score,
+        MinimizerMapper::default_max_min_chain_score,
+        "accept chains with this score or more regardless of read length",
         int_is_nonnegative
+    );
+    chaining_opts.add_range(
+        "min-indel-avoid-bases",
+        &MinimizerMapper::min_indel_avoid_bases,
+        MinimizerMapper::default_min_indel_avoid_bases,
+        "skip seeds in a chain for alignment which would force an indel of INT bases or more"
+    );
+    chaining_opts.add_range(
+        "max-skipped-bases",
+        &MinimizerMapper::max_skipped_bases,
+        MinimizerMapper::default_max_skipped_bases,
+        "when skipping seeds in a chain for alignment, connect seeds at most INT bases apart"
+    );
+    chaining_opts.add_range(
+        "max-chains-per-tree",
+        &MinimizerMapper::max_chains_per_tree,
+        MinimizerMapper::default_max_chains_per_tree,
+        "align up to this many chains from each tree",
+        size_t_is_positive
     );
     
     chaining_opts.add_range(
         "max-chain-connection",
         &MinimizerMapper::max_chain_connection,
         MinimizerMapper::default_max_chain_connection,
-        "maximum distance across which to connect seeds when aligning a chain"
+        "maximum distance across which to connect seeds with WFAExtender when aligning a chain"
     );
     chaining_opts.add_range(
         "max-tail-length",
         &MinimizerMapper::max_tail_length,
         MinimizerMapper::default_max_tail_length,
-        "maximum length of a tail to align before forcing softclipping when aligning a chain"
+        "maximum length of a tail to align with WFAExtender when aligning a chain"
     );
     chaining_opts.add_range(
         "max-dp-cells",
         &MinimizerMapper::max_dp_cells,
         MinimizerMapper::default_max_dp_cells,
-        "maximum number of alignment cells to allow in a tail with GSSW"
+        "maximum number of alignment cells to allow in a tail or BGA connection"
     );
+    chaining_opts.add_range(
+        "max-tail-gap",
+        &MinimizerMapper::max_tail_gap,
+        MinimizerMapper::default_max_tail_gap,
+        "maximum number of gap bases to allow in a Dozeu tail"
+    );
+    chaining_opts.add_range(
+        "max-middle-gap",
+        &MinimizerMapper::max_middle_gap,
+        MinimizerMapper::default_max_middle_gap,
+        "maximum number of gap bases to allow in a middle connection"
+    );
+    chaining_opts.add_range(
+        "max-tail-dp-length",
+        &MinimizerMapper::max_tail_dp_length,
+        MinimizerMapper::default_max_tail_dp_length,
+        "maximum number of bases in a tail to do DP for, to avoid score overflow"
+    );
+    chaining_opts.add_range(
+        "max-middle-dp-length",
+        &MinimizerMapper::max_middle_dp_length,
+        MinimizerMapper::default_max_middle_dp_length,
+        "maximum number of bases in a middle connection to do DP for, before making it a tail"
+    );
+    chaining_opts.add_range(
+        "wfa-max-mismatches",
+        &MinimizerMapper::wfa_max_mismatches,
+        MinimizerMapper::default_wfa_max_mismatches,
+        "maximum mismatches (or equivalent-scoring gaps) to allow in the shortest WFA connection or tail"
+    );
+    chaining_opts.add_range(
+        "wfa-max-mismatches-per-base",
+        &MinimizerMapper::wfa_max_mismatches_per_base,
+        MinimizerMapper::default_wfa_max_mismatches_per_base,
+        "maximum additional mismatches (or equivalent-scoring gaps) to allow per involved read base in WFA connections or tails"
+    );
+    chaining_opts.add_range(
+        "wfa-max-max-mismatches",
+        &MinimizerMapper::wfa_max_max_mismatches,
+        MinimizerMapper::default_wfa_max_max_mismatches,
+        "maximum mismatches (or equivalent-scoring gaps) to allow in the longest WFA connection or tail"
+    );
+    chaining_opts.add_range(
+        "wfa-distance",
+        &MinimizerMapper::wfa_distance,
+        MinimizerMapper::default_wfa_distance,
+        "band distance to allow in the shortest WFA connection or tail"
+    );
+    chaining_opts.add_range(
+        "wfa-distance-per-base",
+        &MinimizerMapper::wfa_distance_per_base,
+        MinimizerMapper::default_wfa_distance_per_base,
+        "band distance to allow per involved read base in WFA connections or tails"
+    );
+    chaining_opts.add_range(
+        "wfa-max-distance",
+        &MinimizerMapper::wfa_max_distance,
+        MinimizerMapper::default_wfa_max_distance,
+        "band distance to allow in the longest WFA connection or tail"
+    );
+    chaining_opts.add_range(
+        "rec-penalty-aln",
+        &MinimizerMapper::rec_penalty_aln,
+        MinimizerMapper::default_rec_penalty_aln,
+        "penalty per recombination for final alignment scoring in recombination-aware mode",
+        int_is_nonnegative
+    );
+    chaining_opts.add_range(
+        "softclip-penalty",
+        &MinimizerMapper::softclip_penalty,
+        MinimizerMapper::default_softclip_penalty,
+        "penalize candidate alignment scores this many points per softclipped base",
+        double_is_nonnegative
+    );
+    chaining_opts.add_flag(
+        "sort-by-chain-score",
+        &MinimizerMapper::sort_by_chain_score,
+        MinimizerMapper::default_sort_by_chain_score,
+        "order alignment candidates by chain score instead of base-level score"
+    );
+    chaining_opts.add_range(
+        "min-unique-node-fraction",
+        &MinimizerMapper::min_unique_node_fraction,
+        MinimizerMapper::default_min_unique_node_fraction,
+        "minimum fraction of an alignment that must be from distinct oriented nodes for the alignment to be distinct",
+        double_is_fraction
+    );
+
     return parser;
 }
 
@@ -362,73 +645,127 @@ std::string strip_suffixes(std::string filename, const std::vector<std::string>&
     return filename;
 }
 
-// Returns the name of the sampled GBZ.
-string sample_haplotypes(const vector<pair<string, string>>& indexes, string& basename, string& sample_name, string& haplotype_file, string& kff_file, bool progress);
+/**
+ * Make sure that variables set by options independently controlling the min
+ * and max of something actually make sense as a min and max.
+ */
+template<typename T> void enforce_min_max(const T& low, const std::string& low_option, const T& high, const std::string& high_option) {
+    if (low > high) {
+        logger.error() << "Empty range: --" << low_option << " of " << low << " exceeds --" << high_option << " of " << high << std::endl;
+    }
+}
 
 //----------------------------------------------------------------------------
 
-void help_giraffe(char** argv, const BaseOptionGroup& parser, bool full_help) {
-    cerr
-    << "usage:" << endl
-    << "  " << argv[0] << " giraffe -Z graph.gbz [-d graph.dist -m graph.min] <input options> [other options] > output.gam" << endl
-    << "  " << argv[0] << " giraffe -Z graph.gbz --haplotype-name graph.hapl --kff-name sample.kff <input options> [other options] > output.gam" << endl
-    << endl
-    << "Fast haplotype-aware short read mapper." << endl
-    << endl;
+void help_giraffe(char** argv, const BaseOptionGroup& parser, const std::map<std::string, Preset>& presets, bool full_help) {
+    cerr << "usage:" << endl
+         << "  " << argv[0] << " giraffe -Z graph.gbz [-d graph.dist [-m graph.withzip.min -z graph.zipcodes]] <input options> [other options] > output.gam" << endl
+         << "  " << argv[0] << " giraffe -Z graph.gbz --haplotype-name graph.hapl --kff-name sample.kff <input options> [other options] > output.gam" << endl
+         << endl
+         << "Fast haplotype-aware read mapper." << endl
+         << endl;
 
-    cerr
-    << "basic options:" << endl
-    << "  -Z, --gbz-name FILE           map to this GBZ graph" << endl
-    << "  -d, --dist-name FILE          cluster using this distance index" << endl
-    << "  -m, --minimizer-name FILE     use this minimizer index" << endl
-    << "  -p, --progress                show progress" << endl
-    << "  -t, --threads INT             number of mapping threads to use" << endl
-    << "  -b, --parameter-preset NAME   set computational parameters (fast / default) [default]" << endl
-    << "  -h, --help                    print full help with all available options" << endl;
+    cerr << "basic options:" << endl
+         << "  -Z, --gbz-name FILE           map to this GBZ graph" << endl
+         << "  -m, --minimizer-name FILE     use this minimizer index" << endl
+         << "  -z, --zipcode-name FILE       use these additional distance hints" << endl
+         << "  -d, --dist-name FILE          cluster using this distance index" << endl
+         << "  -p, --progress                show progress" << endl
+         << "  -t, --threads N               number of mapping threads to use" << endl
+         << "  -b, --parameter-preset NAME   set computational parameters [default]" << endl
+         << "                                (";
+    for (auto p = presets.begin(); p != presets.end(); ++p) {
+        // Announce each preset name, slash-separated
+        cerr << p->first;
+        auto next_p = p;
+        ++next_p;
+        if (next_p != presets.end()) {
+            // There's another preset.
+            cerr << " / ";
+        }
+    }
+    cerr << ")" << endl
+         << "  -h, --help                    print full help with all available options" << endl;
 
-    cerr
-    << "input options:" << endl
-    << "  -G, --gam-in FILE             read and realign GAM-format reads from FILE" << endl
-    << "  -f, --fastq-in FILE           read and align FASTQ-format reads from FILE (two are allowed, one for each mate)" << endl
-    << "  -i, --interleaved             GAM/FASTQ input is interleaved pairs, for paired-end alignment" << endl;
+    cerr << "input options:" << endl
+         << "  -G, --gam-in FILE             read and realign these GAM-format reads" << endl
+         << "  -f, --fastq-in FILE           read and align these FASTQ/FASTA-format reads" << endl
+         << "                                (two are allowed, one for each mate)" << endl
+         << "  -i, --interleaved             GAM/FASTQ/FASTA input is interleaved pairs," << endl
+         << "                                for paired-end alignment" << endl
+         << "      --comments-as-tags        treat comments in name lines as SAM-style tags" << endl
+         << "                                and annotate alignments with them" << endl
+         << "      --index-basename STR      name prefix for autodetected and generated" << endl
+         << "                                graph/index files (default: from graph and" << endl
+         << "                                sample)" << endl;
 
-    cerr
-    << "haplotype sampling:" << endl
-    << "  --haplotype-name FILE         sample from haplotype information in FILE" << endl
-    << "  --kff-name FILE               sample according to kmer counts in FILE" << endl
-    << "  --index-basename STR          name prefix for generated graph/index files (default: from graph name)" << endl;
+    cerr << "haplotype sampling:" << endl
+         << "      --haplotype-sampling      use per-sample personalized graph (will be" << endl
+         << "                                built if not found)" << endl
+         << "      --haplotype-name FILE     sample from haplotype information in FILE" << endl
+         << "                                (implies --haplotype-sampling)" << endl
+         << "      --kff-name FILE           sample according to kmer counts in FILE (implies" << endl
+         << "                                --haplotype-sampling)" << endl
+         << "      --set-reference STR       include this sample as a reference" << endl
+         << "                                in the personalized graph (may repeat)" << endl
+         << "      --num-haplotypes N        haplotypes candidates to sample (default: " << IndexingParameters::haplotype_sampling_num_haplotypes << ")" << endl
+         << "      --no-diploid-sampling     turn off downsampling candidates to best diploid" << endl;
 
-    cerr
-    << "alternate graphs:" << endl
-    << "  -x, --xg-name FILE            map to this graph (if no -Z / -g), or use this graph for HTSLib output" << endl
-    << "  -g, --graph-name FILE         map to this GBWTGraph (if no -Z)" << endl
-    << "  -H, --gbwt-name FILE          use this GBWT index (when mapping to -x / -g)" << endl;
+    cerr << "alternate graphs:" << endl
+         << "  -x, --xg-name FILE            map to this graph (if no -Z / -g)," << endl
+         << "                                or use this graph for HTSLib output" << endl
+         << "  -g, --graph-name FILE         map to this GBWTGraph (if no -Z)" << endl
+         << "  -H, --gbwt-name FILE          use this GBWT index (when mapping to -x / -g)" << endl;
 
-    cerr
-    << "output options:" << endl
-    << "  -N, --sample NAME             add this sample name" << endl
-    << "  -R, --read-group NAME         add this read group" << endl
-    << "  -o, --output-format NAME      output the alignments in NAME format (gam / gaf / json / tsv / SAM / BAM / CRAM) [gam]" << endl
-    << "  --ref-paths FILE              ordered list of paths in the graph, one per line or HTSlib .dict, for HTSLib @SQ headers" << endl
-    << "  --named-coordinates           produce GAM/GAF outputs in named-segment (GFA) space" << endl;
+    cerr << "output options:" << endl
+         << "  -N, --sample NAME             add this sample name" << endl
+         << "  -R, --read-group NAME         add this read group" << endl
+         << "  -o, --output-format NAME      output the alignments in NAME format [gam]" << endl
+         << "                                {gam / gaf / json / tsv / SAM / BAM / CRAM} " << endl
+         << "      --ref-paths FILE          ordered list of paths in the graph, one per line" << endl
+         << "                                or HTSlib .dict, for HTSLib @SQ headers" << endl
+         << "      --ref-name NAME           name of reference in the graph for HTSlib output" << endl
+         << "      --named-coordinates       make GAM/GAF output in named-segment (GFA) space" << endl;
     if (full_help) {
-        cerr
-        << "  -P, --prune-low-cplx          prune short and low complexity anchors during linear format realignment" << endl
-        << "  -n, --discard                 discard all output alignments (for profiling)" << endl
-        << "  --output-basename NAME        write output to a GAM file beginning with the given prefix for each setting combination" << endl
-        << "  --report-name NAME            write a TSV of output file and mapping speed to the given file" << endl
-        << "  --show-work                   log how the mapper comes to its conclusions about mapping locations" << endl;
+        cerr << "      --add-graph-aln           annotate linear formats with graph alignment" << endl
+             << "      --left-align              attempt to left-align indels in linear formats" << endl
+             << "                                in the GR tag as a cs-style difference string" << endl
+             << "      --off-ref-position        annotate off-reference mappings in HTSLib output" << endl
+             << "                                with the nearest reference position in NR tag" << endl
+             << "  -n, --discard                 discard all output alignments (for profiling)" << endl
+             << "      --output-basename NAME    write output to a GAM file with the given prefix" << endl
+             << "                                for each setting combination. Setting values for" << endl
+             << "                                many other options can be provided as ranges" << endl
+             << "                                in the format start[:end[:step]], with end" << endl
+             << "                                being inclusive." << endl
+             << "      --report-name FILE        write a TSV of output file and mapping speed" << endl
+             << "      --show-work               log how the mapper comes to its conclusions" << endl
+             << "                                about mapping locations (use one read at a time)" << endl;
+             
     }
 
     if (full_help) {
-        cerr
-        << "Giraffe parameters:" << endl
-        << "  -A, --rescue-algorithm NAME   use algorithm NAME for rescue (none / dozeu / gssw) [dozeu]" << endl
-        << "  --fragment-mean FLOAT         force the fragment length distribution to have this mean (requires --fragment-stdev)" << endl
-        << "  --fragment-stdev FLOAT        force the fragment length distribution to have this standard deviation (requires --fragment-mean)" << endl
-        << "  --track-provenance            track how internal intermediate alignment candidates were arrived at" << endl
-        << "  --track-correctness           track if internal intermediate alignment candidates are correct (implies --track-provenance)" << endl
-        << "  -B, --batch-size INT          number of reads or pairs per batch to distribute to threads [" << vg::io::DEFAULT_PARALLEL_BATCHSIZE << "]" << endl;
+        cerr << "Giraffe parameters:" << endl
+             << "  -E, --rec-mode                activate recombination-aware mode" << endl
+             << "      --no-rec-mode             deactivate recombination-aware mode" << endl
+             << "  -A, --rescue-algorithm NAME   use this rescue algorithm [dozeu]" << endl
+             << "                                {none / dozeu / gssw}" << endl
+             << "      --fragment-mean FLOAT     force fragment length distribution to have this" << endl
+             << "                                mean (requires --fragment-stdev)" << endl
+             << "      --fragment-stdev FLOAT    force fragment length distribution to have this" << endl
+             << "                                standard deviation (requires --fragment-mean)" << endl
+             << "      --set-refpos              set refpos field on reads" << endl
+             << "                                to reference path positions they visit" << endl
+             << "      --track-provenance        track how internal intermediate alignment" << endl
+             << "                                candidates were arrived at" << endl
+             << "      --track-correctness       track if internal intermediate alignment" << endl
+             << "                                candidates are correct" << endl
+             << "                                (implies --track-provenance)" << endl
+             << "      --track-position          coarsely track linear reference positions of" << endl
+             << "                                good intermediate alignment candidates" << endl
+             << "                                (implies --track-provenance)" << endl
+             << "      --haplotype-positions     index all haplotypes for position reporting" << endl;
+             
 
         auto helps = parser.get_help();
         print_table(helps, cerr);
@@ -445,25 +782,37 @@ int main_giraffe(int argc, char** argv) {
     gbwt::Verbosity::set(gbwt::Verbosity::SILENT);
 
     // Set up to parse options
-    GroupedOptionGroup parser = get_options();
+    std::unique_ptr<GroupedOptionGroup> parser = get_options();
 
-    if (argc == 2) {
-        help_giraffe(argv, parser, false);
-        return 1;
-    }
-    
-    #define OPT_OUTPUT_BASENAME 1001
-    #define OPT_REPORT_NAME 1002
-    #define OPT_TRACK_PROVENANCE 1003
-    #define OPT_TRACK_CORRECTNESS 1004
-    #define OPT_FRAGMENT_MEAN 1005
-    #define OPT_FRAGMENT_STDEV 1006
-    #define OPT_REF_PATHS 1010
-    #define OPT_SHOW_WORK 1011
-    #define OPT_NAMED_COORDINATES 1012
+    constexpr int OPT_OUTPUT_BASENAME = 1000;
+    constexpr int OPT_REPORT_NAME = 1001;
+    constexpr int OPT_SET_REFPOS = 1002;
+    constexpr int OPT_FRAGMENT_MEAN = 1003;
+    constexpr int OPT_FRAGMENT_STDEV = 1004;
+    constexpr int OPT_REF_PATHS = 1005;
+    constexpr int OPT_REF_NAME = 1006;
+    constexpr int OPT_NAMED_COORDINATES = 1011;
+    constexpr int OPT_ADD_GRAPH_ALIGNMENT = 1012;
+    constexpr int OPT_COMMENTS_AS_TAGS = 1013;
+    constexpr int OPT_OFF_REF_POSITION = 1014;
+    constexpr int OPT_LEFT_ALIGN = 1015;
+    constexpr int OPT_NO_REC_MODE = 1016;
     constexpr int OPT_HAPLOTYPE_NAME = 1100;
+
     constexpr int OPT_KFF_NAME = 1101;
     constexpr int OPT_INDEX_BASENAME = 1102;
+    constexpr int OPT_SET_REFERENCE = 1103;
+    constexpr int OPT_HAPLOTYPE_SAMPLING = 1104;
+    constexpr int OPT_NUM_HAPLOTYPES = 1105;
+    constexpr int OPT_NO_DIPLOID_SAMPLING = 1106;
+
+    constexpr int OPT_TRACK_PROVENANCE = 1201;
+    constexpr int OPT_TRACK_CORRECTNESS = 1202;
+    constexpr int OPT_TRACK_POSITION = 1203;
+    constexpr int OPT_HAPLOTYPE_POSITIONS = 1204;
+    constexpr int OPT_SHOW_WORK = 1205;
+
+
 
     // initialize parameters with their default options
     
@@ -471,12 +820,16 @@ int main_giraffe(int argc, char** argv) {
     IndexRegistry registry = VGIndexes::get_vg_index_registry();
 
     // Indexes provided to IndexRegistry in the arguments. We do not apply them
-    // immediately, because we may want to do haplotype sampling.
-    vector<pair<string, string>> provided_indexes;
-    string index_basename, index_basename_override;
+    // immediately, because we may want to do haplotype sampling. We need them
+    // indexed for lookup. We only support one file per index (FASTQs get
+    // handled separately).
+    std::unordered_map<string, string> provided_indexes;
+    string index_basename_guess, index_basename;
 
     // For haplotype sampling.
-    string haplotype_name, kff_name;
+    string kff_filename;
+    bool haplotype_sampling_flag = false;
+    gbwtgraph::sample_name_set reference_samples;
 
     string output_basename;
     string report_name;
@@ -490,15 +843,17 @@ int main_giraffe(int argc, char** argv) {
     // What GAM should we realign?
     string gam_filename;
     // What FASTQs should we align.
-    // Note: multiple FASTQs are not interpreted as paired.
+    // Multiple FASTQs are interpreted as paired.
     string fastq_filename_1;
     string fastq_filename_2;
     // Is the input interleaved/are we in paired-end mode?
     bool interleaved = false;
     // True if fastq_filename_2 or interleaved is set.
     bool paired = false;
+    // True if the FASTQ's name line comments are SAM-style tags that we want to preserve
+    bool comments_as_tags = false;
     string param_preset = "default";
-    //Attempt up to this many rescues of reads with no pairs
+    // Attempt up to this many rescues of reads with no pairs
     bool forced_rescue_attempts = false;
     // Which rescue algorithm do we use?
     MinimizerMapper::RescueAlgorithm rescue_algorithm = MinimizerMapper::rescue_dozeu;
@@ -514,20 +869,26 @@ int main_giraffe(int argc, char** argv) {
     string sample_name;
     // What read group if any should we apply?
     string read_group;
+    // Should we set the alignment refpos fields?
+    bool set_refpos = MinimizerMapper::default_set_refpos;
     // Should we track candidate provenance?
     bool track_provenance = MinimizerMapper::default_track_provenance;
     // Should we track candidate correctness?
     bool track_correctness = MinimizerMapper::default_track_correctness;
+    // Should we track candidate position?
+    bool track_position = MinimizerMapper::default_track_position;
     // Should we log our mapping decision making?
     bool show_work = MinimizerMapper::default_show_work;
+    // Should we index all haplotypes for more informative logs and dumps?
+    bool haplotype_positions = MinimizerMapper::default_haplotype_positions;
+    // TODO: We could also add machinery to index particular haplotypes for
+    // debugging using positions on them.
     
     // Should we throw out our alignments instead of outputting them?
     bool discard_alignments = false;
-    // How many reads per batch to run at a time?
-    uint64_t batch_size = vg::io::DEFAULT_PARALLEL_BATCHSIZE;
     
     // Chain all the ranges and get a function that loops over all combinations.
-    auto for_each_combo = parser.get_iterator();
+    auto for_each_combo = parser->get_iterator();
     
 
     // Formats for alignment output.
@@ -536,11 +897,29 @@ int main_giraffe(int argc, char** argv) {
 
     // For HTSlib formats, where do we get sequence header info?
     std::string ref_paths_name;
-    // And should we drop low complexity anchors when surjectng?
-    bool prune_anchors = false;
+    // What assemblies shoudl we use when autodetecting reference paths?
+    std::unordered_set<std::string> reference_assembly_names;
+    // When surjecting, should we annotate the reads with the graph alignment?
+    bool add_graph_alignment = false;
+
+    // When surjecting, should we attempt to left-align relative to the reference?
+    bool left_align = false;
     
+    // When surjecting, should we annotate the off-reference reads with the nearest reference position?
+    bool annotate_off_ref_position = false;
+
     // For GAM format, should we report in named-segment space instead of node ID space?
     bool named_coordinates = false;
+
+    // Are we mapping long reads or short reads? According to the parameter preset
+    bool map_long_reads = false;
+    
+    // User-provided option for whether to do recombination-aware mapping. 
+    //
+    // If true, use a minimizer index with paths in the payloads, and do
+    // recombination-aware chaining. If false, use minimizer-only payloads and
+    // don't do recombination-aware chaining.
+    std::optional<bool> rec_mode;
 
     // Map algorithm names to rescue algorithms
     std::map<std::string, MinimizerMapper::RescueAlgorithm> rescue_algorithms = {
@@ -553,7 +932,8 @@ int main_giraffe(int argc, char** argv) {
         { MinimizerMapper::rescue_dozeu, "dozeu" },
         { MinimizerMapper::rescue_gssw, "gssw" },
     };
-    
+    //TODO: Right now there can be two versions of the distance index. This ensures that the correct minimizer type gets built
+
     // Map preset names to presets
     std::map<std::string, Preset> presets;
     // We have a fast preset that sets a bunch of stuff
@@ -570,11 +950,192 @@ int main_giraffe(int argc, char** argv) {
         .add_entry<double>("extension-set", 20)
         .add_entry<int>("extension-score", 1);
     // And a default preset that doesn't.
-    presets["default"];
-    // And a chaining preset (TODO: make into PacBio and Nanopore)
-    presets["chaining"]
+    presets["default"]
+        // This is always on in the non-chaining codepath right now, but just to be sure...
+        .add_entry<bool>("explored-cap", true);
+    
+    presets["hifi"]
         .add_entry<bool>("align-from-chains", true)
-        .add_entry<size_t>("watchdog-timeout", 30);
+        .add_entry<bool>("explored-cap", false)
+        .add_entry<size_t>("watchdog-timeout", 30)
+        .add_entry<size_t>("batch-size", 10)
+        // Use downsampling instead of max unique minimizer count
+        .add_entry<size_t>("max-min", 79)
+        .add_entry<size_t>("num-bp-per-min", 152)
+        .add_entry<size_t>("downsample-window-count", 15)
+        .add_entry<size_t>("downsample-window-length", 227)
+        // Don't use the hit-cap||score-fraction filter because it doesn't do anything after downsampling
+        .add_entry<size_t>("hit-cap", 0)
+        .add_entry<double>("score-fraction", 1.0)
+        .add_entry<size_t>("hard-hit-cap", 13614)
+        // Don't do gapless extension
+        .add_entry<size_t>("gapless-extension-limit", 0)
+        .add_entry<double>("mapq-score-scale", 0.001)
+        .add_entry<double>("zipcode-tree-score-threshold", 100.0)
+        .add_entry<double>("pad-zipcode-tree-score-threshold", 50.0)
+        .add_entry<double>("zipcode-tree-coverage-threshold", 0.5)
+        .add_entry<double>("zipcode-tree-scale", 2.0)
+        .add_entry<int>("min-chaining-problems", 6)
+        .add_entry<int>("max-chaining-problems", std::numeric_limits<int>::max())
+        .add_entry<size_t>("max-graph-lookback-bases", 20000)
+        .add_entry<double>("max-graph-lookback-bases-per-base", 0.10501002120802233)
+        .add_entry<size_t>("max-indel-bases", 5000)
+        .add_entry<double>("max-indel-bases-per-base", 2.45)
+        .add_entry<int>("item-bonus", 2)
+        .add_entry<double>("gap-scale", 0.27579)
+        .add_entry<int>("rec-penalty", 2)
+        .add_entry<int>("rec-consistency-bonus", 12)
+        .add_entry<double>("chain-score-threshold", 234.0)
+        .add_entry<int>("target-alignment-attempts", 2)
+        .add_entry<double>("min-chain-score-per-base", 0.24)
+        .add_entry<size_t>("max-chains-per-tree", 3)
+        .add_entry<int>("max-min-chain-score", 46)
+        .add_entry<size_t>("min-indel-avoid-bases", 50)
+        .add_entry<size_t>("max-skipped-bases", 1000)
+        .add_entry<size_t>("max-alignments", 3)
+        .add_entry<size_t>("max-chain-connection", 233)
+        .add_entry<size_t>("max-tail-length", 68)
+        .add_entry<size_t>("max-tail-gap", 150)
+        .add_entry<size_t>("max-middle-gap", 500)
+        .add_entry<size_t>("max-dp-cells", 8000000000)
+        .add_entry<int>("wfa-distance", 33)
+        .add_entry<double>("wfa-distance-per-base", 0.195722)
+        .add_entry<int>("wfa-max-distance", 240)
+        .add_entry<int>("wfa-max-mismatches", 2)
+        .add_entry<double>("wfa-max-mismatches-per-base", 0.05)
+        .add_entry<int>("wfa-max-max-mismatches", 15)
+        .add_entry<int>("rec-penalty-aln", 28)
+        .add_entry<bool>("prune-low-cplx", true);
+
+    Preset r10_base;
+
+    r10_base
+        .add_entry<bool>("align-from-chains", true)
+        .add_entry<bool>("explored-cap", false)
+        .add_entry<size_t>("watchdog-timeout", 30)
+        .add_entry<size_t>("batch-size", 10)
+        // Use downsampling instead of max unique minimizer count
+        .add_entry<size_t>("max-min", 79)
+        .add_entry<size_t>("num-bp-per-min", 152)
+        .add_entry<size_t>("downsample-window-count", 15)
+        .add_entry<size_t>("downsample-window-length", 227)
+        // Don't use the hit-cap||score-fraction filter because it doesn't do anything after downsampling
+        .add_entry<size_t>("hit-cap", 0)
+        .add_entry<double>("score-fraction", 1.0)
+        .add_entry<size_t>("hard-hit-cap", 13614)
+        .add_entry<double>("mapq-score-scale", 1)
+        .add_entry<size_t>("mapq-score-window", 150)
+        .add_entry<size_t>("min-mapq0-score", 67)
+        .add_entry<double>("zipcode-tree-score-threshold", 100.0)
+        .add_entry<double>("pad-zipcode-tree-score-threshold", 50.0)
+        .add_entry<double>("zipcode-tree-coverage-threshold", 0.5)
+        .add_entry<double>("zipcode-tree-scale", 2.0)
+        //Don't do gapless extension
+        .add_entry<size_t>("gapless-extension-limit", 0)
+        .add_entry<int>("min-chaining-problems", 6)
+        .add_entry<int>("max-chaining-problems", std::numeric_limits<int>::max())
+        .add_entry<size_t>("max-graph-lookback-bases", 20000)
+        .add_entry<double>("max-graph-lookback-bases-per-base", 0.036)
+        .add_entry<size_t>("max-read-lookback-bases", 20000)
+        .add_entry<double>("max-read-lookback-bases-per-base", 0.036)
+        .add_entry<size_t>("max-indel-bases", 5000)
+        .add_entry<double>("max-indel-bases-per-base", 2.45)
+        .add_entry<int>("item-bonus", 20)
+        .add_entry<double>("gap-scale", 0.06759721757973396)
+        .add_entry<int>("rec-penalty", 2)
+        .add_entry<int>("rec-consistency-bonus", 13)
+        .add_entry<double>("chain-score-threshold", 160.0)
+        .add_entry<int>("target-alignment-attempts", 2)
+        .add_entry<size_t>("max-chains-per-tree", 3)
+        // Lowering this can reduce wrong reads in mapping experiments, but
+        // seems to *increase* miscalls; see
+        // https://ucsc-gi.slack.com/archives/CJ2EHEH1A/p1779202719223779?thread_ts=1779127572.303779&cid=CJ2EHEH1A
+        .add_entry<double>("min-chain-score-per-base", 0.052)
+        .add_entry<int>("max-min-chain-score", 1900.0)
+        .add_entry<size_t>("min-indel-avoid-bases", 50)
+        .add_entry<size_t>("max-skipped-bases", 1000)
+        .add_entry<size_t>("max-alignments", 3)
+        .add_entry<size_t>("max-chain-connection", 233)
+        .add_entry<size_t>("max-tail-length", 68)
+        .add_entry<size_t>("max-tail-gap", 150)
+        .add_entry<size_t>("max-middle-gap", 500)
+        .add_entry<size_t>("max-dp-cells", 8000000000)
+        .add_entry<int>("wfa-distance", 33)
+        .add_entry<double>("wfa-distance-per-base", 0.195722)
+        .add_entry<int>("wfa-max-distance", 240)
+        .add_entry<int>("wfa-max-mismatches", 2)
+        .add_entry<double>("wfa-max-mismatches-per-base", 0.05)
+        .add_entry<int>("wfa-max-max-mismatches", 15)
+        .add_entry<int>("rec-penalty-aln", 32)
+        .add_entry<bool>("prune-low-cplx", true);
+
+    presets.emplace("r10", r10_base);
+
+    // TODO: Add a dedicated r10y2025 preset that diverges slightly.
+
+    // And a short reads with chaining preset
+    presets["chaining-sr"]
+        .add_entry<bool>("align-from-chains", true)
+        .add_entry<bool>("explored-cap", true)
+        // Cap minimizers at a number we won't reach.
+        .add_entry<size_t>("max-min", 500)
+        .add_entry<size_t>("num-bp-per-min", 500)
+        // Don't downsample
+        .add_entry<size_t>("downsample-window-count", 0)
+        .add_entry<size_t>("downsample-window-length", std::numeric_limits<size_t>::max())
+        // Use the hit-cap||score-fraction filter
+        .add_entry<size_t>("hit-cap", 15)
+        .add_entry<double>("score-fraction", 0.9)
+        .add_entry<size_t>("hard-hit-cap", 500) // Default: 500
+        // Grab the best trees
+        .add_entry<double>("zipcode-tree-scale", 1.5)
+        .add_entry<double>("zipcode-tree-score-threshold", 70)
+        .add_entry<double>("pad-zipcode-tree-score-threshold", 50)
+        .add_entry<double>("zipcode-tree-coverage-threshold", 0.13)
+        // And extend them
+        .add_entry<size_t>("gapless-extension-limit", std::numeric_limits<size_t>::max())
+        // Allowing a lot of mismatches because we chop later
+        .add_entry<size_t>("max-extension-mismatches", 15)
+        .add_entry<double>("gap-scale", 2.2)
+        // And take those to chains
+        .add_entry<int>("min-chaining-problems", 7)
+        .add_entry<int>("max-chaining-problems", std::numeric_limits<int>::max())
+        .add_entry<size_t>("max-graph-lookback-bases", 1000)
+        .add_entry<double>("max-graph-lookback-bases-per-base", 0)
+        .add_entry<size_t>("max-indel-bases", 1600)
+        .add_entry<double>("max-indel-bases-per-base", 0)
+        .add_entry<double>("chain-score-threshold", 100.0)
+        .add_entry<double>("min-chain-score-per-base", 0.01)
+        .add_entry<int>("max-min-chain-score", 200.0)
+        .add_entry<int>("item-bonus", 0)
+        .add_entry<int>("target-alignment-attempts", 3)
+        .add_entry<size_t>("max-chains-per-tree", 5)
+        .add_entry<size_t>("max-alignments", 4)
+        // Don't use the WFAExtender to connect anchors because it can take tenths of seconds sometimes.
+        .add_entry<size_t>("max-chain-connection", 65)
+        .add_entry<size_t>("max-tail-gap", 115)
+        .add_entry<double>("mapq-score-scale", 1.5);
+    presets["srold"]
+        .add_entry<bool>("align-from-chains", true)
+        .add_entry<bool>("explored-cap", false)
+        // Use downsampling instead of max unique minimizer count
+        .add_entry<size_t>("max-min", 0)
+        .add_entry<size_t>("downsample-window-count", 100)
+        .add_entry<size_t>("downsample-window-length", std::numeric_limits<size_t>::max())
+        // Don't use the hit-cap||score-fraction filter because it doesn't do anything after downsampling
+        .add_entry<size_t>("hit-cap", 0)
+        .add_entry<double>("score-fraction", 1.0)
+        // Use a high hard hit cap to allow centromeres
+        .add_entry<size_t>("hard-hit-cap", 16384)
+        .add_entry<double>("mapq-score-scale", 1.0)
+        .add_entry<int>("min-chaining-problems", 1)
+        .add_entry<int>("max-chaining-problems", std::numeric_limits<int>::max())
+        .add_entry<double>("max-graph-lookback-bases-per-base", 0)
+        .add_entry<double>("max-indel-bases-per-base", 0)
+        .add_entry<int>("target-alignment-attempts", 4)
+        .add_entry<size_t>("max-chains-per-tree", 5)
+        .add_entry<size_t>("max-alignments", 5);
+        
    
     std::vector<struct option> long_options =
     {
@@ -584,39 +1145,56 @@ int main_giraffe(int argc, char** argv) {
         {"graph-name", required_argument, 0, 'g'},
         {"gbwt-name", required_argument, 0, 'H'},
         {"minimizer-name", required_argument, 0, 'm'},
+        {"zipcode-name", required_argument, 0, 'z'},
         {"dist-name", required_argument, 0, 'd'},
         {"progress", no_argument, 0, 'p'},
+        {"index-basename", required_argument, 0, OPT_INDEX_BASENAME},
+        {"haplotype-sampling", no_argument, 0, OPT_HAPLOTYPE_SAMPLING},
         {"haplotype-name", required_argument, 0, OPT_HAPLOTYPE_NAME},
         {"kff-name", required_argument, 0, OPT_KFF_NAME},
-        {"index-basename", required_argument, 0, OPT_INDEX_BASENAME},
+        {"set-reference", required_argument, 0, OPT_SET_REFERENCE},
+        {"num-haplotypes", required_argument, 0, OPT_NUM_HAPLOTYPES},
+        {"no-diploid-sampling", no_argument, 0, OPT_NO_DIPLOID_SAMPLING},
         {"gam-in", required_argument, 0, 'G'},
         {"fastq-in", required_argument, 0, 'f'},
         {"interleaved", no_argument, 0, 'i'},
-        {"max-multimaps", required_argument, 0, 'M'},
+        {"comments-as-tags", no_argument, 0, OPT_COMMENTS_AS_TAGS},
         {"sample", required_argument, 0, 'N'},
         {"read-group", required_argument, 0, 'R'},
         {"output-format", required_argument, 0, 'o'},
         {"ref-paths", required_argument, 0, OPT_REF_PATHS},
-        {"prune-low-cplx", no_argument, 0, 'P'},
+        {"ref-name", required_argument, 0, OPT_REF_NAME},
+        {"add-graph-aln", no_argument, 0, OPT_ADD_GRAPH_ALIGNMENT},
+        {"off-ref-position", no_argument, 0, OPT_OFF_REF_POSITION},
+        {"left-align", no_argument, 0, OPT_LEFT_ALIGN},
         {"named-coordinates", no_argument, 0, OPT_NAMED_COORDINATES},
         {"discard", no_argument, 0, 'n'},
         {"output-basename", required_argument, 0, OPT_OUTPUT_BASENAME},
         {"report-name", required_argument, 0, OPT_REPORT_NAME},
         {"parameter-preset", required_argument, 0, 'b'},
+        {"rec-mode", no_argument, 0, 'E'},
+        {"no-rec-mode", no_argument, 0, OPT_NO_REC_MODE},
         {"rescue-algorithm", required_argument, 0, 'A'},
         {"fragment-mean", required_argument, 0, OPT_FRAGMENT_MEAN },
         {"fragment-stdev", required_argument, 0, OPT_FRAGMENT_STDEV },
+        {"set-refpos", no_argument, 0, OPT_SET_REFPOS},
         {"track-provenance", no_argument, 0, OPT_TRACK_PROVENANCE},
         {"track-correctness", no_argument, 0, OPT_TRACK_CORRECTNESS},
+        {"track-position", no_argument, 0, OPT_TRACK_POSITION},
+        {"haplotype-positions", no_argument, 0, OPT_HAPLOTYPE_POSITIONS},
         {"show-work", no_argument, 0, OPT_SHOW_WORK},
-        {"batch-size", required_argument, 0, 'B'},
         {"threads", required_argument, 0, 't'},
     };
-    parser.make_long_options(long_options);
+    parser->make_long_options(long_options);
     long_options.push_back({0, 0, 0, 0});
     
-    std::string short_options = "hZ:x:g:H:m:d:pG:f:iM:N:R:o:Pnb:B:t:A:";
-    parser.make_short_options(short_options);
+    std::string short_options = "h?Z:x:g:H:m:z:d:pG:f:iN:R:o:nb:t:A:E";
+    parser->make_short_options(short_options);
+
+    if (argc == 2) {
+        help_giraffe(argv, *parser, presets, false);
+        return 1;
+    }
 
     int c;
     optind = 2; // force optind past command positional argument
@@ -632,7 +1210,7 @@ int main_giraffe(int argc, char** argv) {
         if (c == -1)
             break;
             
-        if (parser.parse(c, optarg)) {
+        if (parser->parse(c, optarg)) {
             // Parser took care of it
             continue;
         }
@@ -641,138 +1219,103 @@ int main_giraffe(int argc, char** argv) {
         switch (c)
         {
             case 'Z':
-                if (!optarg || !*optarg) {
-                    cerr << "error:[vg giraffe] Must provide GBZ file with -Z." << endl;
-                    exit(1);
-                }
-                if (!std::ifstream(optarg).is_open()) {
-                    cerr << "error:[vg giraffe] Couldn't open GBZ file " << optarg << endl;
-                    exit(1);
-                }
-                provided_indexes.emplace_back("Giraffe GBZ", optarg);
+                // All provided_indexes are later validated
+                // with require_exists()
+                provided_indexes.emplace("GBZ", optarg);
 
                 // If we have a GBZ we probably want to use its name as the base name.
-                // But see -g.
-                index_basename = strip_suffixes(std::string(optarg), { ".gbz", ".giraffe" });
+                index_basename_guess = strip_suffixes(std::string(optarg), { ".gbz", ".giraffe" });
 
                 break;
 
             case 'x':
-                if (!optarg || !*optarg) {
-                    cerr << "error:[vg giraffe] Must provide graph file with -x." << endl;
-                    exit(1);
-                }
-                if (!std::ifstream(optarg).is_open()) {
-                    cerr << "error:[vg giraffe] Couldn't open graph file " << optarg << endl;
-                    exit(1); 
-                }
-                provided_indexes.emplace_back("XG", optarg);
+                provided_indexes.emplace("XG", optarg);
                 
-                // If we have an xg we probably want to use its name as the base name.
-                // But see -g.
-                index_basename = split_ext(optarg).first;
+                // If we have an XG we probably want to use its name as the base name.
+                index_basename_guess = split_ext(optarg).first;
                 
                 break;
 
             case 'g':
-                if (!optarg || !*optarg) {
-                    cerr << "error:[vg giraffe] Must provide GBWTGraph file with -g." << endl;
-                    exit(1);
-                }
-                if (!std::ifstream(optarg).is_open()) {
-                    cerr << "error:[vg giraffe] Couldn't open GBWTGraph file " << optarg << endl;
-                    exit(1); 
-                }
-                provided_indexes.emplace_back("GBWTGraph", optarg);
+                provided_indexes.emplace("GBWTGraph", optarg);
                 
-                // But if we have a GBWTGraph we probably want to use *its* name as the base name.
-                // Whichever is specified last will win, unless we also have a FASTA input name.
-                index_basename = split_ext(optarg).first;
+                // If we have a GBWTGraph we probably want to use its name as the base name.
+                index_basename_guess = split_ext(optarg).first;
                 
                 break;
 
             case 'H':
-                if (!optarg || !*optarg) {
-                    cerr << "error:[vg giraffe] Must provide GBWT file with -H." << endl;
-                    exit(1);
-                }
-                if (!std::ifstream(optarg).is_open()) {
-                    cerr << "error:[vg giraffe] Couldn't open GBWT file " << optarg << endl;
-                    exit(1); 
-                }
-                provided_indexes.emplace_back("Giraffe GBWT", optarg);
+                provided_indexes.emplace("Giraffe GBWT", optarg);
                 break;
                 
             case 'm':
-                if (!optarg || !*optarg) {
-                    cerr << "error:[vg giraffe] Must provide minimizer file with -m." << endl;
-                    exit(1);
-                }
-                if (!std::ifstream(optarg).is_open()) {
-                    cerr << "error:[vg giraffe] Couldn't open minimizer file " << optarg << endl;
-                    exit(1); 
-                }
-                provided_indexes.emplace_back("Minimizers", optarg);
+                provided_indexes.emplace("Long Read Minimizers", optarg);
+                provided_indexes.emplace("Short Read Minimizers", optarg);
                 break;
                 
+            case 'z':
+                provided_indexes.emplace("Long Read Zipcodes", optarg);
+                provided_indexes.emplace("Short Read Zipcodes", optarg);
+                break;
             case 'd':
-                if (!optarg || !*optarg) {
-                    cerr << "error:[vg giraffe] Must provide distance index file with -d." << endl;
-                    exit(1);
-                }
-                if (!std::ifstream(optarg).is_open()) {
-                    cerr << "error:[vg giraffe] Couldn't open distance index file " << optarg << endl;
-                    exit(1); 
-                }
-                provided_indexes.emplace_back("Giraffe Distance Index", optarg);
+                provided_indexes.emplace("Giraffe Distance Index", optarg);
                 break;
 
             case 'p':
                 show_progress = true;
                 break;
 
-            case OPT_HAPLOTYPE_NAME:
-                haplotype_name = optarg;
-                break;
-            case OPT_KFF_NAME:
-                kff_name = optarg;
-                break;
             case OPT_INDEX_BASENAME:
-                index_basename_override = optarg;
+                index_basename = optarg;
+                break;
+
+            case OPT_HAPLOTYPE_SAMPLING:
+                haplotype_sampling_flag = true;
+                break;
+
+            case OPT_HAPLOTYPE_NAME:
+                provided_indexes.emplace("Haplotype Index", optarg);
+                break;
+
+            case OPT_KFF_NAME:
+                // We need to provide the KFF with sample scope if we provide
+                // it, but we're not sure of the sample name yet.
+                kff_filename = require_exists(logger, optarg);
+                break;
+
+            case OPT_SET_REFERENCE:
+                reference_samples.insert(optarg);
+                break;
+
+            case OPT_NUM_HAPLOTYPES:
+                IndexingParameters::haplotype_sampling_num_haplotypes = parse<size_t>(optarg);
+                if (IndexingParameters::haplotype_sampling_num_haplotypes == 0) {
+                    logger.error() << "number of haplotypes cannot be 0" << std::endl;
+                }
+                break;
+
+            case OPT_NO_DIPLOID_SAMPLING:
+                IndexingParameters::haplotype_sampling_diploid = false;
                 break;
 
             case 'G':
-                gam_filename = optarg;
-                if (gam_filename.empty()) {
-                    cerr << "error:[vg giraffe] Must provide GAM file with -G." << endl;
-                    exit(1);
-                }
+                gam_filename = require_exists(logger, optarg);
                 break;
             
             case 'f':
-                if (fastq_filename_1.empty()) {
-                    fastq_filename_1 = optarg;
-                    if (fastq_filename_1.empty()) {
-                        cerr << "error:[vg giraffe] Must provide FASTQ file with -f." << endl;
-                        exit(1);
-                    }
-                }
-                else if (fastq_filename_2.empty()) {
-                    fastq_filename_2 = optarg;
-                    if (fastq_filename_2.empty()) {
-                        cerr << "error:[vg giraffe] Must provide FASTQ file with -f." << endl;
-                        exit(1);
-                    }
+                assign_fastq_files(logger, optarg, fastq_filename_1, fastq_filename_2);
+                if (!fastq_filename_2.empty()) {
                     paired = true;
-                } else {
-                    cerr << "error:[vg giraffe] Cannot specify more than two FASTQ files." << endl;
-                    exit(1);
                 }
                 break;
 
             case 'i':
                 interleaved = true;
                 paired = true;
+                break;
+                
+            case OPT_COMMENTS_AS_TAGS:
+                comments_as_tags = true;
                 break;
                 
             case 'N':
@@ -790,8 +1333,7 @@ int main_giraffe(int argc, char** argv) {
                         c = std::toupper(c);
                     }
                     if (output_formats.find(output_format) == output_formats.end()) {
-                        std::cerr << "error: [vg giraffe] Invalid output format: " << optarg << std::endl;
-                        std::exit(1);
+                        logger.error() << "Invalid output format: " << output_format << std::endl;
                     }
                 }
                 break;
@@ -799,15 +1341,27 @@ int main_giraffe(int argc, char** argv) {
             case OPT_REF_PATHS:
                 ref_paths_name = optarg;
                 break;
-                
-            case 'P':
-                prune_anchors = true;
+
+            case OPT_REF_NAME:
+                reference_assembly_names.insert(optarg);
                 break;
-                
+
             case OPT_NAMED_COORDINATES:
                 named_coordinates = true;
                 break;
-
+                
+            case OPT_ADD_GRAPH_ALIGNMENT:
+                add_graph_alignment = true;
+                break;
+                
+            case OPT_OFF_REF_POSITION:
+                annotate_off_ref_position = true;
+                break;
+                
+            case OPT_LEFT_ALIGN:
+                left_align = true;
+                break;
+                
             case 'n':
                 discard_alignments = true;
                 break;
@@ -815,25 +1369,38 @@ int main_giraffe(int argc, char** argv) {
             case OPT_OUTPUT_BASENAME:
                 output_basename = optarg;
                 break;
-            
+
             case OPT_REPORT_NAME:
-                report_name = optarg;
+                report_name = ensure_writable(logger, optarg);
                 break;
+
             case 'b':
                 param_preset = optarg;
                 {
                     auto found = presets.find(param_preset);
                     if (found == presets.end()) {
                         // Complain this isn't a preset.
-                        std::cerr << "error: [vg giraffe] invalid parameter preset: " << param_preset << std::endl;
-                        exit(1);
+                        logger.error() << "invalid parameter preset: " << param_preset << std::endl;
                     } else {
                         // Apply the preset values.
-                        found->second.apply(parser);
+                        // Order of processing doesn't matter; preset values
+                        // sit under any actually-parsed values.
+                        found->second.apply(*parser);
                     }
                 }
+                // TODO: Can we make the presets know if they are long read
+                // presets and not list their names here? What if someone
+                // manually turns on chaining?
+                if (param_preset == "hifi" || param_preset == "r10") {
+                    map_long_reads = true;
+                }
                 break;
-
+            case 'E':
+                rec_mode = true;
+                break;
+            case OPT_NO_REC_MODE:
+                rec_mode = false;
+                break;
             case 'A':
                 {
                     std::string algo_name = optarg;
@@ -842,8 +1409,7 @@ int main_giraffe(int argc, char** argv) {
                     }
                     auto iter = rescue_algorithms.find(algo_name);
                     if (iter == rescue_algorithms.end()) {
-                        std::cerr << "error: [vg giraffe] Invalid rescue algorithm: " << optarg << std::endl;
-                        std::exit(1);
+                        logger.error() << "Invalid rescue algorithm: " << algo_name << std::endl;
                     }
                     rescue_algorithm = iter->second;
                 }
@@ -859,6 +1425,10 @@ int main_giraffe(int argc, char** argv) {
                 fragment_stdev = parse<double>(optarg);
                 break;
 
+            case OPT_SET_REFPOS:
+                set_refpos = true;
+                break;
+
             case OPT_TRACK_PROVENANCE:
                 track_provenance = true;
                 break;
@@ -867,6 +1437,15 @@ int main_giraffe(int argc, char** argv) {
                 track_provenance = true;
                 track_correctness = true;
                 break;
+
+            case OPT_TRACK_POSITION:
+                track_provenance = true;
+                track_position = true;
+                break;
+
+            case OPT_HAPLOTYPE_POSITIONS:
+                haplotype_positions = true;
+                break;
                 
             case OPT_SHOW_WORK:
                 show_work = true;
@@ -874,25 +1453,14 @@ int main_giraffe(int argc, char** argv) {
                 Explainer::save_explanations = true;
                 break;
                 
-            case 'B':
-                batch_size = parse<uint64_t>(optarg);
-                break;
-                
             case 't':
-            {
-                int num_threads = parse<int>(optarg);
-                if (num_threads <= 0) {
-                    cerr << "error:[vg giraffe] Thread count (-t) set to " << num_threads << ", must set to a positive integer." << endl;
-                    exit(1);
-                }
-                omp_set_num_threads(num_threads);
-            }
+                set_thread_count(logger, optarg);
                 break;
                 
             case 'h':
             case '?':
             default:
-                help_giraffe(argv, parser, true);
+                help_giraffe(argv, *parser, presets, true);
                 exit(1);
                 break;
         }
@@ -910,13 +1478,14 @@ int main_giraffe(int argc, char** argv) {
             fasta_parts = split_ext(fasta_parts.first);
         }
         if (fasta_parts.second != "fa" && fasta_parts.second != "fasta" && fasta_parts.second != "fna") {
-            cerr << "error:[vg giraffe] FASTA file " << fasta_filename << " is not named like a FASTA" << endl;
-            exit(1);
+            logger.error() << "FASTA file " << fasta_filename 
+                           << " is not named like a FASTA" << std::endl;
         }
         
-        provided_indexes.emplace_back("Reference FASTA", fasta_filename);
-        // Everything else should be named like the FASTA by default
-        index_basename = fasta_parts.first;
+        provided_indexes.emplace("Reference FASTA", fasta_filename);
+        // Everything else should be named like the FASTA by default. This is a
+        // better guess than the other siurces.
+        index_basename_guess = fasta_parts.first;
         
         if (have_input_file(optind, argc, argv)) {
             // Next one must be VCF, but check.
@@ -929,119 +1498,276 @@ int main_giraffe(int argc, char** argv) {
                 vcf_parts = split_ext(vcf_parts.first);
             }
             if (vcf_parts.second != "vcf") {
-                cerr << "error:[vg giraffe] VCF file " << vcf_filename << " is not named like a VCF" << endl;
-                exit(1);
+                logger.error() << "VCF file " << vcf_filename 
+                               << " is not named like a VCF" << std::endl;
             }
             
             // Determine if it is phased or not
             string file_type = IndexRegistry::vcf_is_phased(vcf_filename) ? "VCF w/ Phasing" : "VCF";
             
             // Feed it to the index registry to maybe use
-            provided_indexes.emplace_back(file_type, vcf_filename);
+            provided_indexes.emplace(file_type, vcf_filename);
         }
     }
 
+    if (index_basename.empty()) {
+        // Try to pick an index basename now
+        index_basename = index_basename_guess;
+    }
+
     // If we don't want rescue, let the user see we don't try it.
-    if (parser.get_option_value<size_t>("rescue-attempts") == 0 || rescue_algorithm == MinimizerMapper::rescue_none) {
+    if (parser->get_option_value<size_t>("rescue-attempts") == 0 || rescue_algorithm == MinimizerMapper::rescue_none) {
         // Replace any parsed values
-        parser.set_option_value<size_t>("rescue-attempts", 0);
+        parser->set_option_value<size_t>("rescue-attempts", 0);
         rescue_algorithm = MinimizerMapper::rescue_none;
     }
     
     // Now all the arguments are parsed, so see if they make sense
+
+    for (const auto& type_and_filename : provided_indexes) {
+        require_exists(logger, type_and_filename.second);
+    }
     
     // Decide if we are outputting to an htslib format
     bool hts_output = (output_format == "SAM" || output_format == "BAM" || output_format == "CRAM");
     
     if (!ref_paths_name.empty() && !hts_output) {
-        cerr << "warning:[vg giraffe] Reference path file (--ref-paths) is only used when output format (-o) is SAM, BAM, or CRAM." << endl;
-        ref_paths_name = "";
+        logger.warn() << "Reference path file (--ref-paths) is only used "
+                      << "when output format (-o) is SAM, BAM, or CRAM." << std::endl;
+    }
+    if (!reference_assembly_names.empty() && !hts_output) {
+        logger.warn() << "Reference assembly names (--ref-name) are only used "
+                      << "when output format (-o) is SAM, BAM, or CRAM." << std::endl;
     }
     
     if (output_format != "GAM" && !output_basename.empty()) {
-        cerr << "error:[vg giraffe] Using an output basename (--output-basename) only makes sense for GAM format (-o)" << endl;
-        exit(1);
+        logger.error() << "Using an output basename (--output-basename) "
+                       << "only makes sense for GAM format (-o GAM)." << std::endl;
     }
     
     if (interleaved && !fastq_filename_2.empty()) {
-        cerr << "error:[vg giraffe] Cannot designate both interleaved paired ends (-i) and separate paired end file (-f)." << endl;
-        exit(1);
+        logger.error() << "Cannot designate both interleaved paired ends (-i) "
+                       << "and separate paired end file (-f)." << std::endl;
     }
 
     if (!fastq_filename_1.empty() && !gam_filename.empty()) {
-        cerr << "error:[vg giraffe] Cannot designate both FASTQ input (-f) and GAM input (-G) in same run." << endl;
-        exit(1);
+        logger.error() << "Cannot designate both FASTQ input (-f) and GAM input (-G) in same run." << std::endl;
     }
     
     if (have_input_file(optind, argc, argv)) {
         // TODO: work out how to interpret additional files as reads.
-        cerr << "error:[vg giraffe] Extraneous input file: " << get_input_file_name(optind, argc, argv) << endl;
-        exit(1);
+        logger.error() << "Extraneous input file: " << get_input_file_name(optind, argc, argv) << std::endl;
     }
 
     if ((forced_mean && ! forced_stdev) || (!forced_mean && forced_stdev)) {
-        cerr << "warning:[vg giraffe] Both a mean and standard deviation must be specified for the fragment length distribution" << endl;
-        cerr << "                   Detecting fragment length distribution automatically" << endl;
+        logger.warn() << "Both a mean and standard deviation must be specified "
+                      << "for the fragment length distribution. "
+                      << "Detecting fragment length distribution automatically" << std::endl;
         forced_mean = false;
         forced_stdev = false;
         fragment_mean = 0.0;
         fragment_stdev = 0.0;
     }
     if ((forced_mean || forced_stdev || forced_rescue_attempts) && (!paired)) {
-        cerr << "warning:[vg giraffe] Attempting to set paired-end parameters but running in single-end mode" << endl;
+        logger.warn() << "Attempting to set paired-end parameters but running in single-end mode" << std::endl;
     }
 
-    bool haplotype_sampling = !haplotype_name.empty() & !kff_name.empty();
-    if (!index_basename_override.empty()) {
-        index_basename = index_basename_override;
+    if (parser->get_option_value<bool>("align-from-chains") && paired) {
+        // TODO: Implement chaining for paired-end alignment
+        logger.error() << "Paired-end alignment is not yet implemented "
+                       << "for --align-from-chains or chaining-based presets" << std::endl;
     }
+    if (rec_mode.has_value() && rec_mode.value() && !map_long_reads) {
+        // The user has specifically asked fro recombination-aware mapping on short reads, which isn't available.
+        // TODO: Get a better idea of if reads are long.
+        logger.error() << "Recombination-aware mode cannot be used with short reads yet." << endl;
+    }
+    
+    // Use all the provided indexes
+    for (auto& index : provided_indexes) {
+        registry.provide(index.first, index.second);
+    }
+
+    // Haplotype sampling is active when explicitly requested (--haplotype-sampling)
+    // or when either --haplotype-name or --kff-name is given.
+    // Otherwise we'd always sample when we had reads available.
+    bool haplotype_sampling = haplotype_sampling_flag || provided_indexes.count("Haplotype Index") || !kff_filename.empty();
+
+    string sample_scope;
     if (haplotype_sampling) {
-        // If we do haplotype sampling, we get a new GBZ and later build indexes for it.
-        string gbz_name = sample_haplotypes(provided_indexes, index_basename, sample_name, haplotype_name, kff_name, show_progress);
-        registry.provide("Giraffe GBZ", gbz_name);
-        index_basename = split_ext(gbz_name).first;
-    } else {
-        // Otherwise we use the provided indexes.
-        for (auto& index : provided_indexes) {
-            registry.provide(index.first, index.second);
+
+        // Determine sample scope so we can incorporate it into the
+        // index basename; downstream indexes (dist, min) will then be
+        // scoped to the sample.
+        sample_scope = sample_name;
+        if (sample_scope.empty()) {
+            if (!kff_filename.empty()) {
+                sample_scope = file_base_name(kff_filename);
+                if (show_progress) {
+                    logger.info() << "Guessing from " << kff_filename
+                                  << " that sample name is " << sample_scope << std::endl;
+                }
+            } else if (!fastq_filename_1.empty()) {
+                // Strip .gz then use file_base_name to strip .fq/.fastq, since
+                // strip_suffixes stops at the first one that's not there.
+                sample_scope = file_base_name(strip_suffixes(fastq_filename_1, {".gz"}));
+                if (show_progress) {
+                    logger.info() << "Guessing from " << fastq_filename_1
+                                  << " that sample name is " << sample_scope << std::endl;
+                }
+            } else {
+                logger.error() << "Unable to determine a sample name for haplotype sampling; provide --sample" << endl;
+            }
         }
+        if (sample_scope == "giraffe") {
+            logger.warn() << "Using \"giraffe\" as a sample name may lead to filename collisions." << std::endl;
+        }
+
+        // Pass parameters not directly provided in option parsers to the
+        // recipes through IndexingParameters.
+        IndexingParameters::haplotype_sampling_reference_samples = reference_samples;
+        
+        if (kff_filename.empty() && fastq_filename_1.empty()) {
+            // TODO: Eventually learn to kmer count from GAM
+            logger.error() << "Cannot do haplotype sampling without kmer counts (--kff-name) or FASTQ input (--fastq-in/-f)" << std::endl; 
+        }
+
+        if (!kff_filename.empty()) {
+            registry.provide("KFF Kmer Counts", kff_filename, {{"sample", sample_scope}});
+        }
+        if (!fastq_filename_1.empty()) {
+            // If FASTQs are available, send those and we will do haplotype sampling.
+            vector<string> fastqs = {fastq_filename_1};
+            if (!fastq_filename_2.empty()) {
+                fastqs.push_back(fastq_filename_2);
+            }
+            // Provide the FASTQs to the index registry, but mark everything
+            // derived from them as being scoped to the particular sample.
+            registry.provide("FASTQ", fastqs, {{"sample", sample_scope}});
+        }
+        
+        
+        if (!index_basename.empty()) {
+            // We have some idea where indexes might be, so guess them.
+            if (!registry.available("Top Level Chain Distance Index")) {
+                // Look for base GBZ distance index
+                string tcdist_candidate = index_basename + ".tcdist";
+                string dist_candidate = index_basename + ".dist";
+                if (file_exists(tcdist_candidate)) {
+                    registry.provide("Top Level Chain Distance Index", tcdist_candidate);
+                } else if (file_exists(dist_candidate)) {
+                    // Provide it as a top level chain index even though it has more stuff
+                    registry.provide("Top Level Chain Distance Index", dist_candidate);
+                }
+            }
+            
+            if (!registry.available("Haplotype Index")) {
+                // Look for hapl index
+                string hapl_candidate = index_basename + ".hapl";
+                if (file_exists(hapl_candidate)) {
+                    registry.provide("Haplotype Index", hapl_candidate);
+                }
+            }
+
+            if (!registry.available("r Index")) {
+                // Look for r index
+                string r_candidate = index_basename + ".ri";
+                if (file_exists(r_candidate)) {
+                    registry.provide("r Index", r_candidate);
+                }
+            }
+        }
+
     }
-    registry.set_prefix(index_basename);
+    
+    if (!index_basename.empty()) {
+        // Use the basename we've determined for generated indexes
+        registry.set_prefix(index_basename);
+    }
 
     // The IndexRegistry doesn't try to infer index files based on the
     // basename, so do that here. We can have multiple extension options that
     // we try in order of priority.
+    // When found, the index is removed from this map.
     unordered_map<string, vector<string>> indexes_and_extensions = {
         {"Giraffe GBZ", {"giraffe.gbz", "gbz"}},
         {"XG", {"xg"}},
         {"Giraffe GBWT", {"gbwt"}},
         {"GBWTGraph", {"gg"}},
-        {"Giraffe Distance Index", {"dist"}},
-        {"Minimizers", {"min"}}
+        {"Giraffe Distance Index", {"dist"}}
     };
+    if (map_long_reads) {
+        indexes_and_extensions.emplace(std::string("Long Read Minimizers"), std::vector<std::string>({"longread.path.min", "longread.withzip.min", "path.min", "withzip.min", "min"}));
+        indexes_and_extensions.emplace(std::string("Long Read Zipcodes"), std::vector<std::string>({"longread.path.zipcodes", "longread.zipcodes", "path.zipcodes", "zipcodes"}));
+    } else {
+        indexes_and_extensions.emplace(std::string("Short Read Minimizers"), std::vector<std::string>({"shortread.withzip.min","withzip.min", "min"}));
+        indexes_and_extensions.emplace(std::string("Short Read Zipcodes"), std::vector<std::string>({"shortread.zipcodes", "zipcodes"}));
+    }
+
+    if (!haplotype_sampling && registry.available("GBZ")) {
+        // If we're not doing haplotype sampling and we got a GBZ, it should really be the Giraffe GBZ.
+        // Instead of relying on the alias rule, just provide it again.
+        // TODO: This is a hack. But otherwise, we end up guessing the Giraffe
+        // GBZ path and finding it at the GBZ path, which seems worse.
+        registry.provide("Giraffe GBZ", registry.require("GBZ").at(0));
+    }
+    // TODO: What if you want to add a pre-made GBZ to an existing hap sampling
+    // command line that already included a GBZ? We'd need a different option.
+    
     for (auto& completed : registry.completed_indexes()) {
         // Drop anything we already got from the list
         indexes_and_extensions.erase(completed);
     }
-    for (auto& index_and_extensions : indexes_and_extensions) {
+    for (auto index_and_extensions = indexes_and_extensions.begin(); index_and_extensions != indexes_and_extensions.end(); ) {
         // For each index type
-        for (auto& extension : index_and_extensions.second) {
+        bool found = false;
+        for (auto& extension : index_and_extensions->second) {
             // For each extension in priority order
-            string inferred_filename = registry.get_prefix() + "." + extension;
-            if (ifstream(inferred_filename).is_open()) {
+            string inferred_filename = registry.get_prefix();
+            if (haplotype_sampling) {
+                // All these are sample-scoped if we're haplotype sampling.
+                // TODO: Let index registry generate the filenames, which it knows how to do.
+                inferred_filename += "." + sample_scope;
+            }
+            
+            inferred_filename += "." + extension;
+            if (file_exists(inferred_filename)) {
                 // A file with the appropriate name exists and we can read it.
+                // Report it because this may not be desired behavior.
+                logger.info() << "Guessing that " << inferred_filename
+                              << " is " << index_and_extensions->first << endl;
+                std::map<std::string, std::string> scopes;
                 if (haplotype_sampling) {
-                    // If we did haplotype sampling, we are going to overwrite existing indexes.
-                    cerr << "warning:[vg giraffe] " << inferred_filename << " exists and will be overwritten" << endl;
-                } else {
-                    // Report it because this may not be desired behavior.
-                    cerr << "Guessing that " << inferred_filename << " is " << index_and_extensions.first << endl;
-                    registry.provide(index_and_extensions.first, inferred_filename);
+                    scopes.emplace("sample", sample_scope);
                 }
+                registry.provide(index_and_extensions->first, inferred_filename, scopes);
+                found = true;
                 // Skip other extension options for the index
                 break;
             }
         }
+        if (found) {
+            // Erase this one and go to the next one.
+            index_and_extensions = indexes_and_extensions.erase(index_and_extensions);
+        } else {
+            // Leave this one and go to the next one.
+            ++index_and_extensions;
+        }
+    }
+
+    //If we're making new zipcodes, we should rebuild the minimizers too
+    if (!indexes_and_extensions.count(std::string("Long Read Minimizers")) && indexes_and_extensions.count(std::string("Long Read Zipcodes"))) {
+        logger.info() << "Rebuilding minimizer index to include zipcodes" << endl;
+        registry.reset(std::string("Long Read Minimizers"));
+    } else if (indexes_and_extensions.count(std::string("Long Read Minimizers")) && !indexes_and_extensions.count(std::string("Long Read Zipcodes"))) {
+        logger.info() << "Rebuilding zipcodes index to match new minimizers" << endl;
+        registry.reset(std::string("Long Read Zipcodes"));
+    } else if (!indexes_and_extensions.count(std::string("Short Read Minimizers")) && indexes_and_extensions.count(std::string("Short Read Zipcodes"))) {
+        logger.info() << "Rebuilding minimizer index to include zipcodes" << endl;
+        registry.reset(std::string("Short Read Minimizers"));
+    } else if (indexes_and_extensions.count(std::string("Short Read Minimizers")) && !indexes_and_extensions.count(std::string("Short Read Zipcodes"))) {
+        logger.info() << "Rebuilding zipcodes to match new minimizers" << endl;
+        registry.reset(std::string("Short Read Zipcodes"));
     }
 
     // create in-memory objects
@@ -1049,56 +1775,113 @@ int main_giraffe(int argc, char** argv) {
     // Don't try and use all the memory.
     // TODO: add memory options like autoindex?
     registry.set_target_memory_usage(IndexRegistry::get_system_memory() / 2);
-    
-    auto index_targets = VGIndexes::get_default_giraffe_indexes();
 
+    std::vector<std::string> index_targets;
+    if (!map_long_reads) {
+        index_targets = VGIndexes::get_default_short_giraffe_indexes();
+    } else {
+        index_targets = VGIndexes::get_default_long_giraffe_indexes();
+    }
 #ifdef debug
     for (auto& needed : index_targets) {
-        cerr << "Want index: " << needed << endl;
+        logger.info() << "Want index: " << needed << endl;
     }
 #endif
     
     try {
         if (show_progress) {
-            cerr << "Preparing Indexes" << endl;
+            logger.info() << "Preparing Indexes" << endl;
         }
         registry.make_indexes(index_targets);
     }
     catch (InsufficientInputException ex) {
-        cerr << "error:[vg giraffe] Input is not sufficient to create indexes" << endl;
-        cerr << ex.what();
-        return 1;
+        logger.error() << "Input is not sufficient to create indexes\n" << ex.what() << endl;
     }
    
 #ifdef debug
     for (auto& completed : registry.completed_indexes()) {
-        cerr << "Have index: " << completed << endl;
+        logger.info() << "Have index: " << completed << endl;
         for (auto& filename : registry.require(completed)) {
-            cerr << "\tAt: " << filename << endl;
+            logger.info() << "\tAt: " << filename << endl;
         }
     }
 #endif
     
     // Grab the minimizer index
     if (show_progress) {
-        cerr << "Loading Minimizer Index" << endl;
+        logger.info() << "Loading Minimizer Index" << endl;
     }
-    auto minimizer_index = vg::io::VPKG::load_one<gbwtgraph::DefaultMinimizerIndex>(registry.require("Minimizers").at(0));
+    IndexName minimizer_indexname;
+    unique_ptr<gbwtgraph::DefaultMinimizerIndex> minimizer_index;
+    if (map_long_reads) {
+        // Use the long read minimizers
+        minimizer_indexname = "Long Read Minimizers";
+    } else {
+        minimizer_indexname = "Short Read Minimizers";
+    }
+    if (!registry.predates("Giraffe Distance Index", minimizer_indexname)) {
+        logger.error() << registry.require("Giraffe Distance Index").at(0) << " is newer than " << registry.require(minimizer_indexname).at(0) << " which depends on it" << std::endl;
+    }
+    minimizer_index = vg::io::VPKG::load_one<gbwtgraph::DefaultMinimizerIndex>(registry.require(minimizer_indexname).at(0));
+
+    // Decide if we want to do recombination-aware mapping by default, based on whether we can.
+    
+    // Whether to use recombination-aware mapping if the user did not set the option.
+    // Can't be a constant because it has to depend on the haplotype count in the index.
+    bool default_rec_mode = has_payload(*minimizer_index, MinimizerIndexParameters::PAYLOAD_ZIPCODES_WITH_PATHS) && map_long_reads;
+
+    std::vector<MinimizerIndexParameters::PayloadType> allowed_payloads;
+    allowed_payloads.push_back(MinimizerIndexParameters::PAYLOAD_ZIPCODES_WITH_PATHS);
+    if (!rec_mode.value_or(default_rec_mode)) {
+        // If we're not doing recombination-aware mapping, we can also accept a
+        // payload without path info, as long as it still has zipcodes.
+        allowed_payloads.push_back(MinimizerIndexParameters::PAYLOAD_ZIPCODES);
+    }
+    // Make sure we have a usable minimizer index payload.
+    require_payload(*minimizer_index, allowed_payloads);
+    
+    // Grab the zipcodes
+    if (show_progress) {
+        logger.info() << "Loading Zipcodes" << endl;
+    }
+    IndexName oversized_zipcodes_indexname;
+    ZipCodeCollection oversized_zipcodes;        
+    if (map_long_reads) {
+        oversized_zipcodes_indexname = "Long Read Zipcodes";
+    } else {
+        oversized_zipcodes_indexname = "Short Read Zipcodes";
+    }
+    if (!registry.predates("Giraffe Distance Index", oversized_zipcodes_indexname)) {
+        logger.error() << registry.require("Giraffe Distance Index").at(0) << " is newer than " << registry.require(oversized_zipcodes_indexname).at(0) << " which depends on it" << std::endl;
+    }
+    ifstream zip_in (registry.require(oversized_zipcodes_indexname).at(0));
+    oversized_zipcodes.deserialize(zip_in);
+    zip_in.close();
+
 
     // Grab the GBZ
     if (show_progress) {
-        cerr << "Loading GBZ" << endl;
+        logger.info() << "Loading GBZ" << endl;
     }
     auto gbz = vg::io::VPKG::load_one<gbwtgraph::GBZ>(registry.require("Giraffe GBZ").at(0));
+    require_compatible_graphs(*gbz, "GBZ", *minimizer_index, "Minimizer Index");
 
     // Grab the distance index
     if (show_progress) {
-        cerr << "Loading Distance Index v2" << endl;
+        logger.info() << "Loading Distance Index" << endl;
     }
+    // TODO: Now that we enforce that the minimizer and zipcodes files are
+    // newer than the distance index, we really shouldn't modify it ourselves
+    // by fixing any indirect pointers that may still be in it. So we should be
+    // able to open the file read-only and map the file read-only here, which
+    // in turn would solve problems with writable mappings being slow on shared
+    // filesystems even when not being written. But the VPKG system doesn't
+    // really support doing that, so we'd have to get the file descriptor
+    // manually and deserialize() on it and close() it later.
     auto distance_index = vg::io::VPKG::load_one<SnarlDistanceIndex>(registry.require("Giraffe Distance Index").at(0));
     
     if (show_progress) {
-        cerr << "Paging in Distance Index v2" << endl;
+        logger.info() << "Paging in Distance Index" << endl;
     }
     std::chrono::time_point<std::chrono::system_clock> preload_start = std::chrono::system_clock::now();
     // Make sure the distance index is paged in from disk.
@@ -1115,27 +1898,50 @@ int main_giraffe(int argc, char** argv) {
     bdsg::ReferencePathOverlayHelper overlay_helper;
     // And we might load an XG
     unique_ptr<PathHandleGraph> xg_graph;
-    if (track_correctness || hts_output) {
+    if (show_work || track_correctness || track_position || set_refpos || hts_output) {
         // Usually we will get our paths from the GBZ
         PathHandleGraph* base_graph = &gbz->graph;
-        // But if an XG is around, we should use that instead. Otherwise, it's not possible to provide paths when using an old GBWT/GBZ that doesn't have them.
-        if (registry.available("XG")) {
+        // But if an XG is around, and we don't need haplotype paths, we should
+        // use that instead. Otherwise, it's not possible to provide paths when
+        // using an old GBWT/GBZ that doesn't have them.
+        if (registry.available("XG") && !haplotype_positions) {
             if (show_progress) {
-                cerr << "Loading XG Graph" << endl;
+                logger.info() << "Loading XG Graph" << endl;
             }
             xg_graph = vg::io::VPKG::load_one<PathHandleGraph>(registry.require("XG").at(0));
             base_graph = xg_graph.get();
         }
+
+        // If we want to be able to spit out positions along haplotype paths,
+        // for debugging, we need to index them for position queries.
+        std::unordered_set<std::string> extra_indexed_paths;
+        if (haplotype_positions) {
+            base_graph->for_each_path_of_sense(PathSense::HAPLOTYPE, [&](const path_handle_t& path) {
+                // Say every haplotype path is in the "extra" path set to
+                // index, so we index everything.
+                extra_indexed_paths.insert(base_graph->get_path_name(path));
+            });
+        }
+
     
         // Apply the overlay if needed.
-        path_position_graph = overlay_helper.apply(base_graph);
+        if (show_progress) {
+            logger.info() << "Applying overlay" << endl;
+        }
+        path_position_graph = overlay_helper.apply(base_graph, extra_indexed_paths);
     }
 
     // Set up the mapper
     if (show_progress) {
-        cerr << "Initializing MinimizerMapper" << endl;
+        logger.info() << "Initializing MinimizerMapper" << endl;
     }
-    MinimizerMapper minimizer_mapper(gbz->graph, *minimizer_index, &*distance_index, path_position_graph);
+    unique_ptr<MinimizerMapper> minimizer_mapper_ptr;
+    crash_unless(minimizer_index);
+    minimizer_mapper_ptr = std::make_unique<MinimizerMapper>(
+        gbz->graph, *minimizer_index, distance_index.get(),
+        &oversized_zipcodes, path_position_graph
+    );
+    MinimizerMapper& minimizer_mapper = *minimizer_mapper_ptr;
     if (forced_mean && forced_stdev) {
         minimizer_mapper.force_fragment_length_distr(fragment_mean, fragment_stdev);
     }
@@ -1143,8 +1949,10 @@ int main_giraffe(int argc, char** argv) {
     std::chrono::time_point<std::chrono::system_clock> init = std::chrono::system_clock::now();
     std::chrono::duration<double> init_seconds = init - launch;
     if (show_progress) {
-        cerr << "Loading and initialization: " << init_seconds.count() << " seconds" << endl;
-        cerr << "Of which Distance Index v2 paging: " << di2_preload_seconds.count() << " seconds" << endl;
+        logger.info() << "Loading and initialization: "
+                      << init_seconds.count() << " seconds" << endl;
+        logger.info() << "Of which Distance Index paging: "
+                      << di2_preload_seconds.count() << " seconds" << endl;
     }
     
     // Set up to write a report of mapping speed if requested, instead of just dumping to stderr.
@@ -1152,12 +1960,6 @@ int main_giraffe(int argc, char** argv) {
     if (!report_name.empty()) {
         // Open the report
         report.open(report_name);
-        if (!report) {
-            // Make sure it worked
-            cerr << "error[vg giraffe]: Could not open report file " << report_name << endl;
-            exit(1);
-        }
-        
         // Add a header
         report << "#file\treads/second/thread" << endl;
     }
@@ -1177,7 +1979,7 @@ int main_giraffe(int argc, char** argv) {
                 s << "-i";
             }
             // Make a slug of the other options
-            parser.print_options(s, true);
+            parser->print_options(s, OptionFormat::SLUG);
             s << ".gam";
             
             output_filename = s.str();
@@ -1185,57 +1987,111 @@ int main_giraffe(int argc, char** argv) {
     
         if (show_progress) {
             if (discard_alignments) {
-                cerr << "Discarding output alignments" << endl;
+                logger.info() << "Discarding output alignments" << endl;
             } else {
-                cerr << "Mapping reads to \"" << output_filename << "\" (" << output_format << ")" << endl;
+                logger.info() << "Mapping reads to \"" << output_filename
+                              << "\" (" << output_format << ")" << endl;
             }
         }
 
         // Show and apply all the parser-managed options
         if (show_progress) {
-            parser.print_options(cerr);
+            parser->print_options(cerr);
         }
-        parser.apply(minimizer_mapper);
-        parser.apply(main_options);
-        parser.apply(scoring_options);
-        
-        if (show_progress && interleaved) {
-            cerr << "--interleaved" << endl;
-        }
-        
-        if (show_progress && prune_anchors) {
-            cerr << "--prune-low-cplx" << endl;
-        }
+        parser->apply(minimizer_mapper);
+        parser->apply(main_options);
+        parser->apply(scoring_options);
 
-        if (show_progress && track_provenance) {
-            cerr << "--track-provenance " << endl;
-        }
-        minimizer_mapper.track_provenance = track_provenance;
-        
-        if (show_progress && track_correctness) {
-            cerr << "--track-correctness " << endl;
-        }
-        minimizer_mapper.track_correctness = track_correctness;
-        
-        if (show_progress && show_work) {
-            cerr << "--show-work " << endl;
-        }
-        minimizer_mapper.show_work = show_work;
+        // Make sure that options that represent ranges are sensible, nonempty
+        // ranges.
+        //
+        // TODO: It would be nice if we did this earlier when setting up the
+        // option ranges to iterate, to make it happen before indexing/index
+        // loading, but then we'd have to know how to do the comparison on the
+        // range objects themselves.
+        enforce_min_max(minimizer_mapper.wfa_max_mismatches, "wfa-max-mismatches",
+                        minimizer_mapper.wfa_max_max_mismatches, "wfa-max-max-mismatches");
+        enforce_min_max(minimizer_mapper.wfa_distance, "wfa-distance",
+                        minimizer_mapper.wfa_max_distance, "wfa-max-distance");
+        enforce_min_max(minimizer_mapper.min_chaining_problems, "min-chaining-problems",
+                        minimizer_mapper.max_chaining_problems, "max-chaining-problems");
+        enforce_min_max(minimizer_mapper.min_extensions, "min-extensions",
+                        minimizer_mapper.max_extensions, "max-extensions");
 
-        if (show_progress && paired) {
-            if (forced_mean && forced_stdev) {
-                cerr << "--fragment-mean " << fragment_mean << endl; 
-                cerr << "--fragment-stdev " << fragment_stdev << endl;
+        // Make a line of JSON about our command line options.
+        // We may embed it in the output file later.
+        std::stringstream params_json;
+        params_json << "{";
+        parser->print_options(params_json, OptionFormat::JSON);
+        
+        // We make this helper to report flags we manage both places, to deduplicate code.
+        auto report_flag = [&](const std::string& name, bool value) {
+            if (value) {
+                params_json << ",\"" << name << "\":true";
+                if (show_progress) {
+                    cerr << "--" << name << endl;
+                }
             }
-            cerr << "--rescue-algorithm " << algorithm_names[rescue_algorithm] << endl;
+        };
+        auto report_paired_flag = [&](const std::string& name, bool value) {
+            if (value) {
+                params_json << ",\"" << name << "\":" << (value ? "true" : "false");
+                if (show_progress) {
+                    cerr << "--" << (value ? "" : "no-") << name << endl;
+                }
+            }
+        };
+        auto report_number = [&](const std::string& name, size_t value) {
+            params_json << ",\"" << name << "\":" << value;
+            if (show_progress) {
+                cerr << "--" << name << " " << value << endl;
+            }
+        };
+        auto report_string = [&](const std::string& name, const std::string& value) {
+            params_json << ",\"" << name << "\":\"" << value << "\"";
+            if (show_progress) {
+                cerr << "--" << name << " " << value << endl;
+            }
+        };
+
+        report_flag("interleaved", interleaved);
+        report_flag("add-graph-aln", add_graph_alignment);
+        report_flag("off-ref-position", annotate_off_ref_position);
+        report_flag("left-align", left_align);
+        report_flag("set-refpos", set_refpos);
+        minimizer_mapper.set_refpos = set_refpos;
+        report_flag("track-provenance", track_provenance);
+        minimizer_mapper.track_provenance = track_provenance;
+        report_flag("track-correctness", track_correctness);
+        minimizer_mapper.track_correctness = track_correctness;
+        report_flag("track-position", track_position);
+        minimizer_mapper.track_position = track_position;
+        report_flag("haplotype-positions", haplotype_positions);
+        minimizer_mapper.haplotype_positions = haplotype_positions;
+        report_flag("show-work", show_work);
+        minimizer_mapper.show_work = show_work;
+        if (paired) {
+            if (forced_mean) {
+                report_number("fragment-mean", fragment_mean);
+            }
+            if (forced_stdev) {
+                report_number("fragment-stdev", fragment_stdev);
+            }
+            report_string("rescue-algorithm", algorithm_names[rescue_algorithm]);
         }
         minimizer_mapper.rescue_algorithm = rescue_algorithm;
+        report_paired_flag("rec-mode", rec_mode.value_or(default_rec_mode));
+        minimizer_mapper.use_payload_paths &= rec_mode.value_or(default_rec_mode);
+        
+
+        params_json << "}" << std::endl;
 
         minimizer_mapper.sample_name = sample_name;
         minimizer_mapper.read_group = read_group;
 
         // Apply scoring parameters, after they have been parsed
-        minimizer_mapper.set_alignment_scores(scoring_options.match, scoring_options.mismatch, scoring_options.gap_open, scoring_options.gap_extend, scoring_options.full_length_bonus);
+        minimizer_mapper.set_alignment_scores(scoring_options.match, scoring_options.mismatch, 
+            scoring_options.gap_open, scoring_options.gap_extend, scoring_options.full_length_bonus);
 
         // Work out the number of threads we will have
         size_t thread_count = omp_get_max_threads();
@@ -1245,7 +2101,8 @@ int main_giraffe(int argc, char** argv) {
         
         // For timing, we may run one thread first and then switch to all threads. So track both start times.
         std::chrono::time_point<std::chrono::system_clock> first_thread_start;
-        std::chrono::time_point<std::chrono::system_clock> all_threads_start;
+        std::chrono::time_point<std::chrono::system_clock> all_threads_start \
+            = std::chrono::time_point<std::chrono::system_clock>::min();
         
         // We also time in terms of CPU time
         clock_t cpu_time_before;
@@ -1269,7 +2126,8 @@ int main_giraffe(int argc, char** argv) {
         perf_fds[omp_get_thread_num()] = perf_event_open(&perf_config, 0, -1, -1, 0);
         if (show_progress && perf_fds[omp_get_thread_num()] == -1) {
             int problem = errno;
-            cerr << "Not counting CPU instructions because perf events are unavailable: " << strerror(problem) << endl;
+            logger.info() << "Not counting CPU instructions because perf events are unavailable: "
+                          << strerror(problem) << endl;
             perf_fds.clear();
         }
         
@@ -1304,11 +2162,11 @@ int main_giraffe(int argc, char** argv) {
         {
         
             // Look up all the paths we might need to surject to.
-            vector<tuple<path_handle_t, size_t, size_t>> paths;
+            SequenceDictionary paths;
             if (hts_output) {
                 // For htslib we need a non-empty list of paths.
                 assert(path_position_graph != nullptr);
-                paths = get_sequence_dictionary(ref_paths_name, {}, *path_position_graph);
+                paths = get_sequence_dictionary(ref_paths_name, {}, reference_assembly_names, *path_position_graph);
             }
             
             // Set up output to an emitter that will handle serialization and surjection.
@@ -1320,7 +2178,7 @@ int main_giraffe(int argc, char** argv) {
                 // We actually want to emit alignments.
                 // Encode flags describing what we want to happen.
                 int flags = ALIGNMENT_EMITTER_FLAG_NONE;
-                if (prune_anchors) {
+                if (main_options.prune_low_cplx) {
                     // When surjecting, do anchor pruning.
                     flags |= ALIGNMENT_EMITTER_FLAG_HTS_PRUNE_SUSPICIOUS_ANCHORS;
                 }
@@ -1328,16 +2186,52 @@ int main_giraffe(int argc, char** argv) {
                     // When not surjecting, use named segments instead of node IDs.
                     flags |= ALIGNMENT_EMITTER_FLAG_VG_USE_SEGMENT_NAMES;
                 }
+                if (add_graph_alignment) {
+                    // When surjecting, add the graph alignment tag
+                    flags |= ALIGNMENT_EMITTER_FLAG_HTS_ADD_GRAPH_ALIGNMENT_TAG;
+                }
+                if (minimizer_mapper.find_supplementaries) {
+                    // When surjecting, also report supplementary alignments
+                    flags |= ALIGNMENT_EMITTER_FLAG_HTS_SUPPLEMENTARY;
+                }
+                if (annotate_off_ref_position) {
+                    // When surjecting, annotate the position of off-reference reads
+                    flags |= ALIGNMENT_EMITTER_FLAG_HTS_OFF_REF_POSITION;
+                }
+                if (left_align) {
+                    // When surjecting, attempt to left align
+                    flags |= ALIGNMENT_EMITTER_FLAG_HTS_LEFT_ALIGN;
+                }
                 
                 // We send along the positional graph when we have it, and otherwise we send the GBWTGraph which is sufficient for GAF output.
                 // TODO: What if we need both a positional graph and a NamedNodeBackTranslation???
                 const HandleGraph* emitter_graph = path_position_graph ? (const HandleGraph*)path_position_graph : (const HandleGraph*)&(gbz->graph);
-                
-                alignment_emitter = get_alignment_emitter(output_filename, output_format,
-                                                          paths, thread_count,
-                                                          emitter_graph, flags);
+                alignment_emitter = get_alignment_emitter(
+                    output_filename, output_format,
+                    paths, thread_count, emitter_graph, flags
+                );
+
+                // Emit GAF header lines now, if applicable.
+                // TODO: We should have a function that can take any graph and any alignment emitter
+                // and determine if there is any header information it can emit.
+                io::GafAlignmentEmitter* gaf_emitter = dynamic_cast<io::GafAlignmentEmitter*>(alignment_emitter.get());
+                if (gaf_emitter != nullptr) {
+                    gbwtgraph::GraphName graph_name = gbz->graph_name();
+                    std::vector<std::string> header_lines = graph_name.gaf_header_lines();
+                    gaf_emitter->emit_header_lines(header_lines);
+                }
             }
-            
+
+            // Stick any metadata in the emitter near the front of the stream.
+            alignment_emitter->emit_extra_message("PARAMS_JSON", params_json.str());
+
+#ifdef USE_MEMORY_PROFILING
+            // Start profiling memory allocations
+            AllocatorConfig::set_profiling(true);
+            // And dump an initial snapshot
+            AllocatorConfig::snapshot();
+#endif
+
 #ifdef USE_CALLGRIND
             // We want to profile the alignment, not the loading.
             CALLGRIND_START_INSTRUMENTATION;
@@ -1352,7 +2246,7 @@ int main_giraffe(int argc, char** argv) {
 #endif
 
             if (interleaved || !fastq_filename_2.empty()) {
-                //Map paired end from either one gam or fastq file or two fastq files
+                //Map paired end from either one GAM or FASTQ file or two FASTQ files
 
                 // a buffer to hold read pairs that can't be unambiguously mapped before the fragment length distribution
                 // is estimated
@@ -1374,7 +2268,9 @@ int main_giraffe(int argc, char** argv) {
                             // Report that it is now ready
                             #pragma omp critical (cerr)
                             {
-                                cerr << "Using fragment length estimate: " << minimizer_mapper.get_fragment_length_mean() << " +/- " << minimizer_mapper.get_fragment_length_stdev() << endl;
+                                logger.info() << "Using fragment length estimate: "
+                                              << minimizer_mapper.get_fragment_length_mean()
+                                              << " +/- " << minimizer_mapper.get_fragment_length_stdev() << endl;
                             }
                         }
                         
@@ -1383,15 +2279,17 @@ int main_giraffe(int argc, char** argv) {
                     }
                     return is_ready;
                 };
-                
+
                 // Define a way to force the distribution ready
                 auto require_distribution_finalized = [&]() {
-                    if (!minimizer_mapper.fragment_distr_is_finalized()){
-                        cerr << "warning[vg::giraffe]: Finalizing fragment length distribution before reaching maximum sample size" << endl;
-                        cerr << "                      mapped " << minimizer_mapper.get_fragment_length_sample_size() 
-                             << " reads single ended with " << ambiguous_pair_buffer.size() << " pairs of reads left unmapped" << endl;
-                        cerr << "                      mean: " << minimizer_mapper.get_fragment_length_mean() << ", stdev: " 
-                             << minimizer_mapper.get_fragment_length_stdev() << endl;
+                    if (!minimizer_mapper.fragment_distr_is_finalized()) {
+                        logger.warn() << "Finalizing fragment length distribution "
+                                      << "before reaching maximum sample size.\nmapped"
+                                      << minimizer_mapper.get_fragment_length_sample_size()
+                                      << " reads single ended with" << ambiguous_pair_buffer.size()
+                                      << " pairs of reads left unmapped.\nmean: "
+                                      << minimizer_mapper.get_fragment_length_mean() << ", stdev: "
+                                      << minimizer_mapper.get_fragment_length_stdev() << endl;
                         minimizer_mapper.finalize_fragment_length_distr();
                     }
                 };
@@ -1409,7 +2307,15 @@ int main_giraffe(int argc, char** argv) {
                         if (watchdog) {
                             watchdog->check_in(thread_num, aln1.name() + ", " + aln2.name());
                         }
+                        if (main_options.log_reads) {
+                            #pragma omp critical (cerr)
+                            logger.info() << "Thread " << thread_num << " now mapping "
+                                          << aln1.name() << ", " << aln2.name() << std::endl;
+                        }
                         
+
+                        check_quality_length(aln1);
+                        check_quality_length(aln2);
                         toUppercaseInPlace(*aln1.mutable_sequence());
                         toUppercaseInPlace(*aln2.mutable_sequence());
 
@@ -1437,9 +2343,11 @@ int main_giraffe(int argc, char** argv) {
                         
                         if (!minimizer_mapper.fragment_distr_is_finalized() && ambiguous_pair_buffer.size() >= MAX_BUFFERED_PAIRS) {
                             // We risk running out of memory if we keep this up.
-                            cerr << "warning[vg::giraffe]: Encountered " << ambiguous_pair_buffer.size() << " ambiguously-paired reads before finding enough" << endl
-                                 << "                      unambiguously-paired reads to learn fragment length distribution. Are you sure" << endl
-                                 << "                      your reads are paired and your graph is not a hairball?" << endl;
+                            logger.warn() << "Encountered " << ambiguous_pair_buffer.size()
+                                          << " ambiguously-paired reads before finding enough "
+                                          << "unambiguously-paired reads to learn fragment length distribution. "
+                                          << "Are you sure your reads are paired "
+                                          << "and your graph is not a hairball?" << std::endl;
                             require_distribution_finalized();
                         }
                         
@@ -1462,12 +2370,14 @@ int main_giraffe(int argc, char** argv) {
                     });
                 } else if (!fastq_filename_2.empty()) {
                     //A pair of FASTQ files to map
-                    fastq_paired_two_files_for_each_parallel_after_wait(fastq_filename_1, fastq_filename_2, map_read_pair, distribution_is_ready, batch_size);
+                    fastq_paired_two_files_for_each_parallel_after_wait(fastq_filename_1, fastq_filename_2, map_read_pair,
+                        distribution_is_ready, comments_as_tags, main_options.batch_size);
 
 
                 } else if ( !fastq_filename_1.empty()) {
                     // An interleaved FASTQ file to map, map all its pairs in parallel.
-                    fastq_paired_interleaved_for_each_parallel_after_wait(fastq_filename_1, map_read_pair, distribution_is_ready, batch_size);
+                    fastq_paired_interleaved_for_each_parallel_after_wait(fastq_filename_1, map_read_pair,
+                        distribution_is_ready, comments_as_tags, main_options.batch_size);
                 }
 
                 // Now map all the ambiguous pairs
@@ -1493,6 +2403,11 @@ int main_giraffe(int argc, char** argv) {
                 }
             } else {
                 // Map single-ended
+                
+#ifdef USE_MEMORY_PROFILING
+                size_t reads_mapped = 0;
+                size_t reads_mapped_threshold = 1;
+#endif
 
                 // All the threads start at once.
                 all_threads_start = first_thread_start;
@@ -1508,13 +2423,31 @@ int main_giraffe(int argc, char** argv) {
                         if (watchdog) {
                             watchdog->check_in(thread_num, aln.name());
                         }
+                        if (main_options.log_reads) {
+                            #pragma omp critical (cerr)
+                            logger.info() << "Thread " << thread_num
+                                          << " now mapping " << aln.name() << std::endl;
+                        }
                         
+                        check_quality_length(aln);
                         toUppercaseInPlace(*aln.mutable_sequence());
                     
                         // Map the read with the MinimizerMapper.
                         minimizer_mapper.map(aln, *alignment_emitter);
                         // Record that we mapped a read.
                         reads_mapped_by_thread.at(thread_num)++;
+
+#ifdef USE_MEMORY_PROFILING
+                        #pragma omp critical (reads_mapped)
+                        {
+                            reads_mapped++;
+                            if (reads_mapped == reads_mapped_threshold) {
+                                reads_mapped_threshold *= 2;
+                                // Dump a memory snapshot every time the mapped reads doubles.
+                                AllocatorConfig::snapshot();
+                            }
+                        }
+#endif
                         
                         if (watchdog) {
                             watchdog->check_out(thread_num);
@@ -1529,28 +2462,39 @@ int main_giraffe(int argc, char** argv) {
                     // GAM file to remap
                     get_input_file(gam_filename, [&](istream& in) {
                         // Open it and map all the reads in parallel.
-                        vg::io::for_each_parallel<Alignment>(in, map_read, batch_size);
+                        vg::io::for_each_parallel<Alignment>(in, map_read, main_options.batch_size);
                     });
                 }
                 
                 if (!fastq_filename_1.empty()) {
                     // FASTQ file to map, map all its reads in parallel.
-                    fastq_unpaired_for_each_parallel(fastq_filename_1, map_read, batch_size);
+                    fastq_unpaired_for_each_parallel(fastq_filename_1, map_read, comments_as_tags, main_options.batch_size);
                 }
             }
         
         } // Make sure alignment emitter is destroyed and all alignments are on disk.
-        
+
         // Now mapping is done
         std::chrono::time_point<std::chrono::system_clock> end = std::chrono::system_clock::now();
         clock_t cpu_time_after = clock();
 #ifdef __linux__
         stop_perf_for_thread();
 #endif
+
+#ifdef USE_MEMORY_PROFILING
+            // Dump a final snapshot
+            AllocatorConfig::snapshot();
+            // Stop profiling memory allocations
+            AllocatorConfig::set_profiling(false);
+#endif
         
         // Compute wall clock elapsed
-        std::chrono::duration<double> all_threads_seconds = end - all_threads_start;
-        std::chrono::duration<double> first_thread_additional_seconds = all_threads_start - first_thread_start;
+        std::chrono::duration<double> all_threads_seconds = (
+            all_threads_start == std::chrono::time_point<std::chrono::system_clock>::min()
+        ) ? std::chrono::duration<double>(0.0) : end - all_threads_start;
+        std::chrono::duration<double> first_thread_additional_seconds = (
+            all_threads_start == std::chrono::time_point<std::chrono::system_clock>::min()
+        ) ? end - first_thread_start : all_threads_start - first_thread_start;
         
         // Compute CPU time elapsed
         double cpu_seconds = (cpu_time_after - cpu_time_before) / (double)CLOCKS_PER_SEC;
@@ -1562,12 +2506,13 @@ int main_giraffe(int argc, char** argv) {
                 long long thread_instructions;
                 if (read(perf_fd, &thread_instructions, sizeof(long long)) != sizeof(long long)) {
                     // Read failed for some reason.
-                    cerr << "warning:[vg giraffe] Could not count CPU instructions executed" << endl;
+                    logger.warn() << "Could not count CPU instructions executed" << std::endl;
                     thread_instructions = 0;
                 }
                 if (close(perf_fd)) {
                     int problem = errno;
-                    cerr << "warning:[vg giraffe] Error closing perf event instruction counter: " << strerror(problem) << endl;
+                    logger.warn() << "Error closing perf event instruction counter:\n"
+                                  << strerror(problem) << std::endl;
                 }
                 total_instructions += thread_instructions;
             }
@@ -1588,25 +2533,27 @@ int main_giraffe(int argc, char** argv) {
         
         if (show_progress) {
             // Log to standard error
-            cerr << "Mapped " << total_reads_mapped << " reads across "
-                << thread_count << " threads in "
-                << all_threads_seconds.count() << " seconds with " 
-                << first_thread_additional_seconds.count() << " additional single-threaded seconds." << endl;
-            cerr << "Mapping speed: " << reads_per_second_per_thread
-                << " reads per second per thread" << endl;
+            logger.info() << "Mapped " << total_reads_mapped << " reads across "
+                          << thread_count << " threads in "
+                          << all_threads_seconds.count() << " seconds with " 
+                          << first_thread_additional_seconds.count()
+                          << " additional single-threaded seconds." << endl;
+            logger.info() << "Mapping speed: " << reads_per_second_per_thread
+                          << " reads per second per thread" << endl;
             
-            cerr << "Used " << cpu_seconds << " CPU-seconds (including output)." << endl;
-            cerr << "Achieved " << reads_per_cpu_second
-                << " reads per CPU-second (including output)" << endl;
+            logger.info() << "Used " << cpu_seconds << " CPU-seconds (including output)." << endl;
+            logger.info() << "Achieved " << reads_per_cpu_second
+                          << " reads per CPU-second (including output)" << endl;
             
             if (total_instructions != 0) {
-                cerr << "Used " << total_instructions << " CPU instructions (not including output)." << endl;
-                cerr << "Mapping slowness: " << mega_instructions_per_read
-                    << " M instructions per read at " << mega_instructions_per_second
-                    << " M mapping instructions per inclusive CPU-second" << endl;
+                logger.info() << "Used " << total_instructions
+                              << " CPU instructions (not including output)." << endl;
+                logger.info() << "Mapping slowness: " << mega_instructions_per_read
+                              << " M instructions per read at " << mega_instructions_per_second
+                              << " M mapping instructions per inclusive CPU-second" << endl;
             }
 
-            cerr << "Memory footprint: " << gbwt::inGigabytes(gbwt::memoryUsage()) << " GB" << endl;
+            logger.info() << "Memory footprint: " << gbwt::inGigabytes(gbwt::memoryUsage()) << " GB" << endl;
         }
         
         
@@ -1614,7 +2561,6 @@ int main_giraffe(int argc, char** argv) {
             // Log output filename and mapping speed in reads/second/thread to report TSV
             report << output_filename << "\t" << reads_per_second_per_thread << endl;
         }
-        
     });
         
     return 0;
@@ -1622,74 +2568,5 @@ int main_giraffe(int argc, char** argv) {
 
 //----------------------------------------------------------------------------
 
-string sample_haplotypes(const vector<pair<string, string>>& indexes, string& basename, string& sample_name, string& haplotype_file, string& kff_file, bool progress) {
-
-    if (progress) {
-        std::cerr << "Sampling haplotypes" << std::endl;
-    }
-
-    // Sanity checks.
-    if (haplotype_file.empty() || kff_file.empty()) {
-        std::cerr << "error:[vg giraffe] Haplotype sampling requires --haplotype-name and --kff-name." << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-
-    // Determine output name.
-    std::string sample = sample_name;
-    if (sample.empty()) {
-        sample = file_base_name(kff_file);
-        if (progress) {
-            std::cerr << "Guessing from " << kff_file << " that sample name is " << sample << std::endl;
-        }
-    }
-    if (sample == "giraffe") {
-        std::cerr << "warning:[vg giraffe] Using \"giraffe\" as a sample name may lead to filename collisions." << std::endl;
-    }
-    std::string output_name = basename + "." + sample + ".gbz";
-
-    // Load GBZ.
-    gbwtgraph::GBZ gbz;
-    if (indexes.size() == 1 && indexes[0].first == "Giraffe GBZ") {
-        load_gbz(gbz, indexes[0].second, progress);
-    } else if (indexes.size() == 2 && indexes[0].first == "Giraffe GBWT" && indexes[1].first == "GBWTGraph") {
-        load_gbz(gbz, indexes[0].second, indexes[1].second, progress);
-    } else if (indexes.size() == 2 && indexes[0].first == "GBWTGraph" && indexes[1].first == "Giraffe GBWT") {
-        load_gbz(gbz, indexes[1].second, indexes[0].second, progress);
-    } else {
-        std::cerr << "error:[vg giraffe] Haplotype sampling requires either -Z or -g and -H with no other indexes." << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-
-    // Load haplotype information.
-    if (progress) {
-        std::cerr << "Loading haplotype information from " << haplotype_file << std::endl;
-    }
-    Haplotypes haplotypes;
-    sdsl::simple_sds::load_from(haplotypes, haplotype_file);
-
-    // Sample haplotypes.
-    Haplotypes::Verbosity verbosity = (progress ? Haplotypes::verbosity_basic : Haplotypes::verbosity_silent);
-    Recombinator recombinator(gbz, haplotypes, verbosity);
-    Recombinator::Parameters parameters(Recombinator::Parameters::preset_diploid);
-    gbwt::GBWT sampled_gbwt;
-    try {
-        sampled_gbwt = recombinator.generate_haplotypes(kff_file, parameters);
-    } catch (const std::runtime_error& e) {
-        std::cerr << "error:[vg giraffe] Haplotype sampling failed: " << e.what() << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-
-    // Create GBWTGraph and save GBZ.
-    if (progress) {
-        std::cerr << "Building GBWTGraph" << std::endl;
-    }
-    gbwtgraph::GBWTGraph sampled_graph = gbz.graph.subgraph(sampled_gbwt);
-    save_gbz(sampled_gbwt, sampled_graph, output_name, progress);
-
-    return output_name;
-}
-
-//----------------------------------------------------------------------------
-
 // Register subcommand
-static Subcommand vg_giraffe("giraffe", "fast haplotype-aware short read alignment", PIPELINE, 6, main_giraffe);
+static Subcommand vg_giraffe("giraffe", "fast haplotype-aware read alignment", PIPELINE, 6, main_giraffe);

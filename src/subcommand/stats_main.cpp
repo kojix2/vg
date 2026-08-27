@@ -33,6 +33,8 @@
 #include "../io/converted_hash_graph.hpp"
 #include "../io/save_handle_graph.hpp"
 #include "../gbzgraph.hpp"
+#include "../progressive.hpp"
+#include "../traversal_finder.hpp"
 
 using namespace std;
 using namespace vg;
@@ -42,39 +44,43 @@ using namespace vg::algorithms;
 void help_stats(char** argv) {
     cerr << "usage: " << argv[0] << " stats [options] [<graph file>]" << endl
          << "options:" << endl
-         << "    -z, --size             size of graph" << endl
-         << "    -N, --node-count       number of nodes in graph" << endl
-         << "    -E, --edge-count       number of edges in graph" << endl
-         << "    -l, --length           length of sequences in graph" << endl
-         << "    -L, --self-loops       number of self-loops" << endl
-         << "    -s, --subgraphs        describe subgraphs of graph" << endl
-         << "    -H, --heads            list the head nodes of the graph" << endl
-         << "    -T, --tails            list the tail nodes of the graph" << endl
-         << "    -e, --nondeterm        list the nondeterministic edge sets" << endl
-         << "    -c, --components       print the strongly connected components of the graph" << endl
-         << "    -A, --is-acyclic       print if the graph is acyclic or not" << endl
-         << "    -n, --node ID          consider node with the given id" << endl
-         << "    -d, --to-head          show distance to head for each provided node" << endl
-         << "    -t, --to-tail          show distance to head for each provided node" << endl
-         << "    -a, --alignments FILE  compute stats for reads aligned to the graph" << endl
-         << "    -r, --node-id-range    X:Y where X and Y are the smallest and largest "
-        "node id in the graph, respectively" << endl
-         << "    -o, --overlap PATH    for each overlapping path mapping in the graph write a table:" << endl
+         << "  -z, --size               size of graph" << endl
+         << "  -N, --node-count         number of nodes in graph" << endl
+         << "  -E, --edge-count         number of edges in graph" << endl
+         << "  -l, --length             length of sequences in graph" << endl
+         << "  -L, --self-loops         number of self-loops" << endl
+         << "  -s, --subgraphs          describe subgraphs of graph" << endl
+         << "  -H, --heads              list the head nodes of the graph" << endl
+         << "  -T, --tails              list the tail nodes of the graph" << endl
+         << "  -e, --nondeterm          list the nondeterministic edge sets" << endl
+         << "  -c, --components         print the strongly connected components of the graph" << endl
+         << "  -A, --is-acyclic         print if the graph is acyclic or not" << endl
+         << "  -n, --node ID            consider node with the given id" << endl
+         << "  -d, --to-head            show distance to head for each provided node" << endl
+         << "  -t, --to-tail            show distance to tail for each provided node" << endl
+         << "  -a, --alignments FILE    compute stats for reads aligned to the graph" << endl
+         << "  -r, --node-id-range      X:Y where X and Y are the smallest and largest" << endl
+         << "                           node id in the graph, respectively" << endl
+         << "  -o, --overlap PATH       for each overlapping path mapping in the graph write:" << endl
          << "                              PATH, other_path, rank1, rank2" << endl
-         << "                          multiple allowed; limit comparison to those provided" << endl
-         << "    -O, --overlap-all     print overlap table for the cartesian product of paths" << endl
-         << "    -R, --snarls          print statistics for each snarl" << endl
-         << "        --snarl-contents  print out a table of <snarl, depth, parent, contained node ids>" << endl
-         << "    -C, --chains          print statistics for each chain" << endl
-         << "    -F, --format          graph format from {VG-Protobuf, PackedGraph, HashGraph, XG}. " <<
-        "Can't detect Protobuf if graph read from stdin" << endl
-         << "    -D, --degree-dist     print degree distribution of the graph." << endl
-         << "    -b, --dist-snarls FILE print the sizes and depths of the snarls in a given distance index." << endl
-         << "    -p, --threads N       number of threads to use [all available]" << endl
-         << "    -v, --verbose         output longer reports" << endl;
+         << "                           multiple allowed; limit comparison to those provided" << endl
+         << "  -O, --overlap-all        print overlap table for cartesian product of paths" << endl
+         << "  -R, --snarls             print statistics for each snarl" << endl
+         << "      --snarl-contents     print table of <snarl, depth, parent, node ids>" << endl
+         << "      --snarl-sample NAME  print BED-like reference coordinates on given sample" << endl
+         << "  -C, --chains             print statistics for each chain" << endl
+         << "  -F, --format             graph type {VG-Protobuf, PackedGraph, HashGraph, XG}" << endl
+         << "                           Can't detect Protobuf if graph read from stdin" << endl
+         << "  -D, --degree-dist        print degree distribution of the graph." << endl
+         << "  -b, --dist-snarls FILE   print sizes/depths of the snarls in distance index" << endl
+         << "  -p, --threads N          number of threads to use [all available]" << endl
+         << "  -v, --verbose            output longer reports" << endl
+         << "  -P, --progress           show progress" << endl
+         << "  -h, --help               print this help message to stderr and exit" << endl;
 }
 
 int main_stats(int argc, char** argv) {
+    Logger logger("vg stats");
 
     if (argc == 2) {
         help_stats(argv);
@@ -95,6 +101,7 @@ int main_stats(int argc, char** argv) {
     bool node_count = false;
     bool edge_count = false;
     bool verbose = false;
+    bool show_progress = false;
     bool is_acyclic = false;
     bool stats_range = false;
     set<vg::id_t> ids;
@@ -106,12 +113,15 @@ int main_stats(int argc, char** argv) {
     bool snarl_stats = false;
     bool chain_stats = false;
     bool snarl_contents = false;
+    string snarl_sample;
     bool format = false;
     bool degree_dist = false;
     string distance_index_filename;
 
     // Long options with no corresponding short options.
     constexpr int OPT_SNARL_CONTENTS = 1000;
+    constexpr int OPT_SNARL_SAMPLE = 1001;
+    constexpr int64_t snarl_search_context = 100;
 
     int c;
     optind = 2; // force optind past command positional argument
@@ -127,6 +137,7 @@ int main_stats(int argc, char** argv) {
             {"heads", no_argument, 0, 'H'},
             {"tails", no_argument, 0, 'T'},
             {"nondeterm", no_argument, 0, 'e'},
+            {"show-siblings", no_argument, 0, 'S'},
             {"help", no_argument, 0, 'h'},
             {"components", no_argument, 0, 'c'},
             {"to-head", no_argument, 0, 'd'},
@@ -136,21 +147,23 @@ int main_stats(int argc, char** argv) {
             {"is-acyclic", no_argument, 0, 'A'},
             {"node-id-range", no_argument, 0, 'r'},
             {"verbose", no_argument, 0, 'v'},
-            {"overlap", no_argument, 0, 'o'},
+            {"overlap", required_argument, 0, 'o'},
             {"overlap-all", no_argument, 0, 'O'},
             {"snarls", no_argument, 0, 'R'},
             {"snarl-contents", no_argument, 0, OPT_SNARL_CONTENTS},
+            {"snarl-sample", required_argument, 0, OPT_SNARL_SAMPLE},
             {"chains", no_argument, 0, 'C'},            
             {"format", no_argument, 0, 'F'},
             {"degree-dist", no_argument, 0, 'D'},
             {"dist-snarls", required_argument, 0, 'b'},
             {"threads", required_argument, 0, 'p'},
+            {"progress", no_argument, 0, 'P'},
             {0, 0, 0, 0}
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hzlLsHTecdtn:NEa:vAro:ORCFDb:p:",
-                long_options, &option_index);
+        c = getopt_long (argc, argv, "h?zlLsHTeScdtn:NEa:vPAro:ORCFDb:p:",
+                         long_options, &option_index);
 
         // Detect the end of the options.
         if (c == -1)
@@ -219,7 +232,7 @@ int main_stats(int argc, char** argv) {
             break;
 
         case 'a':
-            alignments_filename = optarg;
+            alignments_filename = require_exists(logger, optarg);
             break;
 
         case 'r':
@@ -241,6 +254,10 @@ int main_stats(int argc, char** argv) {
         case OPT_SNARL_CONTENTS:
             snarl_contents = true;
             break;
+
+        case OPT_SNARL_SAMPLE:
+            snarl_sample = optarg;
+            break;
             
         case 'C':
             chain_stats = true;
@@ -248,6 +265,10 @@ int main_stats(int argc, char** argv) {
             
         case 'v':
             verbose = true;
+            break;
+
+        case 'P':
+            show_progress = true;
             break;
 
         case 'F':
@@ -258,18 +279,11 @@ int main_stats(int argc, char** argv) {
             degree_dist = true;
             break;
         case 'b':
-            distance_index_filename = optarg;
+            distance_index_filename = require_exists(logger, optarg);
             break;
         case 'p':
-        {
-            int num_threads = parse<int>(optarg);
-            if (num_threads <= 0) {
-                cerr << "error:[vg stats] Thread count (-t) set to " << num_threads << ", must set to a positive integer." << endl;
-                exit(1);
-            }
-            omp_set_num_threads(num_threads);
+            set_thread_count(logger, optarg);
             break;
-        }
 
         case 'h':
         case '?':
@@ -280,6 +294,10 @@ int main_stats(int argc, char** argv) {
         default:
             abort ();
         }
+    }
+
+    if (!snarl_sample.empty() && !snarl_stats) {
+        logger.error() << "--snarl-sample can only be used with --snarls/-R" << endl;
     }
 
     bdsg::ReferencePathOverlayHelper overlay_helper;
@@ -301,17 +319,16 @@ int main_stats(int argc, char** argv) {
     }
     
     // We have function to make sure the graph was passed and complain if not
-    auto require_graph = [&graph]() {
+    auto require_graph = [&graph, &logger]() {
         if (graph == nullptr) {
-            cerr << "error[vg stats]: The selected operation requires passing a graph file to work on" << endl;
-            exit(1);
+            logger.error() << "The selected operation requires passing a graph file to work on" << endl;
         }
     };
 
     if (stats_size) {
         require_graph();
         cout << "nodes" << "\t" << graph->get_node_count() << endl
-            << "edges" << "\t" << graph->get_edge_count() << endl;
+             << "edges" << "\t" << graph->get_edge_count() << endl;
     }
 
     if (node_count) {
@@ -509,7 +526,8 @@ int main_stats(int argc, char** argv) {
         // print degrees
         cout << "Degree\tSides\tNodes(min)\tNodes(max)\tNodes(total)" << endl;
         for (const auto& dg : degree_to_count) {
-            cout << dg.first << "\t" << get<0>(dg.second) << "\t" <<get<1>(dg.second) << "\t" << get<2>(dg.second) << "\t" << get<3>(dg.second) << endl;
+            cout << dg.first << "\t" << get<0>(dg.second) << "\t" <<get<1>(dg.second) << "\t"
+                 << get<2>(dg.second) << "\t" << get<3>(dg.second) << endl;
         }
     }
 
@@ -596,9 +614,6 @@ int main_stats(int argc, char** argv) {
     }
 
     if (!alignments_filename.empty()) {
-        // Read in the given GAM
-        ifstream alignment_stream(alignments_filename);
-
         // We need some allele parsing functions
 
         // This one gets the site name from an allele path name
@@ -625,7 +640,8 @@ int main_stats(int argc, char** argv) {
             size_t total_perfect = 0; // Number of reads with no indels or substitutions relative to their paths
             size_t total_gapless = 0; // Number of reads with no indels relative to their paths
 
-            // These are for tracking which nodes are covered and which are not
+            // These are for tracking which nodes are covered and which are not.
+            // Only used if a graph is used.
             map<vg::id_t, size_t> node_visit_counts;
 
             // And for counting indels
@@ -637,12 +653,16 @@ int main_stats(int argc, char** argv) {
             // And substitutions
             size_t total_substitutions = 0;
             size_t total_substituted_bases = 0;
+            // And matches
+            size_t total_matched_bases = 0;
             // And softclips
             size_t total_softclips = 0;
             size_t total_softclipped_bases = 0;
             // And pairing
             size_t total_paired = 0;
             size_t total_proper_paired = 0;
+            // And just bases in general
+            size_t total_bases = 0;
 
             // Alignment and mapping quality score distributions.
             std::map<std::int64_t, size_t> alignment_scores;
@@ -681,10 +701,12 @@ int main_stats(int argc, char** argv) {
                 total_deleted_bases += other.total_deleted_bases;
                 total_substitutions += other.total_substitutions;
                 total_substituted_bases += other.total_substituted_bases;
+                total_matched_bases += other.total_matched_bases;
                 total_softclips += other.total_softclips;
                 total_softclipped_bases += other.total_softclipped_bases;
                 total_paired += other.total_paired;
                 total_proper_paired += other.total_proper_paired;
+                total_bases += other.total_bases;
 
                 for (auto iter = other.alignment_scores.begin(); iter != other.alignment_scores.end(); ++iter) {
                     this->alignment_scores[iter->first] += iter->second;
@@ -799,7 +821,8 @@ int main_stats(int argc, char** argv) {
                 stats.total_secondary++;
             } else {
                 stats.total_primary++;
-                bool has_alignment = aln.score() > 0;
+                // Injected alignments may have paths but no scores.
+                bool has_alignment = aln.score() > 0 || aln.path().mapping_size() > 0;
                 if (has_alignment) {
                     // We only count aligned primary reads in "total aligned";
                     // the primary can't be unaligned if the secondary is
@@ -840,13 +863,16 @@ int main_stats(int argc, char** argv) {
                         // read.
                         alleles_supported.insert(allele_path_for_node.at(node_id));
                     }
-
-                    // Record that there was a visit to this node.
-                    stats.node_visit_counts[node_id]++;
+                    
+                    if (graph != nullptr) {
+                        // Record that there was a visit to this node.
+                        stats.node_visit_counts[node_id]++;
+                    }
 
                     for(size_t j = 0; j < mapping.edit_size(); j++) {
                         // Go through edits and look for each type.
                         auto& edit = mapping.edit(j);
+                        stats.total_bases += edit.to_length();
 
                         if(edit.to_length() > edit.from_length()) {
                             // This is an insert or softclip and not a match
@@ -898,6 +924,9 @@ int main_stats(int argc, char** argv) {
                                 // Record the actual substitution
                                 stats.substitutions.push_back(make_pair(node_id, edit));
                             }
+                        } else {
+                            // This is a match
+                            stats.total_matched_bases += edit.from_length();
                         }
 
                     }
@@ -917,14 +946,30 @@ int main_stats(int argc, char** argv) {
             }
 
         };
-
-        // Actually go through all the reads and count stuff up.
-        vg::io::for_each_parallel(alignment_stream, lambda);
         
+        get_input_file(alignments_filename, [&](istream& alignment_stream) {
+            // Read in the given GAM
+            // Actually go through all the reads and count stuff up.
+            vg::Progressive::with_progress(show_progress, "Read reads", 
+                [&](const std::function<void(size_t, size_t)>& progress) {
+                vg::io::for_each_parallel(alignment_stream, lambda, 256, progress);
+            });
+        });
+
         // Now combine into a single ReadStats object (for which we pre-populated reads_on_allele with 0s).
-        for (auto& per_thread : read_stats) {
-            combined += per_thread;
+        vg::Progressive::with_progress(show_progress, "Combine thread results", 
+            [&](const std::function<void(size_t, size_t)>& progress) {
+            progress(0, read_stats.size());
+            for(size_t i = 0; i < read_stats.size(); i++) {
+                combined += read_stats[i];
+                progress(i + 1, read_stats.size());
+            }
+        });
+        if (show_progress) {
+            logger.info() << "Destroy per-thread data structures" << std::endl;
         }
+        // This can take a long time because we need to deallocate all this
+        // stuff allocated by other threads, such as per-node count maps.
         read_stats.clear();
 
         // Go through all the nodes again and sum up unvisited nodes
@@ -950,6 +995,9 @@ int main_stats(int argc, char** argv) {
         size_t significantly_biased_hets = 0;
 
         if (graph != nullptr) {
+            if (show_progress) {
+                logger.info() << "Account for graph" << std::endl;
+            }
 
             // Calculate stats about the reads per allele data
             for(auto& site_and_alleles : combined.reads_on_allele) {
@@ -1023,6 +1071,10 @@ int main_stats(int argc, char** argv) {
             
         }
 
+        if (show_progress) {
+            logger.info() << "Print report" << std::endl;
+        }
+
         cout << "Total alignments: " << combined.total_alignments << endl;
         cout << "Total primary: " << combined.total_primary << endl;
         cout << "Total secondary: " << combined.total_secondary << endl;
@@ -1057,14 +1109,25 @@ int main_stats(int argc, char** argv) {
                     << " on " << id_and_edit.first << endl;
             }
         }
-        cout << "Substitutions: " << combined.total_substituted_bases << " bp in " << combined.total_substitutions << " read events" << endl;
+        cout << "Substitutions: " << combined.total_substituted_bases << " bp in " << combined.total_substitutions 
+             << " read events" << endl;
         if(verbose) {
             for(auto& id_and_edit : combined.substitutions) {
                 cout << "\t" << id_and_edit.second.from_length() << " -> " << id_and_edit.second.sequence()
                     << " on " << id_and_edit.first << endl;
             }
         }
-        cout << "Softclips: " << combined.total_softclipped_bases << " bp in " << combined.total_softclips << " read events" << endl;
+        cout << "Matches: " << combined.total_matched_bases << " bp";
+        if (combined.total_alignments > 0) {
+            cout << " (" << combined.total_matched_bases / static_cast<double>(combined.total_aligned) << " bp/aligned)";
+        }
+        cout << endl;
+        cout << "Softclips: " << combined.total_softclipped_bases << " bp";
+        if (combined.total_alignments > 0) {
+            cout << " (" << 100 * combined.total_softclipped_bases / static_cast<double>(combined.total_bases) << "% of bases, "
+                 << combined.total_softclipped_bases / static_cast<double>(combined.total_aligned) << " bp/aligned)";
+        } 
+        cout << " in " << combined.total_softclips << " read events" << endl;
         if(verbose) {
             for(auto& id_and_edit : combined.softclips) {
                 cout << "\t" << id_and_edit.second.from_length() << " -> " << id_and_edit.second.sequence()
@@ -1110,23 +1173,174 @@ int main_stats(int argc, char** argv) {
     unordered_map<const Snarl*, size_t> depth;
     
     if (snarl_stats || chain_stats || snarl_contents) {
-        // We will go through all the snarls and compute stats.
-        
+        // We will go through all the snarls and compute stats.        
         require_graph();
+
+        std::unordered_map<nid_t, size_t> extra_node_weight;
+        constexpr size_t EXTRA_WEIGHT = 10000000000;
         
-        // First compute the snarls
-        manager = IntegratedSnarlFinder(*graph).find_snarls_parallel();
+        // Collect paths in our assigned snarl coordinate sample
+        std::vector<std::string> ref_path_names;
+        if (snarl_stats && !snarl_sample.empty()) {
+            graph->for_each_path_of_sample(snarl_sample, [&](path_handle_t path_handle) {
+                ref_path_names.push_back(graph->get_path_name(path_handle));
+            });
+            if (ref_path_names.empty()) {
+                logger.error() << "unable to find any paths of --snarl-sample " << snarl_sample << endl;
+            }
+        }
+
+        // Turn them into an unordered_set so we can make sure they're all positionally indexed
+        std::unordered_set<std::string> target_paths(ref_path_names.begin(), ref_path_names.end());
         
+        // additional indexes only needed when finding --snarl-sample coordinates
+        unique_ptr<PathTraversalFinder> path_trav_finder;
+        bdsg::PathPositionOverlayHelper overlay_helper;
+        PathPositionHandleGraph* pp_graph = dynamic_cast<PathPositionHandleGraph*>(graph);
+        if (pp_graph == nullptr) {
+            pp_graph = overlay_helper.apply(graph, target_paths);
+        }
 
         if (snarl_stats) {
             // TSV header
-            cout << "Start\tStart-Reversed\tEnd\tEnd-Reversed\tUltrabubble\tUnary\tShallow-Nodes\tShallow-Edges\tShallow-bases\tDeep-Nodes\tDeep-Edges\tDeep-Bases\tDepth\tChildren\tChains\tChains-Children\tNet-Graph-Size\n";
+            if (!snarl_sample.empty()) {
+                // optionally prefix with BED-like refpath coordinates if --snarl-sample given
+                cout <<"Contig\tStartPos\tEndPos\t";
+                pp_graph->for_each_path_of_sample(snarl_sample, [&](path_handle_t path_handle) {
+                    // Try and pin down the tips of the sample
+                    extra_node_weight[graph->get_id(graph->get_handle_of_step(graph->path_begin(path_handle)))] += EXTRA_WEIGHT;
+                    extra_node_weight[graph->get_id(graph->get_handle_of_step(graph->path_back(path_handle)))] += EXTRA_WEIGHT;
+                });
+                path_trav_finder = unique_ptr<PathTraversalFinder>(new PathTraversalFinder(*pp_graph, ref_path_names));
+            }
+            cout << "Start\tStart-Reversed\tEnd\tEnd-Reversed\tUltrabubble\tUnary\tShallow-Nodes"
+                 << "\tShallow-Edges\tShallow-bases\tDeep-Nodes\tDeep-Edges\tDeep-Bases\tDepth"
+                 << "\tChildren\tChains\tChains-Children\tNet-Graph-Size\n";
         }
+
+        // First compute the snarls
+        manager = IntegratedSnarlFinder(*graph, extra_node_weight).find_snarls_parallel();
+
+        std::unordered_map<const Snarl*, PathInterval> snarl_to_ref;
         
         manager.for_each_snarl_preorder([&](const Snarl* snarl) {
             // Loop over all the snarls and print stats.
-
             if (snarl_stats) {
+                if (!snarl_sample.empty()) {
+                    // find the reference interval from path index if snarl lies directly on reference path
+                    vector<PathInterval> travs;
+                    std::tie(std::ignore, travs) = path_trav_finder->find_path_traversals(
+                        pp_graph->get_handle(snarl->start().node_id(), snarl->start().backward()),
+                        pp_graph->get_handle(snarl->end().node_id(), snarl->end().backward()));
+                    if (travs.empty() && snarl_to_ref.count(manager.parent_of(snarl))) {
+                        // snarl's not on the reference path, us its parent interval
+                        travs.push_back(snarl_to_ref.at(manager.parent_of(snarl)));
+                    }
+                    if (travs.empty()) {
+                        // search toward the reference path
+                        unordered_map<path_handle_t, vector<step_handle_t>> start_steps;
+                        unordered_map<path_handle_t, vector<step_handle_t>> end_steps;
+                        handlegraph::algorithms::dijkstra(pp_graph, pp_graph->get_handle(snarl->start().node_id(),
+                                                                                         snarl->start().backward()),
+                                 [&](const handle_t& found_handle, size_t dist) {
+                                     graph->for_each_step_on_handle(found_handle, [&](step_handle_t step) {
+                                         if (graph->get_sample_name(graph->get_path_handle_of_step(step)) == snarl_sample) {
+                                             start_steps[graph->get_path_handle_of_step(step)].push_back(step);
+                                         }
+                                     });
+                                     return start_steps.empty() && dist < snarl_search_context;
+                                 }, true);
+                        handlegraph::algorithms::dijkstra(pp_graph, pp_graph->get_handle(snarl->end().node_id(), 
+                                                                                         snarl->end().backward()),
+                                 [&](const handle_t& found_handle, size_t dist) {
+                                     graph->for_each_step_on_handle(found_handle, [&](step_handle_t step) {
+                                         if (graph->get_sample_name(graph->get_path_handle_of_step(step)) == snarl_sample) {
+                                             end_steps[graph->get_path_handle_of_step(step)].push_back(step);
+                                         }
+                                     });
+                                     return end_steps.empty() && dist < snarl_search_context;
+                                 });
+                        for (const auto& start_path_steps : start_steps) {
+                            if (end_steps.count(start_path_steps.first)) {
+                                unordered_map<nid_t, step_handle_t> end_ids;
+                                for (const step_handle_t& step : end_steps[start_path_steps.first]) {
+                                    end_ids[graph->get_id(graph->get_handle_of_step(step))] = step;
+                                }
+                                // search forward (in looping path we want to pull out contiguous steps to form a
+                                // meaningful interval)
+                                for (step_handle_t step = graph->get_next_step(start_path_steps.second[0]);
+                                     step != graph->path_end(graph->get_path_handle_of_step(start_path_steps.second[0]));
+                                     step = graph->get_next_step(step)) {
+                                    if (end_ids.count(graph->get_id(graph->get_handle_of_step(step)))) {
+                                        travs.push_back(make_pair(start_path_steps.second[0],
+                                                                  end_ids[graph->get_id(graph->get_handle_of_step(step))]));
+                                        break;                                        
+                                    }
+                                }
+                                // search backward
+                                if (travs.empty()) {
+                                    for (step_handle_t step = graph->get_previous_step(start_path_steps.second[0]);
+                                         step != graph->path_front_end(graph->get_path_handle_of_step(start_path_steps.second[0]));
+                                         step = graph->get_previous_step(step)) {
+                                        if (end_ids.count(graph->get_id(graph->get_handle_of_step(step)))) {
+                                            travs.push_back(make_pair(start_path_steps.second[0],
+                                                                      end_ids[graph->get_id(graph->get_handle_of_step(step))]));
+                                            break;                                        
+                                        }
+                                    }                                    
+                                }
+                            }
+                            if (!travs.empty()) {
+                                break;
+                            }
+                        }                        
+                        // unlikely, but maybe only one end of the snarl reaches the reference.  in that case
+                        // we just consider it both ends of the interval
+                        if (travs.empty() && !start_steps.empty()) {
+                            travs.push_back(make_pair(start_steps.begin()->second.front(), start_steps.begin()->second.front()));
+                        }
+                        if (travs.empty() && !end_steps.empty()) {
+                            travs.push_back(make_pair(end_steps.begin()->second.front(), end_steps.begin()->second.front()));
+                        }
+                    }
+                    if (travs.empty() || travs.front().first == travs.front().second) {
+                        // either we found nothing on the reference at all, or only one end of the snarl
+                        // reached it, in which case the fallback above paired a step with itself.  a lone
+                        // anchor tells us which node the snarl hangs off but not which side of that node
+                        // it attaches to, so there is no interval to report.  say so, rather than invent
+                        // one that would be indistinguishable from a genuinely empty snarl.
+                        cout << ".\t.\t.\t";
+                    } else {
+                        // note: in case of a cycle, we're just taking the first found
+                        step_handle_t start_step = travs.front().first;
+                        step_handle_t end_step = travs.front().second;
+                        int64_t start_pos = pp_graph->get_position_of_step(start_step);
+                        int64_t end_pos = pp_graph->get_position_of_step(end_step);
+                        if (end_pos < start_pos) {
+                            swap(start_pos, end_pos);
+                            swap(start_step, end_step);
+                        }
+                        // we don't want the boundaries counting toward the snarl length.  the two steps
+                        // are distinct and so occupy disjoint stretches of the path, and
+                        // get_position_of_step always gives the leftmost base of a step's visit whatever
+                        // its orientation.  so the interior runs from one past the end of the leftmost
+                        // boundary node up to (but not including) the first base of the rightmost one,
+                        // giving a 0-based, half-open (BED-like) interval.  note that on a cyclic path
+                        // the traversal can wrap past the path origin, in which case the two steps don't
+                        // bracket the interior and the interval isn't meaningful.
+                        start_pos += graph->get_length(graph->get_handle_of_step(start_step));
+                        // report against the base path, so that coordinates on a subpath are still
+                        // relative to the full contig rather than to the start of the subrange
+                        path_handle_t ref_path = pp_graph->get_path_handle_of_step(start_step);
+                        int64_t base_offset = get_path_base_offset(*pp_graph, ref_path);
+                        cout << get_path_base_name(*pp_graph, ref_path) << "\t" << (start_pos + base_offset) << "\t"
+                             << (end_pos + base_offset) << "\t";
+
+                        // use this interval for off-reference children
+                        snarl_to_ref[snarl] = travs.front();
+                    }
+                }
+                
                 // snarl
                 cout << snarl->start().node_id() << "\t" << snarl->start().backward() << "\t";
                 cout << snarl->end().node_id() << "\t" << snarl->end().backward() << "\t";
@@ -1229,7 +1443,9 @@ int main_stats(int argc, char** argv) {
         
 
         // TSV header
-        cout << "Snarl1-Start\tSSnarl1-Start-Reversed\tSnarl1-End\tSnarl1-End-Reversed\tSnarl1-Reversed\tSnarl2-Start\tSSnarl2-Start-Reversed\tSnarl2-End\tSnarl2-End-Reversed\tSnarl2-Reversed\tSnarl-Count\tMax-Depth\tChild-Snarls\tChild-Chains\n";
+        cout << "Snarl1-Start\tSSnarl1-Start-Reversed\tSnarl1-End\tSnarl1-End-Reversed\tSnarl1-Reversed"
+             << "\tSnarl2-Start\tSSnarl2-Start-Reversed\tSnarl2-End\tSnarl2-End-Reversed\tSnarl2-Reversed"
+             << "\tSnarl-Count\tMax-Depth\tChild-Snarls\tChild-Chains\n";
         
         manager.for_each_chain([&](const Chain* chain) {
             // Loop over all the snarls and print stats.

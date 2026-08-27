@@ -1,9 +1,25 @@
 #include "gbwtgraph_helper.hpp"
 #include "gbwt_helper.hpp"
+#include "gbzgraph.hpp"
 
-#include <vg/io/vpkg.hpp>
+#include <gbwtgraph/index.h>
+#include <vg/io/alignment_io.hpp>
 
 namespace vg {
+
+//------------------------------------------------------------------------------
+
+// Numerical class constants.
+
+constexpr size_t MinimizerIndexParameters::DEFAULT_THRESHOLD;
+constexpr size_t MinimizerIndexParameters::DEFAULT_ITERATIONS;
+constexpr size_t MinimizerIndexParameters::MAX_ITERATIONS;
+constexpr size_t MinimizerIndexParameters::HASH_TABLE_MIN_WIDTH;
+constexpr size_t MinimizerIndexParameters::HASH_TABLE_MAX_WIDTH;
+constexpr size_t MinimizerIndexParameters::ZIPCODE_PAYLOAD_SIZE;
+
+// Other static members.
+const std::string MinimizerIndexParameters::PAYLOAD_KEY = "payload";
 
 //------------------------------------------------------------------------------
 
@@ -64,38 +80,48 @@ void load_gbwtgraph(gbwtgraph::GBWTGraph& graph, const std::string& filename, bo
     if (show_progress) {
         std::cerr << "Loading GBWTGraph from " << filename << std::endl;
     }
-    std::unique_ptr<gbwtgraph::GBWTGraph> loaded = vg::io::VPKG::load_one<gbwtgraph::GBWTGraph>(filename);
-    if (loaded.get() == nullptr) {
-        std::cerr << "error: [load_gbwtgraph()] cannot load GBWTGraph " << filename << std::endl;
+
+    // This mimics Simple-SDS serialization.
+    try {
+        std::ifstream in(filename, std::ios_base::binary);
+        if (!in) {
+            throw sdsl::simple_sds::CannotOpenFile(filename, false);
+        }
+        in.exceptions(std::ifstream::badbit | std::ifstream::failbit | std::ifstream::eofbit);
+        graph.deserialize(in);
+        in.close();
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [load_gbwtgraph()] cannot load GBWTGraph " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    graph = std::move(*loaded);
 }
 
 void load_gbz(gbwtgraph::GBZ& gbz, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Loading GBZ from " << filename << std::endl;
     }
-    std::unique_ptr<gbwtgraph::GBZ> loaded = vg::io::VPKG::load_one<gbwtgraph::GBZ>(filename);
-    if (loaded.get() == nullptr) {
-        std::cerr << "error: [load_gbz()] cannot load GBZ " << filename << std::endl;
+    try {
+        sdsl::simple_sds::load_from(gbz, filename);
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [load_gbz()] cannot load GBZ " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    gbz = std::move(*loaded);
 }
 
 void load_gbz(gbwt::GBWT& index, gbwtgraph::GBWTGraph& graph, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Loading GBWT and GBWTGraph from " << filename << std::endl;
     }
-    std::unique_ptr<gbwtgraph::GBZ> loaded = vg::io::VPKG::load_one<gbwtgraph::GBZ>(filename);
-    if (loaded.get() == nullptr) {
-        std::cerr << "error: [load_gbz()] cannot load GBZ " << filename << std::endl;
+    gbwtgraph::GBZ loaded;
+    try {
+        sdsl::simple_sds::load_from(loaded, filename);
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [load_gbz()] cannot load GBZ " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    index = std::move(loaded->index);
-    graph = std::move(loaded->graph);
-    graph.set_gbwt(index); // We moved the GBWT out from the GBZ, so we have to update the pointer.
+    index = std::move(loaded.index);
+    graph = std::move(loaded.graph);
+    graph.set_gbwt_address(index); // We moved the GBWT out from the GBZ, so we have to update the pointer.
 }
 
 void load_gbz(gbwtgraph::GBZ& gbz, const std::string& gbwt_name, const std::string& graph_name, bool show_progress) {
@@ -109,39 +135,90 @@ void load_minimizer(gbwtgraph::DefaultMinimizerIndex& index, const std::string& 
     if (show_progress) {
         std::cerr << "Loading MinimizerIndex from " << filename << std::endl;
     }
-    std::unique_ptr<gbwtgraph::DefaultMinimizerIndex> loaded = vg::io::VPKG::load_one<gbwtgraph::DefaultMinimizerIndex>(filename);
-    if (loaded.get() == nullptr) {
-        std::cerr << "error: [load_minimizer()] cannot load MinimizerIndex " << filename << std::endl;
+
+    // This mimics Simple-SDS serialization.
+    try {
+        std::ifstream in(filename, std::ios_base::binary);
+        if (!in) {
+            throw sdsl::simple_sds::CannotOpenFile(filename, false);
+        }
+        in.exceptions(std::ifstream::badbit | std::ifstream::failbit | std::ifstream::eofbit);
+        index.deserialize(in);
+        in.close();
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [load_minimizer()] cannot load MinimizerIndex " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    index = std::move(*loaded);
 }
 
 void save_gbwtgraph(const gbwtgraph::GBWTGraph& graph, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Saving GBWTGraph to " << filename << std::endl;
     }
-    graph.serialize(filename);
+
+    // This mimics Simple-SDS serialization.
+    try {
+        std::ofstream out(filename, std::ios_base::binary);
+        if (!out) {
+            throw sdsl::simple_sds::CannotOpenFile(filename, true);
+        }
+        out.exceptions(std::ofstream::badbit | std::ofstream::failbit);
+        graph.serialize(out);
+        out.close();
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [save_gbwtgraph()] cannot save GBWTGraph to " << filename << ": " << e.what() << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
 }
 
 void save_gbz(const gbwtgraph::GBZ& gbz, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Saving GBZ to " << filename << std::endl;
     }
-    sdsl::simple_sds::serialize_to(gbz, filename);
+    try {
+        sdsl::simple_sds::serialize_to(gbz, filename);
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [save_gbz()] cannot save GBZ to " << filename << ": " << e.what() << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+void save_gbz_version(const gbwtgraph::GBZ& gbz, const std::string& filename, std::uint32_t version, bool show_progress) {
+    if (show_progress) {
+        std::cerr << "Saving GBZ (version " << version << ") to " << filename << std::endl;
+    }
+    try {
+        std::ofstream out(filename, std::ios_base::binary);
+        if (!out) {
+            throw sdsl::simple_sds::CannotOpenFile(filename, true);
+        }
+        out.exceptions(std::ofstream::badbit | std::ofstream::failbit);
+        gbz.simple_sds_serialize_version(out, version);
+        out.close();
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [save_gbz_version()] cannot save GBZ (version " << version << ") to " << filename << ": " << e.what() << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
 }
 
 void save_gbz(const gbwt::GBWT& index, gbwtgraph::GBWTGraph& graph, const std::string& filename, bool show_progress) {
     if (show_progress) {
         std::cerr << "Saving GBWT and GBWTGraph to " << filename << std::endl;
     }
-    std::ofstream out(filename, std::ios_base::binary);
-    if (!out) {
-        std::cerr << "error: [save_gbz()] cannot open file " << filename << " for writing" << std::endl;
+
+    // This mimics Simple-SDS serialization.
+    try {
+        std::ofstream out(filename, std::ios_base::binary);
+        if (!out) {
+            throw sdsl::simple_sds::CannotOpenFile(filename, true);
+        }
+        out.exceptions(std::ofstream::badbit | std::ofstream::failbit);
+        gbwtgraph::GBZ::simple_sds_serialize(index, graph, out);
+        out.close();
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [save_gbz()] cannot save GBWT and GBWTGraph to " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    gbwtgraph::GBZ::simple_sds_serialize(index, graph, out);
-    out.close();
 }
 
 void save_gbz(const gbwtgraph::GBZ& gbz, const std::string& gbwt_name, const std::string& graph_name, bool show_progress) {
@@ -153,13 +230,463 @@ void save_minimizer(const gbwtgraph::DefaultMinimizerIndex& index, const std::st
     if (show_progress) {
         std::cerr << "Saving MinimizerIndex to " << filename << std::endl;
     }
-    std::ofstream out(filename, std::ios_base::binary);
-    if (!out) {
-        std::cerr << "error: [save_minimizer()] cannot open file " << filename << " for writing" << std::endl;
+
+    try {
+        std::ofstream out(filename, std::ios_base::binary);
+        if (!out) {
+            throw sdsl::simple_sds::CannotOpenFile(filename, true);
+        }
+        out.exceptions(std::ofstream::badbit | std::ofstream::failbit);
+        index.serialize(out);
+        out.close();
+    } catch (const std::runtime_error& e) {
+        std::cerr << "error: [save_minimizer()] cannot save MinimizerIndex to " << filename << ": " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    index.serialize(out);
-    out.close();
+}
+
+//------------------------------------------------------------------------------
+
+GraphCompatibilityFlags operator|(GraphCompatibilityFlags a, GraphCompatibilityFlags b) {
+    return static_cast<GraphCompatibilityFlags>(static_cast<int>(a) | static_cast<int>(b));
+}
+
+GraphCompatibilityFlags& operator|=(GraphCompatibilityFlags& a, GraphCompatibilityFlags b) {
+    a = a | b;
+    return a;
+}
+
+void require_compatible_graphs_impl(
+    const gbwtgraph::GraphName& first_name, const std::string& first_decription,
+    const gbwtgraph::GraphName& second_name, const std::string& second_description,
+    GraphCompatibilityFlags flags
+) {
+    if (!(flags & GRAPH_COMPATIBILITY_STRICT)) {
+        if (!first_name.has_name() || !second_name.has_name()) {
+            return;
+        }
+    }
+
+    if (first_name.same(second_name)) {
+        return;
+    }
+    if (flags & GRAPH_COMPATIBILITY_SUBGRAPH) {
+        if (first_name.subgraph_of(second_name)) {
+            return;
+        }
+    }
+
+    std::cerr << "error: \"" << first_decription << "\" and \"" << second_description << "\" are not compatible" << std::endl;
+    std::string relationship = first_name.describe_relationship(second_name, first_decription, second_description);
+    std::cerr << relationship << std::endl;
+    std::exit(EXIT_FAILURE);
+}
+
+void require_compatible_reference(
+    const std::string& gaf_filename,
+    const HandleGraph* handle_graph, const gbwtgraph::GBZ* gbz,
+    bool strict
+) {
+    if (handle_graph == nullptr && gbz == nullptr) {
+        return;
+    }
+
+    gbwtgraph::GraphName graph_name;
+    if (gbz != nullptr) {
+        graph_name = gbz->graph_name();
+    } else {
+        // GBZGraph is the only HandleGraph implementation that currently supports graph names.
+        const GBZGraph* gbz_graph = dynamic_cast<const GBZGraph*>(handle_graph);
+        if (gbz_graph == nullptr) {
+            return;
+        }
+        graph_name = gbz_graph->gbz.graph_name();
+    }
+
+    // This will exit if the file does not exist and do nothing if the file is stdin ("-").
+    std::vector<std::string> gaf_header_lines = vg::io::read_gaf_header_lines(gaf_filename);
+    gbwtgraph::GraphName gaf_name(gaf_header_lines);
+
+    GraphCompatibilityFlags flags = GRAPH_COMPATIBILITY_SUBGRAPH;
+    if (strict) {
+        flags |= GRAPH_COMPATIBILITY_STRICT;
+    }
+    require_compatible_graphs_impl(gaf_name, "GAF file", graph_name, "reference graph", flags);
+}
+
+//------------------------------------------------------------------------------
+
+std::string MinimizerIndexParameters::validate() const {
+    if (this->k < 1 || this->k > gbwtgraph::DefaultMinimizerIndex::key_type::KMER_MAX_LENGTH) {
+        return "k-mer length must be between 1 and " + std::to_string(gbwtgraph::DefaultMinimizerIndex::key_type::KMER_MAX_LENGTH);
+    }
+
+    if (this->use_syncmers) {
+        if (this->w_or_s < 1 || this->w_or_s > this->k) {
+            return "s-mer length must be between 1 and k-mer length when using syncmers";
+        }
+        if (this->use_weighted_minimizers) {
+            return "weighted minimizers cannot be used with syncmers";
+        }
+    } else {
+        if (this->w_or_s < 1) {
+            return "window length must be at least 1 when using minimizers";
+        }
+    }
+
+    if (this->use_weighted_minimizers) {
+        if (this->iterations > MAX_ITERATIONS) {
+            return "number of iterations must be at most " + std::to_string(MAX_ITERATIONS) + " when using weighted minimizers";
+        }
+        if (this->hash_table_width != 0 &&
+            (this->hash_table_width < HASH_TABLE_MIN_WIDTH || this->hash_table_width > HASH_TABLE_MAX_WIDTH)) {
+            return "hash table width must be between " + std::to_string(HASH_TABLE_MIN_WIDTH) +
+                   " and " + std::to_string(HASH_TABLE_MAX_WIDTH) + " when using weighted minimizers";
+        }
+    }
+
+    return "";
+}
+
+std::string MinimizerIndexParameters::payload_str(PayloadType type) {
+    switch (type) {
+        case PAYLOAD_NONE:
+            return "none";
+        case PAYLOAD_ZIPCODES:
+            return "zipcodes";
+        case PAYLOAD_ZIPCODES_WITH_PATHS:
+            return "zipcodes with paths";
+        default:
+            return "unknown";
+    }
+}
+
+size_t trailing_zeros(size_t value) {
+    size_t result = 0;
+    if (value == 0) {
+        return result;
+    }
+    while ((value & 1) == 0) {
+        value >>= 1;
+        result++;
+    }
+    return result;
+}
+
+size_t estimate_hash_table_size(const gbwtgraph::GBZ& gbz, bool progress) {
+    if (progress) {
+        std::cerr << "Estimating genome size" << std::endl;
+    }
+    size_t genome_size = 0;
+
+    if (gbz.graph.get_path_count() > 0) {
+        gbz.graph.for_each_path_of_sense({PathSense::REFERENCE, PathSense::GENERIC}, [&](const path_handle_t& path_handle) {
+            std::string path_name = gbz.graph.get_path_name(path_handle);
+            if (!Paths::is_alt(path_name)) {
+                gbz.graph.for_each_step_in_path(path_handle, [&](const step_handle_t& step_handle) {
+                    handle_t handle = gbz.graph.get_handle_of_step(step_handle);
+                    genome_size += gbz.graph.get_length(handle);
+                });
+            }
+        });
+        if (progress) {
+            std::cerr << "Estimated size based on reference / non-alt generic paths: " << genome_size << std::endl;
+        }
+    }
+
+    if (genome_size == 0) {
+        gbz.graph.for_each_handle([&](const handle_t& handle) {
+            genome_size += gbz.graph.get_length(handle);
+        });
+        if (progress) {
+            std::cerr << "Estimated size based on total sequence length: " << genome_size << std::endl;
+        }
+    }
+
+    // Genome size / 2 should be a reasonably tight upper bound for the number of kmers
+    // with any specific base in the middle position.
+    size_t hash_table_size = gbwtgraph::KmerIndex<gbwtgraph::Key64>::minimum_size(genome_size / 2);
+    if (progress) {
+        std::cerr << "Estimated hash table size: 2^" << trailing_zeros(hash_table_size) << std::endl; 
+    }
+
+    return hash_table_size;
+}
+
+using key_type = gbwtgraph::DefaultMinimizerIndex::key_type;
+using code_type = gbwtgraph::KmerEncoding::code_type;
+using payload_t = ZipCode::payload_type;
+
+std::vector<key_type> find_frequent_kmers(const gbwtgraph::GBZ& gbz, const MinimizerIndexParameters& params) {
+    std::vector<key_type> frequent_kmers;
+    if (!params.use_weighted_minimizers) {
+        return frequent_kmers;
+    }
+
+    double start = gbwt::readTimer();
+    if (params.progress) {
+        std::string algorithm = (params.space_efficient_counting ? "space-efficient" : "fast");
+        std::cerr << "Finding frequent kmers using the " << algorithm << " algorithm" << std::endl;
+    }
+    size_t hash_table_size = 0;
+    if (params.hash_table_width == 0) {
+        hash_table_size = estimate_hash_table_size(gbz, params.progress);
+    } else {
+        hash_table_size = size_t(1) << params.hash_table_width;
+    }
+    frequent_kmers = gbwtgraph::frequent_kmers<gbwtgraph::Key64>(
+        gbz.graph, params.k, params.threshold, params.space_efficient_counting, hash_table_size
+    );
+    if (params.progress) {
+        double seconds = gbwt::readTimer() - start;
+        std::cerr << "Found " << frequent_kmers.size() << " kmers with more than " << params.threshold << " hits in " << seconds << " seconds" << std::endl;
+    }
+
+    return frequent_kmers;
+}
+
+// Fills `payload_by_offset` with the zipcode payload for every node.
+// The vector is dense-indexed by `(node_id - min_node_id)`, not by the node id
+// itself; it must be pre-sized so that the largest offset fits, and slots for
+// node ids that do not exist in the graph stay at `MIPayload::NO_CODE`.
+// Oversized zipcodes are appended to `oversized_zipcodes` if non-null, and the 
+// payload stores their offset inside that collection. 
+// Filling runs in parallel: every node writes to a
+// disjoint slot, and access to `oversized_zipcodes` is serialised.
+void cache_payloads(
+    const gbwtgraph::GBZ& gbz,
+    const SnarlDistanceIndex& distance_index,
+    std::vector<payload_t>& payload_by_offset,
+    nid_t min_node_id,
+    ZipCodeCollection* oversized_zipcodes,
+    bool progress
+) {
+    double start = gbwt::readTimer();
+    if (progress) {
+        std::cerr << "Caching payloads" << std::endl;
+    }
+
+    const handlegraph::HandleGraph* graph_ptr = (const handlegraph::HandleGraph*) &gbz.graph;
+
+    double total_zipcode_time = 0.0, total_decoder_time = 0.0;
+    std::atomic<uint64_t> node_count = 0;
+    gbz.graph.for_each_handle([&](const handle_t& handle) {
+        nid_t node_id = gbz.graph.get_id(handle);
+        pos_t pos = make_pos_t(node_id, false, 0);
+        ZipCode zipcode;
+        zipcode.fill_in_zipcode_from_pos(distance_index, pos, false, graph_ptr);
+        zipcode.fill_in_full_decoder();
+        if (++node_count % 10000 == 0 && progress) {
+            double telapsed = gbwt::readTimer() - start;
+            #pragma omp critical (cerr)
+            std::cerr << "  Cached " << node_count << " nodes in " << telapsed << "s" << std::endl;
+        }
+
+        payload_t payload = zipcode.get_payload_from_zip();
+        if (payload == MIPayload::NO_CODE && oversized_zipcodes != nullptr) {
+            // The zipcode is too large for the payload field.
+            // Add it to the oversized zipcode list.
+            zipcode.fill_in_full_decoder();
+            size_t offset;
+            #pragma omp critical (oversized_zipcodes)
+            {
+                offset = oversized_zipcodes->size();
+                oversized_zipcodes->emplace_back(zipcode);
+            }
+            payload = { 0, offset };
+        }
+        payload_by_offset[node_id - min_node_id] = payload;
+    }, true);
+
+    if (progress) {
+        double seconds = gbwt::readTimer() - start;
+        std::cerr << "Cached payloads in " << seconds << " seconds" << std::endl;
+    }
+}
+
+gbwtgraph::DefaultMinimizerIndex build_minimizer_index(
+    const gbwtgraph::GBZ& gbz,
+    const SnarlDistanceIndex* distance_index,
+    ZipCodeCollection* oversized_zipcodes,
+    const MinimizerIndexParameters& params,
+    bool require_path_payloads
+) {
+    double start = gbwt::readTimer();
+
+    Logger logger("build_minimizer_index");
+
+    // Minimal validation to avoid inconsistent parameters that would
+    // otherwise require manual handling.
+    std::string err = params.validate();
+    if (!err.empty()) {
+        logger.error() << err << std::endl;
+    }
+
+    // Count the distinct samples that we might use for the payload.
+    // TODO: We're counting the magic generic samples here.
+    size_t sample_count = gbz.graph.index->metadata.sample_names.size();
+
+    // Consider reasons we can't index paths.
+    // Don't put the paths in if we think they won't fit.
+    bool too_many_samples = sample_count > gbwtgraph::MAX_PATH_IDS;
+    // Don't put the paths in if they would fit but were generated as a path
+    // cover.
+    bool has_path_cover = false;
+    if (!too_many_samples) {
+        // Check if any samples in the GBZ are path cover samples
+        for (size_t i = 0; i < sample_count; i++) {
+            // Look at the name of each sample
+            std::string sample_name = gbz.graph.index->metadata.sample(i);
+            // See if it starts with the path cover prefix.
+            // TODO: Use C++20 starts_with when available
+            // See <https://stackoverflow.com/a/40441240>
+            if (sample_name.rfind(gbwtgraph::COVER_PATH_SAMPLE_PREFIX, 0) == 0) {
+                has_path_cover = true;
+                break;
+            }
+        }
+    }
+
+    // Determine payload size and type code.
+    size_t payload_size = 0;
+    MinimizerIndexParameters::PayloadType payload_type = MinimizerIndexParameters::PAYLOAD_NONE;
+    if (distance_index != nullptr) {
+        payload_size = MinimizerIndexParameters::ZIPCODE_PAYLOAD_SIZE;
+        if (!too_many_samples && !has_path_cover) {
+            // We can track the paths for recombination-aware mapping
+            payload_size++;
+            payload_type = MinimizerIndexParameters::PAYLOAD_ZIPCODES_WITH_PATHS;
+        } else {
+            payload_type = MinimizerIndexParameters::PAYLOAD_ZIPCODES;
+        }
+    }
+    if (require_path_payloads && payload_type != MinimizerIndexParameters::PAYLOAD_ZIPCODES_WITH_PATHS) {
+        // We want to bail out before doing all the indexing if we aren't going to have path info.
+        std::stringstream ss;
+        ss << "Cannot build minimizer index supporting recombination-aware mapping";
+        if (too_many_samples) {
+            ss << " because GBZ contains " << sample_count << " samples, more than the limit of " << gbwtgraph::MAX_PATH_IDS;
+        } else if (has_path_cover) {
+            ss << " because GBZ contains path cover samples starting with \""
+                << gbwtgraph::COVER_PATH_SAMPLE_PREFIX << "\"";
+        }
+        ss << std::endl;
+        logger.error() << ss.str();
+    }
+    std::string payload_str = MinimizerIndexParameters::payload_str(payload_type);
+
+    // Create an empty minimizer index.
+    std::vector<key_type> frequent_kmers = find_frequent_kmers(gbz, params);
+    gbwtgraph::DefaultMinimizerIndex index(params.k, params.w_or_s, payload_size, params.use_syncmers);
+    if (params.use_weighted_minimizers && !frequent_kmers.empty()) {
+        index.add_frequent_kmers(frequent_kmers, params.iterations);
+    }
+    index.set_tag(MinimizerIndexParameters::PAYLOAD_KEY, payload_str);
+
+    // Build the index.
+    if (params.progress) {
+        auto s = logger.info() << "Building MinimizerIndex with k = " << index.k();
+        if (index.uses_syncmers()) {
+            s << ", s = " << index.s();
+        } else {
+            s << ", w = " << index.w();
+        }
+        s << ", payload = " << payload_str << std::endl;
+    }
+
+    if (distance_index == nullptr) {
+        gbwtgraph::index_haplotypes(gbz, index, [](const pos_t&) { return nullptr; });
+    } else {
+        // Cache payloads before building the index.
+        // A zipcode only depends on the node id. The cache is a dense vector indexed
+        // by (node_id - min_node_id), not by the node id itself: this lets us
+        // fill it in parallel without synchronisation, since every node writes
+        // to a disjoint slot.
+        nid_t min_node_id = gbz.graph.min_node_id();
+        nid_t max_node_id = gbz.graph.max_node_id();
+        std::vector<payload_t> payload_by_offset(max_node_id - min_node_id + 1, MIPayload::NO_CODE);
+        cache_payloads(gbz, *distance_index, payload_by_offset, min_node_id, oversized_zipcodes, params.progress);
+
+        auto get_payload = [&](const pos_t& pos) -> const code_type* {
+            nid_t nid = id(pos);
+            if (nid < min_node_id || nid - min_node_id >= payload_by_offset.size()) {
+                return reinterpret_cast<const code_type*>(&MIPayload::NO_CODE);
+            }
+            return reinterpret_cast<const code_type*>(&payload_by_offset[nid - min_node_id]);
+        };
+        if (payload_type == MinimizerIndexParameters::PAYLOAD_ZIPCODES_WITH_PATHS) {
+            gbwtgraph::index_haplotypes_with_paths(gbz, index, get_payload);
+        } else {
+            gbwtgraph::index_haplotypes(gbz, index, get_payload);
+        }
+    }
+
+    // Index statistics.
+    if (params.progress) {
+        logger.info() << index.size() << " keys (" << index.unique_keys() << " unique)" << std::endl;
+        logger.info() << "Minimizer occurrences: " << index.number_of_values() << std::endl;
+        logger.info() << "Load factor: " << index.load_factor() << std::endl;
+        double seconds = gbwt::readTimer() - start;
+        logger.info() << "Construction time: " << seconds << " seconds" << std::endl;
+    }
+
+    return index;
+}
+
+void require_payload(const gbwtgraph::DefaultMinimizerIndex& index, MinimizerIndexParameters::PayloadType expected_payload) {
+    std::string found = index.get_tag(MinimizerIndexParameters::PAYLOAD_KEY);
+    std::string expected_str = MinimizerIndexParameters::payload_str(expected_payload);
+    if (found != expected_str) {
+        std::cerr << "error: expected a minimizer index with payload type \""
+            << expected_str << "\" but found \"" << found << "\"" << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+void require_payload(
+    const gbwtgraph::DefaultMinimizerIndex& index,
+    const std::vector<MinimizerIndexParameters::PayloadType>& expected_payloads
+) {
+    std::string found = index.get_tag(MinimizerIndexParameters::PAYLOAD_KEY);
+    for (MinimizerIndexParameters::PayloadType type : expected_payloads) {
+        std::string expected_str = MinimizerIndexParameters::payload_str(type);
+        if (found == expected_str) {
+            return;
+        }
+    }
+    std::cerr << "error: expected a minimizer index with one of payload types {";
+    for (size_t i = 0; i < expected_payloads.size(); ++i) {
+        std::cerr << " \"" << MinimizerIndexParameters::payload_str(expected_payloads[i]) << "\"";
+        if (i + 1 < expected_payloads.size()) {
+            std::cerr << ",";
+        }
+    }
+    std::cerr << " } but found \"" << found << "\"" << std::endl;
+    std::exit(EXIT_FAILURE);
+}
+
+// TODO: I couldn't figure out a way to factor out a checker/stringifier
+// function and share code between require_payload() and has_payload() without
+// some cost for the abstraction.
+
+bool has_payload(const gbwtgraph::DefaultMinimizerIndex& index, MinimizerIndexParameters::PayloadType payload) {
+    std::string found = index.get_tag(MinimizerIndexParameters::PAYLOAD_KEY);
+    std::string expected_str = MinimizerIndexParameters::payload_str(payload);
+    return found == expected_str;
+}
+
+bool has_payload(
+    const gbwtgraph::DefaultMinimizerIndex& index,
+    const std::vector<MinimizerIndexParameters::PayloadType>& payloads
+) {
+    std::string found = index.get_tag(MinimizerIndexParameters::PAYLOAD_KEY);
+    for (MinimizerIndexParameters::PayloadType type : payloads) {
+        std::string expected_str = MinimizerIndexParameters::payload_str(type);
+        if (found == expected_str) {
+            return true;
+        }
+    }
+    return false;
 }
 
 //------------------------------------------------------------------------------

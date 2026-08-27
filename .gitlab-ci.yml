@@ -7,11 +7,15 @@
 # Make sure to use :latest so we re-check and re-pull if needed on every run.
 image: quay.io/vgteam/vg_ci_prebake:latest
 
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+
 before_script:
   - sudo apt-get -q -y update
   # Make sure we have some curl stuff for pycurl which we need for some Python stuff
   # And the CI report upload needs uuidgen from uuid-runtime
-  - sudo apt-get -q -y install --no-upgrade docker.io python3-pip python3-virtualenv libcurl4-gnutls-dev python-dev npm nodejs node-gyp uuid-runtime libgnutls28-dev doxygen libzstd-dev bcftools
+  - sudo apt-get -q -y install --no-upgrade docker.io python3-pip python3-virtualenv libcurl4-gnutls-dev python-dev-is-python3 npm nodejs node-gyp uuid-runtime libgnutls28-dev libzstd-dev bcftools bwa graphviz
   - which junit-merge || sudo npm install -g junit-merge
   # Configure Docker to use a mirror for Docker Hub and restart the daemon
   - |
@@ -62,12 +66,17 @@ stages:
 # still takes longer than the Docker build, so we put it in the test stage
 # alongside other longer jobs.
 local-build-test-job:
+  interruptible: true
   stage: test
   cache:
     # Gitlab isn't clever enough to fill PR caches from the main branch, so we
     # just use one megacache and hope the Makefile is smart enough to recover
-    # from the future
-    key: local-build-test-cache
+    # from the future.
+    #
+    # We make sure to key this on compiler version because the linker might
+    # demand object files from its own GCC version for link-time optimization
+    # (LTO). See <https://gcc.gnu.org/legacy-ml/gcc/2019-06/msg00231.html>.
+    key: local-build-test-cache-gcc-$COMPILER_VERSION
     paths:
       - deps/
       - include/
@@ -76,6 +85,9 @@ local-build-test-job:
       - obj/
   before_script:
     - sudo apt-get -q -y update
+    - sudo apt-get install -y gcc-${COMPILER_VERSION} g++-${COMPILER_VERSION} bwa graphviz
+    - sudo rm -f /usr/bin/gcc && sudo ln -s /usr/bin/gcc-${COMPILER_VERSION} /usr/bin/gcc
+    - sudo rm -f /usr/bin/g++ && sudo ln -s /usr/bin/g++-${COMPILER_VERSION} /usr/bin/g++
     # We need to make sure we get the right submodule files for this version
     # and don't clobber sources with the cache. We want to have a dirty state
     # with the correct source files.
@@ -86,8 +98,6 @@ local-build-test-job:
   script:
     - THREADS=8
     - nvm version
-    - python3 ./configure.py
-    - source ./source_me.sh
     - make get-deps
     - make -j${THREADS}
     - echo Testing
@@ -96,6 +106,8 @@ local-build-test-job:
     - make test
     - make static -j${THREADS}
     # Also test as a backend for the tube map
+    # Tube map expects vg on PATH
+    - export PATH="$(pwd)/bin:${PATH}"
     - git clone https://github.com/vgteam/sequenceTubeMap.git
     - cd sequenceTubeMap
     # Tube map expects local IPv6 but Kubernetes won't let us have it
@@ -110,10 +122,47 @@ local-build-test-job:
   variables:
     VG_FULL_TRACEBACK: "1"
     GIT_SUBMODULE_STRATEGY: none
+    COMPILER_VERSION: 11
+
+# Ensure vg builds on the oldest supported compiler version.
+oldest-supported-compiler-job:
+  interruptible: true
+  stage: test
+  cache:
+    key: oldest-supported-compiler-cache-gcc-$COMPILER_VERSION
+    paths:
+      - deps/
+      - include/
+      - lib/
+      - bin/
+      - obj/
+  before_script:
+    - sudo apt-get -q -y update
+    - sudo apt-get install -y gcc-${COMPILER_VERSION} g++-${COMPILER_VERSION}
+    - sudo rm -f /usr/bin/gcc && sudo ln -s /usr/bin/gcc-${COMPILER_VERSION} /usr/bin/gcc
+    - sudo rm -f /usr/bin/g++ && sudo ln -s /usr/bin/g++-${COMPILER_VERSION} /usr/bin/g++
+    # We need to make sure we get the right submodule files for this version
+    # and don't clobber sources with the cache. We want to have a dirty state
+    # with the correct source files.
+    - scripts/restore-deps.sh
+  script:
+    - THREADS=8
+    # Ensure that the version used here is also the version in the README.
+    - grep "will need GCC version ${COMPILER_VERSION}" README.md
+    - make get-deps
+    - make -j${THREADS}
+  after_script: []
+  variables:
+    VG_FULL_TRACEBACK: "1"
+    GIT_SUBMODULE_STRATEGY: none
+    # DO NOT change this version number without updating the README to reflect
+    # the requirement bump.
+    COMPILER_VERSION: 10
 
 
 # We define one job to do the Docker container build
 build-job:
+  interruptible: true
   stage: build
   script:
     - CI_REPO=${CI_REGISTRY}/vgteam/vg
@@ -122,13 +171,15 @@ build-job:
     - PLATFORMS=linux/amd64
     - THREADS=8
     - DOCKER_TAG=ci-${CI_PIPELINE_IID}-${CI_COMMIT_SHA}
+    # Before the build, make sure linting passes to fail fast.
+    - make lint
     - make version
     # Connect so we can upload our images
     - docker login -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}" "${CI_REGISTRY}"
     # Note that A LOCAL CACHE CAN ONLY HOLD ONE TAG/TARGET AT A TIME!
     # And Quay can't use mode=max registry caching to cache the intermediate targets with the final image, just inline caching.
     # So we have to do the Complicated Cache Shuffle.
-    - echo " Build base image from branch and mainline base caches to local cache"
+    - echo "Build base image from branch and mainline base caches to local cache"
     - docker buildx build --cache-from type=registry,ref=${CI_REPO}:${MAINLINE_CACHE_TAG}-base --cache-from type=registry,ref=${CI_REPO}:${CACHE_TAG}-base --cache-from type=local,src=${HOME}/docker-cache/base --cache-to type=local,dest=${HOME}/docker-cache/base --platform="${PLATFORMS}" --build-arg THREADS=${THREADS} --target base -t ${CI_REPO}:${CACHE_TAG}-base -f Dockerfile .
     - echo "Push base image from local cache to registry cache for branch."
     - docker buildx build --cache-from type=local,src=${HOME}/docker-cache/base --cache-to type=inline --platform="${PLATFORMS}" --build-arg THREADS=${THREADS} --target base -t ${CI_REPO}:${CACHE_TAG}-base -f Dockerfile --push .
@@ -144,12 +195,16 @@ build-job:
     - docker buildx build --cache-from type=local,src=${HOME}/docker-cache/base --cache-from type=local,src=${HOME}/docker-cache/build --cache-from type=local,src=${HOME}/docker-cache/run --cache-to type=inline --platform="${PLATFORMS}" --build-arg THREADS=${THREADS} --target run -t ${CI_REPO}:${DOCKER_TAG} -f Dockerfile --push .
   variables:
     GIT_SUBMODULE_STRATEGY: recursive
+    # Work around <https://gitlab.com/gitlab-org/gitlab-runner/-/work_items/39384>
+    # See <https://gitlab.com/gitlab-org/gitlab-runner/-/work_items/38908>
+    GIT_STRATEGY: clone
 
 # The arm container build takes like 90 minutes, so we don't want to run it
 # before the main test phase where the other long tests live.
 # To ship a final production Docker tag, we need the ARM and x86 builds
 # happening in the same command so we can push one multiarch manifest.
 production-build-job:
+  interruptible: true
   stage: test
   only:
     - /^arm/
@@ -165,8 +220,6 @@ production-build-job:
     # Determine what we should be tagging vg Dockers as. If we're running on a Git tag we want to use that. Otherwise push over the tag we made already.
     - if [[ ! -z "${CI_COMMIT_TAG}" ]]; then DOCKER_TAG="${CI_COMMIT_TAG}" ; else DOCKER_TAG="ci-${CI_PIPELINE_IID}-${CI_COMMIT_SHA}"; fi
     - make version
-    # Make sure ARM emulation is available.
-    - if [[ "${CI_BUILDKIT_DRIVER}" != "kubernetes" ]] ; then docker run --privileged --rm tonistiigi/binfmt --install all || true ; fi
     # TODO: deduplicate this code with normal build above
     # Note that A LOCAL CACHE CAN ONLY HOLD ONE TAG/TARGET AT A TIME!
     # And Quay can't use mode=max registry caching to cache the intermediate targets with the final image, just inline caching.
@@ -193,15 +246,19 @@ production-build-job:
     # manage to hit a 6 hour timeout on our extremely slow emulators.
   variables:
     GIT_SUBMODULE_STRATEGY: recursive
+    # Work around <https://gitlab.com/gitlab-org/gitlab-runner/-/work_items/39384>
+    # See <https://gitlab.com/gitlab-org/gitlab-runner/-/work_items/38908>
+    GIT_STRATEGY: clone
 
 # We also run the toil-vg/pytest-based tests
 # Note that WE ONLY RUN TESTS LISTED IN vgci/test-list.txt
 test-job:
+  interruptible: true
   stage: test
   # Run in parallel, setting CI_NODE_INDEX and CI_NODE_TOTAL
   # We will find our share of tests from vgci/test-list.txt and run them
   # We ought to run one job per test, but we can wrap around.
-  parallel: 6
+  parallel: 7
   cache:
     key: docker-pull-cache
     paths:
@@ -243,6 +300,7 @@ test-job:
 
 # We have a final job in the last stage to compose an HTML report
 report-job:
+  interruptible: true
   stage: report
   # Run this even when the tests fail, because otherwise we won't hear about it.
   # Hopefully if the actual build failed we fail at the docker pull and we don't upload stuff for no version.
@@ -262,8 +320,17 @@ report-job:
     
 # We need a separate job to build the Doxygen docs
 docs-job:
+    interruptible: true
     stage: build
+    before_script:
+      # Install a minimal set of dependencies for building the docs.
+      # We throw in rsync and git because we do need them, even if they're
+      # already definitely in the base image we use, because we don't want our
+      # dependency list weirdly split between here and the base image.
+      - sudo apt-get -q -y update
+      - sudo apt-get -q -y install --no-upgrade doxygen graphviz rsync git
     script:
       - doc/publish-docs.sh
+    after_script: []
    
   

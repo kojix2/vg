@@ -22,55 +22,56 @@ using namespace std;
 using namespace vg;
 using namespace vg::subcommand;
 
-void help_circularize(char** argv){
+void help_circularize(char** argv) {
     cerr << "usage: " << argv[0] << " circularize [options] <graph.vg> > [circularized.vg]" << endl
-        << "Makes specific paths or nodes in a graph circular." << endl
-        << endl
-        << "options:" << endl
-        << "    -p  --path  <PATHNAME>  circularize the path by connecting its head/tail node." << endl
-        << "    -P, --pathfile <PATHSFILE> circularize all paths in the provided file." << endl
-        << "    -a, --head  <node_id>   circularize a head and tail node (must provide a tail)." << endl
-        << "    -z, --tail  <tail_id>   circularize a head and tail node (must provide a head)." << endl
-        << "    -d  --describe          list all the paths in the graph."   << endl
-        << endl;
+         << "Make specific paths or nodes in a graph circular by connecting head/tail." << endl
+         << endl
+         << "options:" << endl
+         << "  -p, --path NAME         circularize the path [may repeat]" << endl
+         << "  -P, --pathfile FILE     circularize all paths in the provided file" << endl
+         << "  -a, --head ID           circularize a head and tail node (must provide a tail)" << endl
+         << "  -z, --tail ID           circularize a head and tail node (must provide a head)" << endl
+         << "  -h, --help              print this help message to stderr and exit" << endl;
     exit(1);
 }
 
-int main_circularize(int argc, char** argv){
+int main_circularize(int argc, char** argv) {
+    Logger logger("vg circularize");
     if (argc == 2){
         help_circularize(argv);
         exit(1);
     }
 
-    string path = "";
+    vector<string> paths_to_circularize;
     string pathfile = "";
-    bool describe = false;
-    vg::id_t head = -1;
-    vg::id_t tail = -1;
+    const vg::id_t DEFAULT_ID = std::numeric_limits<nid_t>::max();
+    vg::id_t head = DEFAULT_ID;
+    vg::id_t tail = DEFAULT_ID;
 
 
     int c;
     optind = 2;
-    while (true){
+    while (true) {
         static struct option long_options[] =
         {
+            {"help", no_argument, 0, 'h'},
             {"path", required_argument, 0, 'p'},
             {"pathfile", required_argument, 0, 'P'},
             {"head", required_argument, 0, 'a'},
             {"tail", required_argument, 0, 'z'},
-            {"describe", required_argument, 0, 'd'},
+            {"describe", no_argument, 0, 'd'},
             {0,0,0,0}
         };
 
 
-    int option_index = 0;
-    c = getopt_long (argc, argv, "hdp:P:a:z:",
-            long_options, &option_index);
-    if (c == -1){
-        break;
-    }
+        int option_index = 0;
+        c = getopt_long (argc, argv, "h?dp:P:a:z:",
+                        long_options, &option_index);
+        if (c == -1) {
+            break;
+        }
 
-        switch(c){
+        switch(c) {
             case 'a':
                 head = parse<int>(optarg);
                 break;
@@ -78,47 +79,43 @@ int main_circularize(int argc, char** argv){
                 tail = parse<int>(optarg);
                 break;
             case 'p':
-                path = optarg;
+                paths_to_circularize.emplace_back(optarg);
                 break;
             case 'P':
-                pathfile = optarg;
+                pathfile = require_exists(logger, optarg);
                 break;
             case 'd':
-                describe = true;
+                logger.error() << "vg circularize --describe has been removed."
+                               << " Use vg paths --list" << std::endl;
                 break;
             case 'h':
             case '?':
                 help_circularize(argv);
                 exit(1);
-                break;
 
             default:
                 abort();
         }
     }
 
-    vector<string> paths_to_circularize;
-    if (!((head * tail) > 0)){
-        cerr << "Both a head and tail node must be provided" << endl;
-        help_circularize(argv);
-        exit(1);
+    if ((head == DEFAULT_ID) != (tail == DEFAULT_ID)) {
+        logger.error() << "Both a head and tail node must be provided" << endl;
+    } else if (tail < head) {
+        logger.error() << "Tail " << tail << " is smaller than head " << head << endl;
     }
-    if  (pathfile != ""){
+
+    if (pathfile != "") {
         string line;
         ifstream pfi;
         pfi.open(pathfile);
-        if (!pfi.good()){
-            cerr << "There is an error with the input file." << endl;
+        if (!pfi.good()) {
             help_circularize(argv);
+            logger.error() << "There is an error with the input file." << endl;
         }
-        while (getline(pfi, line)){
+        while (getline(pfi, line)) {
             paths_to_circularize.push_back(line);
         }
         pfi.close();
-
-    }
-    else if (path != ""){
-        paths_to_circularize.push_back(path);
     }
 
     // TODO: if we settle on a uniform serialzation method that covers the VG class, the code is ready to be switched
@@ -127,40 +124,27 @@ int main_circularize(int argc, char** argv){
         graph = new VG(in);
     });
 
-    // Check if paths are in graph:
-    for (const string& p : paths_to_circularize){
-        if (!graph->has_path(p)){
-            cerr << "ERROR: PATH NOT IN GRAPH - " << p << endl;
-            exit(1);
-        }
-    }
-
-    if (describe){
-        graph->for_each_path_handle([&](const path_handle_t& path_handle) {
-            cout << graph->get_path_name(path_handle) << endl;
-        });
-       exit(0);
-    }
-
-    if (head > 0 && tail > head){
+    if (head != DEFAULT_ID) {
         graph->create_edge(graph->get_handle(tail), graph->get_handle(head));
     }
-    else{
-        for (const auto& path_name : paths_to_circularize) {
-            path_handle_t path = graph->get_path_handle(path_name);
-            if (graph->get_step_count(path) > 0) {
-                graph->create_edge(graph->get_handle_of_step(graph->path_back(path)),
-                                   graph->get_handle_of_step(graph->path_begin(path)));
-            }
-            graph->set_circularity(path, true);
+
+    for (const auto& path_name : paths_to_circularize) {
+        if (!graph->has_path(path_name)) {
+            logger.error() << "Path not in graph \"" << path_name << "\"" << endl;
         }
+
+        path_handle_t path = graph->get_path_handle(path_name);
+        if (graph->get_step_count(path) > 0) {
+            graph->create_edge(graph->get_handle_of_step(graph->path_back(path)),
+                                graph->get_handle_of_step(graph->path_begin(path)));
+        }
+        graph->set_circularity(path, true);
     }
     
     graph->serialize_to_ostream(cout);
 //    SerializableHandleGraph* to_serialize = dynamic_cast<SerializableHandleGraph*>(&(*graph));
 //    if (!to_serialize) {
-//        cerr << "error: graph format is not serializable!" << endl;
-//        return 1;
+//        logger.error() << "graph format is not serializable!" << endl;
 //    }
 //    to_serialize->serialize(std::cout);
     

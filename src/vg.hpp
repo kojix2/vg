@@ -859,7 +859,8 @@ public:
 
     /// Keep paths in the given set of path names. Populates kept_names with the names of the paths it actually found to keep.
     /// The paths specified may not overlap. Removes all nodes and edges not used by one of the specified paths.
-    void keep_paths(const set<string>& path_names, set<string>& kept_names);
+    /// If invert is true, instead keeps all paths *not* in the given set of path names.
+    void keep_paths(const set<string>& path_names, set<string>& kept_names, bool invert = false);
     void keep_path(const string& path_name);
 
     /// Path stats.
@@ -1255,12 +1256,6 @@ public:
     /// Collect the subgraph of a Node. TODO: what does that mean?
     void collect_subgraph(Node* node, set<Node*>& subgraph);
 
-    /// Join head nodes of graph to common null node, creating a new single head.
-    Node* join_heads(void);
-    /// Join head nodes of graph to specified node. Optionally from the start/to the end of the new node.
-    void join_heads(Node* node, bool from_start = false);
-    /// Join tail nodes of graph to specified node. Optionally from the start/to the end of the new node.
-    void join_tails(Node* node, bool to_end = false);
     /// Add singular head and tail null nodes to graph.
     void wrap_with_null_nodes(void);
     /// Add a start node and an end node, where all existing heads in the graph

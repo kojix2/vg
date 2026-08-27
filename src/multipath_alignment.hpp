@@ -139,7 +139,7 @@ namespace vg {
     string debug_string(const connection_t& connection);
     string debug_string(const subpath_t& subpath);
     string debug_string(const multipath_alignment_t& multipath_aln);
-    
+
     /// Put subpaths in topological order (assumed to be true for other algorithms)
     void topologically_order_subpaths(multipath_alignment_t& multipath_aln);
     
@@ -336,6 +336,9 @@ namespace vg {
 
     /// Returns true if any subpath has a connection adjacency
     bool contains_connection(const multipath_alignment_t& multipath_aln);
+
+    /// Returns true if the multipath_alignment_t is annotated as supplementary
+    bool is_supplementary(const multipath_alignment_t& multipath_aln);
 
     /// Returns all of the positions where a given sequence index occurs at a given graph
     /// graph position (if any), where positions are represented as tuples of

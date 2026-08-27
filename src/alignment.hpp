@@ -16,72 +16,112 @@
 #include "handle.hpp"
 #include "vg/io/alignment_io.hpp"
 #include <vg/io/alignment_emitter.hpp>
+#include "hts_alignment_emitter.hpp"
 
 namespace vg {
 
 const char* const BAM_DNA_LOOKUP = "=ACMGRSVTWYHKDBN";
 
+// htslib-based alignment read functions.
+// When encountering read records that don't agree with the graph (i.e. go off
+// path ends, etc.), these stop the program and print a useful error message.
+
 int hts_for_each(string& filename, function<void(Alignment&)> lambda);
 int hts_for_each_parallel(string& filename, function<void(Alignment&)> lambda);
 int hts_for_each(string& filename, function<void(Alignment&)> lambda,
-                 const PathPositionHandleGraph* graph);
+                 const PathPositionHandleGraph* graph, bool allow_missing_contig = false);
 int hts_for_each_parallel(string& filename, function<void(Alignment&)> lambda,
-                          const PathPositionHandleGraph* graph);
-int fastq_for_each(string& filename, function<void(Alignment&)> lambda);
+                          const PathPositionHandleGraph* graph, bool allow_missing_contig = false);
 
-// fastq
-bool get_next_alignment_from_fastq(gzFile fp, char* buffer, size_t len, Alignment& alignment);
-bool get_next_interleaved_alignment_pair_from_fastq(gzFile fp, char* buffer, size_t len, Alignment& mate1, Alignment& mate2);
-bool get_next_alignment_pair_from_fastqs(gzFile fp1, gzFile fp2, char* buffer, size_t len, Alignment& mate1, Alignment& mate2);
+// FASTQ-input functions
 
-size_t fastq_unpaired_for_each(const string& filename, function<void(Alignment&)> lambda);
-size_t fastq_paired_interleaved_for_each(const string& filename, function<void(Alignment&, Alignment&)> lambda);
-size_t fastq_paired_two_files_for_each(const string& file1, const string& file2, function<void(Alignment&, Alignment&)> lambda);
+// parsing a FASTQ record, optionally intepreting the comment as SAM-style tags
+bool get_next_alignment_from_fastq(gzFile fp, char* buffer, size_t len, Alignment& alignment, bool comment_as_tags);
+bool get_next_interleaved_alignment_pair_from_fastq(gzFile fp, char* buffer, size_t len, Alignment& mate1, Alignment& mate2, bool comment_as_tags);
+bool get_next_alignment_pair_from_fastqs(gzFile fp1, gzFile fp2, char* buffer, size_t len, Alignment& mate1, Alignment& mate2, bool comment_as_tags);
+
+// parsing a FASTQ or FASTA file, optionally interpreting comments as SAM-style tags
+size_t fastq_unpaired_for_each(const string& filename, function<void(Alignment&)> lambda, bool comment_as_tags = false);
+size_t fastq_paired_interleaved_for_each(const string& filename, function<void(Alignment&, Alignment&)> lambda, bool comment_as_tags = false);
+size_t fastq_paired_two_files_for_each(const string& file1, const string& file2, function<void(Alignment&, Alignment&)> lambda, bool comment_as_tags = false);
 // parallel versions of above
 size_t fastq_unpaired_for_each_parallel(const string& filename,
                                         function<void(Alignment&)> lambda,
+                                        bool comment_as_tags = false,
                                         uint64_t batch_size = vg::io::DEFAULT_PARALLEL_BATCHSIZE);
     
 size_t fastq_paired_interleaved_for_each_parallel(const string& filename,
                                                   function<void(Alignment&, Alignment&)> lambda,
+                                                  bool comment_as_tags = false,
                                                   uint64_t batch_size = vg::io::DEFAULT_PARALLEL_BATCHSIZE);
     
 size_t fastq_paired_interleaved_for_each_parallel_after_wait(const string& filename,
                                                              function<void(Alignment&, Alignment&)> lambda,
                                                              function<bool(void)> single_threaded_until_true,
+                                                             bool comment_as_tags = false,
                                                              uint64_t batch_size = vg::io::DEFAULT_PARALLEL_BATCHSIZE);
     
 size_t fastq_paired_two_files_for_each_parallel(const string& file1, const string& file2,
                                                 function<void(Alignment&, Alignment&)> lambda,
+                                                bool comment_as_tags = false,
                                                 uint64_t batch_size = vg::io::DEFAULT_PARALLEL_BATCHSIZE);
     
 size_t fastq_paired_two_files_for_each_parallel_after_wait(const string& file1, const string& file2,
                                                            function<void(Alignment&, Alignment&)> lambda,
                                                            function<bool(void)> single_threaded_until_true,
+                                                           bool comment_as_tags = false,
                                                            uint64_t batch_size = vg::io::DEFAULT_PARALLEL_BATCHSIZE);
+
+// Functions to read indexed GAF.
+// TODO: move to libvgio?
+
+/// Find each distinct GAF record intersecting any of the given sorted node ID ranges.
+/// Presents the GAF record as a string, even though it is parsed internally.
+/// If you need the gfakluge::GafRecord, refactor this function instead of parsing it again.
+void for_each_gaf_record_in_ranges(htsFile* gaf_fp, tbx_t* gaf_tbx, const vector<pair<vg::id_t, vg::id_t>>& ranges, const std::function<void(const std::string&)>& iteratee);
+
+/// Return True if the given parsed GAF record has any node IDs that occur in the given ID range.
+/// Raises an exception if any GAF path entries aren't ID visits.
+bool gaf_record_intersects_range(const gafkluge::GafRecord& record, const std::pair<nid_t, nid_t>& range);
+
+// More htslib-based functions
 
 bam_hdr_t* hts_file_header(string& filename, string& header);
 bam_hdr_t* hts_string_header(string& header,
-                             const map<string, int64_t>& path_length,
-                             const map<string, string>& rg_sample);
-bam_hdr_t* hts_string_header(string& header,
-                             const vector<pair<string, int64_t>>& path_order_and_length,
+                             const SequenceDictionary& sequence_dictionary,
                              const map<string, string>& rg_sample);
 void write_alignment_to_file(const Alignment& aln, const string& filename);
 
-void mapping_cigar(const Mapping& mapping, vector<pair<int, char> >& cigar);
+/// Add a mapping to a CIGAR string. The mismatch operation character may be
+/// 'M' (the default) to roll them into matches, or 'X' to mark mismatches as a
+/// different operation.
+void mapping_cigar(const Mapping& mapping, vector<pair<int, char> >& cigar, char mismatch_operation = 'M');
 string cigar_string(const vector<pair<int, char> >& cigar);
 string mapping_string(const string& source, const Mapping& mapping);
 
 void cigar_mapping(const bam1_t *b, Mapping& mapping);
 
+/// Convert a BAM record to an Alignment.
+/// May throw AlignmentEmbeddingError if the BAM record is inconsistent with
+/// the provided graph.
+/// Unless set_missing_contig_to_unmapped is true, will also error if a read
+/// is aligned to a contig which is not in the graph.
+/// If true, then those reads are treated as unmapped instead.
 Alignment bam_to_alignment(const bam1_t *b,
                            const map<string, string>& rg_sample,
                            const map<int, path_handle_t>& tid_path_handle,
                            const bam_hdr_t *bh,
-                           const PathPositionHandleGraph* graph);
+                           const PathPositionHandleGraph* graph,
+                           bool set_missing_contig_to_unmapped = false);
+/// Convert a BAM record to an Alignment without a graph.
 Alignment bam_to_alignment(const bam1_t *b, const map<string, string>& rg_sample, const map<int, path_handle_t>& tid_path_handle);
 
+// the CIGAR string of the graph alignment
+vector<pair<int, char>> graph_cigar(const Alignment& aln, bool rev_strand = false);
+// the CS-style (i.e. verbose) CIGAR difference string of the graph alignment
+string graph_CS_cigar(const Alignment& aln, const HandleGraph& graph, bool rev_strand = false);
+// the cs-style (i.e. compact) CIGAR difference string of the graph alignment
+string graph_cs_cigar(const Alignment& aln, const HandleGraph& graph, bool rev_stand = false);
 /**
  * Add a CIGAR operation to a vector representing the parsed CIGAR string.
  *
@@ -201,11 +241,21 @@ int32_t determine_flag(const Alignment& alignment,
 /// suppress softclips up to that length. This will necessitate adjusting pos,
 /// which is why it is passed by reference.
 vector<pair<int, char>> cigar_against_path(const Alignment& alignment, bool on_reverse_strand, int64_t& pos, size_t path_len, size_t softclip_suppress);
+    
+/// Convert a spliced alignment against a path to a cigar. The alignment must be
+/// colinear along a path and contain only mappings on the path, but it can have
+/// deletions relative to the path that follow edges in the graph.
+vector<pair<int, char>> spliced_cigar_against_path(const Alignment& aln, const PathPositionHandleGraph& graph, const string& path_name, 
+                                                   int64_t pos, bool rev, int64_t min_splice_length);
 
 /// Merge runs of successive I/D operations into a single I and D, remove 0-length
 /// operations, and merge adjacent operations of the same type
 void simplify_cigar(vector<pair<int, char>>& cigar);
 
+/// Normalize the adjustment of indels in an alignment to left or right
+/// Optionally: don't allow the ending positions of the alignment to change
+/// even if that requires the alignment to end in a deletion
+void normalize_indel_adjustment(Alignment& aln, bool adjust_left, const HandleGraph& graph, bool preserve_end_pos = false);
 
 /// Translate the CIGAR in the given BAM record into mappings in the given
 /// Alignment against the given path in the given graph.
@@ -238,20 +288,29 @@ Alignment strip_from_start(const Alignment& aln, size_t drop);
 Alignment strip_from_end(const Alignment& aln, size_t drop);
 Alignment trim_alignment(const Alignment& aln, const Position& pos1, const Position& pos2);
 vector<Alignment> alignment_ends(const Alignment& aln, size_t len1, size_t len2);
+/// Get an Alignment corresponding to the middle len bases of the given alignment
 Alignment alignment_middle(const Alignment& aln, int len);
-// generate a digest of the alignmnet
+/// Cut the Alignment into contiguous pieces visiting nodes in the given node set, defined by a membership predicate.
+/// Will pass the original Alignment through if it is fully contained.
+/// Cut pieces will not have score or annotations set, but will keep mapping quality.
+std::vector<Alignment> alignment_pieces_within(const Alignment& aln, const std::function<bool(nid_t)>& node_in_set);
+// generate a digest of the alignment
 const string hash_alignment(const Alignment& aln);
 // Flip the alignment's sequence and is_reverse flag, and flip and re-order its
 // Mappings to match. A function to get node lengths is needed because the
 // Mappings in the alignment will need to give their positions from the opposite
 // ends of their nodes. Offsets will be updated to count unused bases from node
 // start when considering the node in its new orientation.
-Alignment reverse_complement_alignment(const Alignment& aln, const function<int64_t(id_t)>& node_length);
-void reverse_complement_alignment_in_place(Alignment* aln, const function<int64_t(id_t)>& node_length);
-vector<Alignment> reverse_complement_alignments(const vector<Alignment>& alns, const function<int64_t(int64_t)>& node_length);
+Alignment reverse_complement_alignment(const Alignment& aln, const function<int64_t(nid_t)>& node_length);
+void reverse_complement_alignment_in_place(Alignment* aln, const function<int64_t(nid_t)>& node_length);
+vector<Alignment> reverse_complement_alignments(const vector<Alignment>& alns, const function<int64_t(nid_t)>& node_length);
 int non_match_start(const Alignment& alignment);
 int non_match_end(const Alignment& alignment);
+/// Get the leading softclip from an Alignment, assuming it is coalesced into a
+/// single Edit
 int softclip_start(const Alignment& alignment);
+/// Get the trailing softclip from an Alignment, assuming it is coalesced into a
+/// single Edit
 int softclip_end(const Alignment& alignment);
 int softclip_trim(Alignment& alignment);
 int query_overlap(const Alignment& aln1, const Alignment& aln2);
@@ -264,6 +323,24 @@ string signature(const Alignment& aln);
 pair<string, string> signature(const Alignment& aln1, const Alignment& aln2);
 string middle_signature(const Alignment& aln, int len);
 pair<string, string> middle_signature(const Alignment& aln1, const Alignment& aln2, int len);
+/// Return whether the path is a perfect match (i.e. contains no non-match edits)
+/// and has no soft clips (e.g. like in vg stats -a)
+bool is_perfect(const Alignment& alignment);
+bool is_supplementary(const Alignment& alignment);
+// The indexes on the read sequence of the portion of the read that is aligned outside of soft clips
+pair<int64_t, int64_t> aligned_interval(const Alignment& aln);
+
+// create an annotation string required to properly set the SAM fields/flags of a supplementary alignment
+// the arguments all refer to properties of the primary *mate* alignment
+// the path name saved in the info is the base path name, with any subrange info reflected in the position
+string mate_info(const string& path, int32_t pos, bool rev_strand, bool is_read1);
+// parse the annotation string, returns tuple of (mate path name, mate path pos, mate rev strand, mate is read1) 
+tuple<string, int32_t, bool, bool> parse_mate_info(const string& info);
+
+/// Return whether the Alignment represents a mapped read (true) or an
+/// unaligned read (false). Uses the GAM read_mapped flag, but also sniffs for
+/// mapped reads which forgot to set it.
+bool is_mapped(const Alignment& alignment);
 
 // project the alignment's path back into a different ID space
 void translate_nodes(Alignment& a, const unordered_map<id_t, pair<id_t, bool> >& ids, const std::function<size_t(int64_t)>& node_length);
@@ -321,6 +398,13 @@ void alignment_set_distance_to_correct(Alignment& aln, const Alignment& base, co
 void alignment_set_distance_to_correct(Alignment& aln, const map<string, vector<pair<size_t, bool>>>& base_offsets, const unordered_map<string, string>* translation = nullptr);
 
 /**
+ * Stop the program and print a useful error message if the alignment has
+ * quality values, but not the right number of them for the number of sequence
+ * bases. 
+ */
+void check_quality_length(const Alignment& aln);
+
+/**
  * Represents a report on whether an alignment makes sense in the context of a graph.
  */
 struct AlignmentValidity {
@@ -329,6 +413,8 @@ struct AlignmentValidity {
         OK,
         NODE_MISSING,
         NODE_TOO_SHORT,
+        READ_TOO_SHORT,
+        BAD_EDIT,
         SEQ_DOES_NOT_MATCH
     };
     
@@ -336,6 +422,10 @@ struct AlignmentValidity {
     Problem problem = OK;
     /// The mapping in the alignment's path at which the problem was encountered.
     size_t bad_mapping_index = 0;
+    /// The edit within the mapping at which the problem was encountered.
+    size_t bad_edit_index = 0;
+    /// The position in the alignment's read sequence at which the problem was encountered.
+    size_t bad_read_position  = 0;
     /// An explanation for the problem.
     std::string message = "";
     
@@ -349,17 +439,225 @@ struct AlignmentValidity {
 /// node lengths or ids. Result can be used like a bool or inspected for
 /// further details. Does not log anything itself about bad alignments.
 AlignmentValidity alignment_is_valid(const Alignment& aln, const HandleGraph* hgraph, bool check_sequence = false);
-    
+
+/**
+ * Represents a problem when trying to find a path region in a graph as an
+ * Alignment, or when trying to inject a linear CIGAR-based alignment into the
+ * graph along an embedded path.
+ *
+ * This could be a problem like the alignment trying to go out of range on the
+ * embedded linear path/reference, or trying to go across the junction of a
+ * path that isn't really circular.
+ *
+ * We expect the user to be able to cause this with bad inputs, so this
+ * exception should be handled and reported in a helpful way, rather than as a
+ * crash.
+ */
+class AlignmentEmbeddingError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 /// Make an Alignment corresponding to a subregion of a stored path.
 /// Positions are 0-based, and pos2 is excluded.
 /// Respects path circularity, so pos2 < pos1 is not a problem.
 /// If pos1 == pos2, returns an empty alignment.
+///
+/// Throws AlignmentEmbeddingError if the region goes out of range, or tries to
+/// go across the junction of a non-circular path. Despite taking 0-based
+/// coordinates, error messages will describe 1-based coordinates.
 Alignment target_alignment(const PathPositionHandleGraph* graph, const path_handle_t& path, size_t pos1, size_t pos2,
                            const string& feature, bool is_reverse);
-/// Same as above, but uses the given Mapping, translated directly form a CIGAR string, as a source of edits.
+/// Same as above, but uses the given Mapping, translated directly from a CIGAR string, as a source of edits.
 /// The edits are inserted into the generated Alignment, cut as necessary to fit into the Alignment's Mappings.
+///
+/// Throws AlignmentEmbeddingError if the region goes out of range, or tries to
+/// go across the junction of a non-circular path, or if cigar_mapping
+/// describes edits that are impossible, like matches past the end of the
+/// described region. Despite taking 0-based coordinates, error messages will
+/// describe 1-based coordinates.
 Alignment target_alignment(const PathPositionHandleGraph* graph, const path_handle_t& path, size_t pos1, size_t pos2,
                            const string& feature, bool is_reverse, Mapping& cigar_mapping);
+
+
+/// Returns indexes into an vector-like container of Alignments that correspond to supplementary alignments to the primary
+///  min_read_coverage      Require the supplementaries and primary to cover this fraction of the read
+///  max_separation         Require the separation between supplementaries to be at most this many bases
+///  max_overlap            Require the overlap between supplementaries to be at most this many bases
+///  max_uncovered_end      Require the collection of supplementaries to leave at most this many bases uncovered on each end
+///  min_score_fraction     Require each supplementary to have this fraction of the primary's score
+///  min_size               Require each supplementary to align at least this many bases
+template<class AlignmentVector>
+vector<size_t> identify_supplementaries(const AlignmentVector& alignments, double min_read_coverage, size_t max_separation,
+                                        size_t max_overlap, size_t max_uncovered_end, double min_score_fraction, size_t min_size, 
+                                        size_t primary_idx = 0) {
+
+    assert(min_read_coverage >= 0.0 && min_read_coverage <= 1.0 && min_score_fraction >= 0.0 && min_score_fraction <= 1.0);
+
+    vector<size_t> supplementaries;
+
+    if (alignments.size() > 1) {
+
+        size_t seq_size = alignments[0].sequence().size();
+
+        size_t min_total_cov = ceil(min_read_coverage * seq_size);
+        int64_t min_score = ceil(min_score_fraction * alignments[primary_idx].score());
+
+        // do sparse DP over part of the read to determine which set of intervals achieves the highest read coverage, subject
+        // to the constraints
+        // the DP assumes that the primary interval is to the left and the end of the sequence is to the right
+        auto do_dp = [&](vector<tuple<int64_t, int64_t, size_t>>& intervals, int64_t begin, int64_t end, bool* success) -> vector<size_t> {
+
+            std::sort(intervals.begin(), intervals.end());  
+
+            // map from (end index -> (total coverage, final interval))
+            map<int64_t, pair<size_t, size_t>> dp;
+            vector<size_t> backpointer(intervals.size(), numeric_limits<size_t>::max());
+
+            for (size_t i = 0; i < intervals.size(); ++i) {
+
+                const auto& interval = intervals[i];
+                
+                // look for the best feasible previous DP entry
+                // TODO: this could have better worst-case guarantees with a key-value RMQ
+                auto max_it = dp.end();
+                for (auto it = dp.lower_bound(get<0>(interval) - max_separation); it != dp.end() && it->first <= get<0>(interval) + max_overlap; ++it) {
+                    if (max_it == dp.end() || max_it->second.first - max<int64_t>(max_it->first - get<0>(interval), 0) < it->second.first) {
+                        max_it = it;
+                    } 
+                }
+
+                if (max_it != dp.end() || get<0>(interval) <= begin + max_separation) {
+                    // we can make an entry into the DP structure
+
+                    size_t prev_idx = numeric_limits<size_t>::max();
+                    size_t cov = 0;
+                    if (max_it != dp.end()) {
+                        prev_idx = max_it->second.second;
+                        cov = max_it->second.first - max<int64_t>(max_it->second.first - get<0>(interval), 0);
+                    }
+                    cov += get<1>(interval) - get<0>(interval);
+                    backpointer[i] = prev_idx;
+
+                    auto dp_val = make_pair(cov, i);
+                    auto insert_it = dp.emplace(get<1>(interval), dp_val);
+                    if (!insert_it.second) {
+                        // there is already an interval ending at this index, take the max
+                        if (insert_it.first->second.first < dp_val.first) {
+                            insert_it.first->second = dp_val;
+                        }
+                    }
+                }
+            }
+
+            // traceback the optimum
+            vector<size_t> traceback;
+            auto final_it = dp.end();
+            auto it = dp.lower_bound(max<int64_t>(begin, end - max_uncovered_end));
+            while (it != dp.end()) {
+                if (final_it == dp.end() || it->second.first >= final_it->second.first) {
+                    final_it = it;
+                }
+                ++it;
+            }
+            if (final_it != dp.end()) { 
+                // there is a feasible solution
+                traceback.emplace_back(final_it->second.second);
+                while (backpointer[traceback.back()] != numeric_limits<size_t>::max()) {
+                    traceback.emplace_back(backpointer[traceback.back()]);
+                }
+                reverse(traceback.begin(), traceback.end());
+
+                *success = true;
+            }
+            else {
+                *success = false;
+            }
+
+            return traceback;
+        };
+
+        auto primary_interval = aligned_interval(alignments[primary_idx]);
+
+        if (primary_interval.second - primary_interval.first >= min_size && alignments[primary_idx].score() >= min_score) {
+
+            // records of (begin read pos, end read pos, idx of alignment)
+            vector<tuple<int64_t, int64_t, size_t>> left_side, right_side;
+
+            for (size_t i = 0; i < alignments.size(); ++i) {
+                if (i == primary_idx) {
+                    continue;
+                }
+                auto interval = aligned_interval(alignments[i]);
+                // filter to alignments that meet the minimum thresholds
+                if (alignments[i].score() >= min_score && interval.second - interval.first >= min_size) {
+                    if (interval.second <= primary_interval.first + max_overlap) {
+                        // negate the positions so that we can iterate left-to-right in the DP
+                        left_side.emplace_back(-interval.second, -interval.first, i);
+                    }
+                    else if (interval.first >= primary_interval.second - max_overlap) {
+                        right_side.emplace_back(interval.first, interval.second, i);
+                    }
+                }
+            }
+
+            // do DP on each side and combine the tracebacks 
+
+            bool left_success = false, right_success = false;
+            vector<tuple<size_t, size_t, size_t>> full_traceback;
+            // negate the interval of iteration so we can iterate left-to-right
+            for (auto i : do_dp(left_side, -primary_interval.first, 0, &left_success)) {
+                auto& interval = left_side[i];
+                full_traceback.emplace_back(-get<1>(interval), -get<0>(interval), get<2>(interval));
+            }
+            // the negated interval is ordered in reverse, flip it back
+            std::reverse(full_traceback.begin(), full_traceback.end());
+            full_traceback.emplace_back(primary_interval.first, primary_interval.second, primary_idx);
+            for (auto i : do_dp(right_side, primary_interval.second, seq_size, &right_success)) {
+                auto interval = right_side[i];
+                full_traceback.emplace_back(get<0>(interval), get<1>(interval), get<2>(interval));
+            }
+
+            // compute the total read coverage with sweep line algorithm
+            if (!is_sorted(full_traceback.begin(), full_traceback.end())) {
+                // TODO: is this even possible? maybe in some weird cases where the max separation is larger than the min size
+                sort(full_traceback.begin(), full_traceback.end());
+            }
+
+            size_t total_cov = 0;
+            pair<size_t, size_t> curr_interval(0, 0);
+            for (const auto& interval : full_traceback) {
+                if (get<0>(interval) <= curr_interval.second) {
+                    curr_interval.second = max(curr_interval.second, get<1>(interval));
+                }
+                else {
+                    total_cov += (curr_interval.second - curr_interval.first);
+                    curr_interval.first = get<0>(interval);
+                    curr_interval.second = get<1>(interval);
+                }
+            }
+            total_cov += (curr_interval.second - curr_interval.first);
+            if ((left_success || primary_interval.first <= max_uncovered_end) &&
+                (right_success || seq_size - primary_interval.second <= max_uncovered_end) &&
+                total_cov >= min_total_cov) {
+                // the supplementaries and primary jointly cover the entire read, the result of DP is feasible
+                for (auto& interval : full_traceback) {
+                    if (get<2>(interval) != primary_idx) {
+                        supplementaries.push_back(get<2>(interval));
+                    }
+                }
+
+                sort(supplementaries.begin(), supplementaries.end());
+            }
+        }
+    }
+
+    return supplementaries;
+}
+
+
+
+
 
 }
 

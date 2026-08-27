@@ -14,7 +14,7 @@ void RareVariantSimplifier::simplify() {
 
     graph.for_each_path_handle([&](const path_handle_t& path) {
         // For each path
-        
+
         if (!Paths::is_alt(graph.get_path_name(path))) {
             // If it isn't an alt path, we want to trace it
 

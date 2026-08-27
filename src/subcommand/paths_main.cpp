@@ -10,14 +10,20 @@
 
 #include <algorithm>
 #include <iostream>
+#include <fstream>
 
 #include "subcommand.hpp"
 
+#include "../crash.hpp"
 #include "../vg.hpp"
 #include "../xg.hpp"
 #include "../gbwt_helper.hpp"
 #include "../traversal_clusters.hpp"
+#include "../gref.hpp"
+#include "../integrated_snarl_finder.hpp"
+#include "../snarl_distance_index.hpp"
 #include "../io/save_handle_graph.hpp"
+#include <bdsg/overlays/overlay_helper.hpp>
 #include <vg/io/vpkg.hpp>
 #include <vg/io/stream.hpp>
 #include <vg/io/alignment_emitter.hpp>
@@ -29,35 +35,55 @@ using namespace vg::subcommand;
 
 void help_paths(char** argv) {
     cerr << "usage: " << argv[0] << " paths [options]" << endl
-         << "options:" << endl
-         << "  input:" << endl
-         << "    -x, --xg FILE            use the paths and haplotypes in this graph FILE. Supports GBZ haplotypes." <<endl
-         << "                             (Also accepts -v, --vg)" << endl
-         << "    -g, --gbwt FILE          use the threads in the GBWT index in FILE" << endl
-         << "                             (graph also required for most output options; -g takes priority over -x)" << endl
-         << "  output graph (.vg format)" << endl
-         << "    -V, --extract-vg         output a path-only graph covering the selected paths" << endl
-         << "    -d, --drop-paths         output a graph with the selected paths removed" << endl
-         << "    -r, --retain-paths       output a graph with only the selected paths retained" << endl
-         << "    -n, --normalize-paths    output a graph where all equivalent paths in a site a merged (using selected paths to snap to if possible)" << endl 
-         << "  output path data:" << endl
-         << "    -X, --extract-gam        print (as GAM alignments) the stored paths in the graph" << endl
-         << "    -A, --extract-gaf        print (as GAF alignments) the stored paths in the graph" << endl
-         << "    -L, --list               print (as a list of names, one per line) the path (or thread) names" << endl
-         << "    -E, --lengths            print a list of path names (as with -L) but paired with their lengths" << endl
-         << "    -M, --metadata           print a table of path names and their metadata" << endl
-         << "    -C, --cyclicity          print a list of path names (as with -L) but paired with flag denoting the cyclicity" << endl
-         << "    -F, --extract-fasta      print the paths in FASTA format" << endl
-         << "    -c, --coverage           print the coverage stats for selected paths (not including cylces)" << endl
-         << "  path selection:" << endl
-         << "    -p, --paths-file FILE    select the paths named in a file (one per line)" << endl
-         << "    -Q, --paths-by STR       select the paths with the given name prefix" << endl
-         << "    -S, --sample STR         select the haplotypes or reference paths for this sample" << endl
-         << "    -a, --variant-paths      select the variant paths added by 'vg construct -a'" << endl
-         << "    -G, --generic-paths      select the generic, non-reference, non-haplotype paths" << endl
-         << "    -R, --reference-paths    select the reference paths" << endl
-         << "    -H, --haplotype-paths    select the haplotype paths paths" << endl
-         << "    -t, --threads N          number of threads to use [all available]. applies only to snarl finding within -n" << endl;
+         << "  -h, --help                print this help message to stderr and exit" << endl
+         << "input:" << endl
+         << "  -x, --xg FILE             use the paths and haplotypes in this graph FILE" << endl
+         << "                            Supports GBZ haplotypes. (also accepts -v, --vg)" << endl
+         << "  -g, --gbwt FILE           use the threads in the GBWT index in FILE instead " << endl
+         << "                            of graph paths (graph also required for most output " << endl
+         << "                            options)" << endl
+         << "output graph (.vg format):" << endl
+         << "  -d, --drop-paths          output a graph with the selected paths removed" << endl
+         << "  -r, --retain-paths        output a graph with only the selected paths retained" << endl
+         << "  -n, --normalize-paths     output a graph where equivalent paths in a site are" << endl
+         << "                            merged (using selected paths to snap to if possible)" << endl
+         << "output path data:" << endl
+         << "  -X, --extract-gam         print (as GAM alignments) stored paths in the graph" << endl
+         << "  -A, --extract-gaf         print (as GAF alignments) stored paths in the graph" << endl
+         << "  -L, --list                print (one per line) path (or thread) names" << endl
+         << "  -E, --lengths             print a list of path names (as with -L)" << endl
+         << "                            but paired with their lengths" << endl
+         << "  -M, --metadata            print a table of path names and their metadata" << endl
+         << "  -C, --cyclicity           print a list of path names (as with -L)" << endl
+         << "                            but paired with flag denoting the cyclicity" << endl
+         << "  -F, --extract-fasta       print the paths in FASTA format" << endl
+         << "  -c, --coverage            print the coverage stats for selected paths" << endl
+         << "                            (not including cycles)" << endl
+         << "path selection:" << endl
+         << "  -p, --paths-file FILE     select paths named in a file (one per line)" << endl
+         << "  -Q, --paths-by STR        select paths with the given name prefix" << endl
+         << "  -S, --sample STR          select haplotypes or reference paths for this sample" << endl
+         << "  -a, --variant-paths       select variant paths added by 'vg construct -a'" << endl
+         << "  -G, --generic-paths       select generic, non-reference, non-haplotype paths" << endl
+         << "  -R, --reference-paths     select reference paths" << endl
+         << "  -H, --haplotype-paths     select haplotype paths" << endl
+         << "      --exclude-sample STR  exclude paths belonging to this sample" << endl
+         << "graph reference computation:" << endl
+         << "  -u, --compute-gref        compute graph reference path cover, written as" << endl
+         << "                            a gref_ copy of each reference path plus the" << endl
+         << "                            fragments hanging off it (GRCh38#0#chr1 gives" << endl
+         << "                            gref_GRCh38#0#chr1, gref_GRCh38#0#chr1_1_alt...)" << endl
+         << "                            (use -Q to select reference paths)" << endl
+         << "  -l, --min-gref-len N      minimum gref fragment length [50]" << endl
+         << "      --gref-segs FILE      write a table of the gref fragments to FILE, one" << endl
+         << "                            row each, with a '#' header naming the columns." << endl
+         << "                            Columns 1-6 are a BED6 on the source haplotype" << endl
+         << "configuration:" << endl
+         << "  -o, --overlay             apply a ReferencePathOverlayHelper to the graph" << endl
+         << "  -t, --threads N           number of threads to use [all available]" << endl
+         << "                            applies to -n (snarl finding) and -u (gref)" << endl
+         << "      --progress, --verbose print progress and gref coverage summary" << endl;
+
 }
 
 /// Chunk a path and emit it in Graph messages.
@@ -67,7 +93,7 @@ void chunk_to_emitter(const Path& path, vg::io::ProtobufEmitter<Graph>& graph_em
                     
     for (size_t start = 0; start < path.mapping_size(); start += chunk_size) {
         // Make sure to chunk.
-        // TODO: Can we avoild a copy here somehow?
+        // TODO: Can we avoid a copy here somehow?
         Path chunk;
         chunk.set_name(path.name());
         chunk.set_is_circular(path.is_circular());
@@ -77,7 +103,7 @@ void chunk_to_emitter(const Path& path, vg::io::ProtobufEmitter<Graph>& graph_em
             *chunk.add_mapping() = path.mapping(start + i);
         }
         
-        // Emit a graph chunk containing htis part of the path
+        // Emit a graph chunk containing this part of the path
         Graph g;
         *(g.add_path()) = std::move(chunk);
         graph_emitter.write(std::move(g));
@@ -92,6 +118,7 @@ unordered_map<PathSense, string> SENSE_TO_STRING {
 };
 
 int main_paths(int argc, char** argv) {
+    Logger logger("vg paths");
 
     if (argc == 2) {
         help_paths(argv);
@@ -100,7 +127,6 @@ int main_paths(int argc, char** argv) {
 
     bool extract_as_gam = false;
     bool extract_as_gaf = false;
-    bool extract_as_vg = false;
     bool list_names = false;
     bool extract_as_fasta = false;
     bool drop_paths = false;
@@ -122,6 +148,16 @@ int main_paths(int argc, char** argv) {
     bool coverage = false;
     const size_t coverage_bins = 10;
     bool normalize_paths = false;
+    bool overlay = false;
+    bool progress = false;
+    bool compute_gref = false;
+    int64_t min_gref_length = 50;
+    string gref_segments_file;
+    string exclude_sample;
+
+    constexpr int OPT_PROGRESS = 1001;
+    constexpr int OPT_GREF_SEGMENTS = 1002;
+    constexpr int OPT_EXCLUDE_SAMPLE = 1003;
 
     int c;
     optind = 2; // force optind past command positional argument
@@ -129,6 +165,7 @@ int main_paths(int argc, char** argv) {
         static struct option long_options[] =
 
         {
+            {"help", no_argument, 0, 'h'},
             {"vg", required_argument, 0, 'v'},
             {"xg", required_argument, 0, 'x'},
             {"gbwt", required_argument, 0, 'g'},
@@ -151,16 +188,26 @@ int main_paths(int argc, char** argv) {
             {"reference-paths", no_argument, 0, 'R'},
             {"haplotype-paths", no_argument, 0, 'H'},
             {"coverage", no_argument, 0, 'c'},            
+            {"overlay", no_argument, 0, 'o'},
+            {"threads", required_argument, 0, 't'},
+            {"progress", no_argument, 0, OPT_PROGRESS},
+            {"verbose", no_argument, 0, OPT_PROGRESS},
 
             // Hidden options for backward compatibility.
-            {"threads", no_argument, 0, 'T'},
+            {"threads-old", no_argument, 0, 'T'},
             {"threads-by", required_argument, 0, 'q'},
+
+            // Gref options
+            {"compute-gref", no_argument, 0, 'u'},
+            {"min-gref-len", required_argument, 0, 'l'},
+            {"gref-segs", required_argument, 0, OPT_GREF_SEGMENTS},
+            {"exclude-sample", required_argument, 0, OPT_EXCLUDE_SAMPLE},
 
             {0, 0, 0, 0}
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hLXv:x:g:Q:VEMCFAS:Tq:drnaGRHp:ct:",
+        c = getopt_long (argc, argv, "h?LXv:x:g:Q:VEMCFAS:drnaGRHp:coTq:t:ul:",
                 long_options, &option_index);
 
         // Detect the end of the options.
@@ -172,18 +219,17 @@ int main_paths(int argc, char** argv) {
 
         case 'v': // Fall through
         case 'x':
-            graph_file = optarg;
+            graph_file = require_exists(logger, optarg);
             ++input_formats;
             break;
 
         case 'g':
-            gbwt_file = optarg;
+            gbwt_file = require_exists(logger, optarg);
             ++input_formats;
             break;
 
         case 'V':
-            extract_as_vg = true;
-            output_formats++;
+            logger.error() << "-V/--extract-vg has been removed" << endl;
             break;
                 
         case 'd':
@@ -240,7 +286,7 @@ int main_paths(int argc, char** argv) {
             break;
                 
         case 'p':
-            path_file = optarg;
+            path_file = require_exists(logger, optarg);
             selection_criteria++;
             break;
 
@@ -276,27 +322,45 @@ int main_paths(int argc, char** argv) {
             output_formats++;
             break;
 
+        case 'o':
+            overlay = true;
+            break;
+
         case 'T':
-            std::cerr << "warning: [vg paths] option --threads is obsolete and unnecessary" << std::endl;
+            logger.warn() << "option -T/--threads-old is obsolete; use -t/--threads" << std::endl;
             break;
 
         case 'q':
-            std::cerr << "warning: [vg paths] option --threads-by is deprecated; please use --paths-by" << std::endl;
+            logger.warn() << "option --threads-by is deprecated; please use --paths-by" << std::endl;
             path_prefix = optarg;
             selection_criteria++;
             break;
 
         case 't':
-        {
-            int num_threads = parse<int>(optarg);
-            if (num_threads <= 0) {
-                cerr << "error:[vg paths] Thread count (-t) set to " << num_threads << ", must set to a positive integer." << endl;
-                exit(1);
-            }
-            omp_set_num_threads(num_threads);
+            set_thread_count(logger, optarg);
             break;
-        }
-            
+
+        case 'u':
+            compute_gref = true;
+            output_formats++;
+            break;
+
+        case 'l':
+            min_gref_length = parse<int64_t>(optarg);
+            break;
+
+        case OPT_PROGRESS:
+            progress = true;
+            break;
+
+        case OPT_GREF_SEGMENTS:
+            gref_segments_file = ensure_writable(logger, optarg);
+            break;
+
+        case OPT_EXCLUDE_SAMPLE:
+            exclude_sample = optarg;
+            break;
+
         case 'h':
         case '?':
             help_paths(argv);
@@ -320,52 +384,61 @@ int main_paths(int argc, char** argv) {
             path_senses.insert(PathSense::GENERIC);
         }
     } else {
+        if (!gbwt_file.empty()) {
+            logger.warn() << "path sense selection is not done by GBWT" << std::endl;
+        }
         // We asked for path senses specifically
         selection_criteria++;
     }
 
     if (input_formats != 1 && input_formats != 2) {
-        std::cerr << "error: [vg paths] at least one input format (-x, -g) must be specified" << std::endl;
-        std::exit(EXIT_FAILURE);
+        logger.error() << "at least one input format (-x, -g) must be specified" << std::endl;
     }
     if (!gbwt_file.empty()) {
-        bool need_graph = (extract_as_gam || extract_as_gaf || extract_as_vg || drop_paths || retain_paths || extract_as_fasta || list_lengths);
+        bool need_graph = (extract_as_gam || extract_as_gaf || drop_paths
+                           || retain_paths || extract_as_fasta || list_lengths);
         if (need_graph && graph_file.empty()) {
-            std::cerr << "error: [vg paths] a graph is needed for extracting threads in -X, -A, -V, -d, -r, -n, -E or -F format" << std::endl;
-            std::exit(EXIT_FAILURE);
+            logger.error() << "a graph is needed for extracting threads in "
+                           << "-X, -A, -d, -r, -n, -E or -F format" << std::endl;
         }
         if (!need_graph && !graph_file.empty()) {
             // TODO: This should be an error, but we display a warning instead for backward compatibility.
-            //std::cerr << "error: [vg paths] cannot read input from multiple sources" << std::endl;
-            //std::exit(EXIT_FAILURE);
-            std::cerr << "warning: [vg paths] graph unnecessary for listing GBWT threads" << std::endl;
+            //logger.error() << "cannot read input from multiple sources");
+            logger.warn() << "graph unnecessary for listing GBWT threads" << std::endl;
         }
     } 
     if (output_formats != 1) {
-        std::cerr << "error: [vg paths] one output format (-X, -A, -V, -d, -r, -n, -L, -F, -E, -C or -c) must be specified" << std::endl;
-        std::exit(EXIT_FAILURE);
+        logger.error() << "one output format (-X, -A, -d, -r, -n, -L, -F, -E, -C or -c) "
+                       << "must be specified" << std::endl;
     }
     if (selection_criteria > 1) {
-        std::cerr << "error: [vg paths] multiple selection criteria (-Q, -S, -a, -G/-R/-H, -p) cannot be used" << std::endl;
-        std::exit(EXIT_FAILURE);
+        logger.error() << "multiple selection criteria (-Q, -S, -a, -G/-R/-H, -p) cannot be used" << std::endl;
     }
     if (select_alt_paths && !gbwt_file.empty()) {
-        std::cerr << "error: [vg paths] selecting variant allele paths is not compatible with a GBWT index" << std::endl;
-        std::exit(EXIT_FAILURE);
+        logger.error() << "selecting variant allele paths is not compatible with a GBWT index" << std::endl;
     }
     if (list_metadata && !gbwt_file.empty()) {
-        std::cerr << "error: [vg paths] listing path metadata is not compatible with a GBWT index" << std::endl;
-        std::exit(EXIT_FAILURE);
+        logger.error() << "listing path metadata is not compatible with a GBWT index" << std::endl;
     }
-    if ((drop_paths || retain_paths || normalize_paths) && !gbwt_file.empty()) {
-        std::cerr << "error: [vg paths] dropping, retaining or normalizing paths only works on embedded graph paths, not GBWT threads" << std::endl;
-        std::exit(EXIT_FAILURE);
+    if (normalize_paths && !gbwt_file.empty()) {
+        logger.error() << "normalizing paths only works on embedded graph paths, not GBWT threads" << std::endl;
     }
     if (coverage && !gbwt_file.empty()) {
-        std::cerr << "error: [vg paths] coverage option -c only works on embedded graph paths, not GBWT threads" << std::endl;
-        std::exit(EXIT_FAILURE);
+        logger.error() << "coverage option -c only works on embedded graph paths, not GBWT threads" << std::endl;
     }
-    
+    if (compute_gref && !gbwt_file.empty()) {
+        logger.error() << "gref computation only works on embedded graph paths, not GBWT threads" << std::endl;
+    }
+    if (compute_gref && path_prefix.empty()) {
+        logger.error() << "--compute-gref requires -Q to select reference path(s)" << std::endl;
+    }
+    if (!gref_segments_file.empty() && !compute_gref) {
+        logger.error() << "--gref-segs requires --compute-gref" << std::endl;
+    }
+    if (!exclude_sample.empty() && !sample_name.empty() && exclude_sample == sample_name) {
+        logger.error() << "--exclude-sample and --sample cannot specify the same sample" << std::endl;
+    }
+
     if (select_alt_paths) {
         // alt paths all have a specific prefix
         path_prefix = "_alt_";
@@ -375,11 +448,23 @@ int main_paths(int argc, char** argv) {
     
     // Load whatever indexes we were given
     // Note: during handlifiction, distinction between -v and -x options disappeared.
-    unique_ptr<PathHandleGraph> graph;
+    unique_ptr<PathHandleGraph> path_handle_graph;
     if (!graph_file.empty()) {
         // Load the graph
-        graph = vg::io::VPKG::load_one<PathHandleGraph>(graph_file);
+        path_handle_graph = vg::io::VPKG::load_one<PathHandleGraph>(graph_file);
     }
+    bdsg::ReferencePathOverlayHelper overlay_helper;
+    PathHandleGraph* graph = nullptr;
+    if (path_handle_graph) {
+        if (overlay) {
+            // Try to apply the overlay if the user wanted it and this isn't
+            // already a graph implementing position lookups.
+            graph = overlay_helper.apply(path_handle_graph.get());
+        } else {
+            graph = path_handle_graph.get();
+        }
+    }
+
     unique_ptr<gbwt::GBWT> gbwt_index;
     if (!gbwt_file.empty()) {
         // We want a gbwt
@@ -389,21 +474,119 @@ int main_paths(int argc, char** argv) {
 
         if (gbwt_index.get() == nullptr) {
           // Complain if we couldn't.
-          cerr << "error: [vg paths] unable to load gbwt index file" << endl;
-          exit(1);
+          logger.error() << "unable to load GBWT index file" << std::endl;
         }
     }
     
     
     
+    // Handle gref computation before other operations
+    if (compute_gref && graph) {
+        if (overlay) {
+            // The overlay wrapper is read-only, so -o would otherwise defeat
+            // --compute-gref and report it as a problem with the input file.
+            logger.error() << "--compute-gref cannot be combined with -o/--overlay,"
+                           << " which wraps the graph in a read-only overlay" << std::endl;
+            return 1;
+        }
+        MutablePathMutableHandleGraph* mutable_graph = dynamic_cast<MutablePathMutableHandleGraph*>(graph);
+        if (!mutable_graph) {
+            // --compute-gref writes new paths into the graph, so read-only formats
+            // (GBZ, XG) cannot be used directly no matter how they were loaded.
+            logger.error() << "--compute-gref writes paths into the graph, but " << graph_file
+                           << " is in a read-only format (such as GBZ or XG)." << std::endl
+                           << "         Convert it to a mutable format first, for example:"
+                           << std::endl
+                           << "           vg convert -p " << graph_file << " > graph.pg" << std::endl
+                           << "           vg paths -x graph.pg --compute-gref ..." << std::endl;
+            return 1;
+        }
+
+        // Collect reference paths matching the prefix from -Q
+        unordered_set<path_handle_t> ref_paths;
+        graph->for_each_path_handle([&](path_handle_t ph) {
+            string path_name = graph->get_path_name(ph);
+            // Skip anything already in the gref namespace: a previous cover is about to
+            // be cleared, and a gref path can never be the base of a new one.
+            if (GrefCover::is_gref_derived(path_name)) {
+                return;
+            }
+            if (path_name.compare(0, path_prefix.size(), path_prefix) == 0) {
+                if (!exclude_sample.empty() &&
+                    graph->get_sample_name(ph) == exclude_sample) {
+                    return;
+                }
+                ref_paths.insert(ph);
+            }
+        });
+        if (ref_paths.empty()) {
+            logger.error() << "no paths found matching prefix: " << path_prefix << std::endl;
+            return 1;
+        }
+
+        // Weight the reference path endpoints so the decomposition roots its chains on them
+        // (matching snarls_main.cpp).  Without the bias the snarl tree roots arbitrarily and
+        // produces backward-oriented top-level snarls that do not align with the reference.
+        std::unordered_map<nid_t, size_t> extra_node_weight;
+        {
+            constexpr size_t EXTRA_WEIGHT = 10000000000;
+            for (const path_handle_t& ph : ref_paths) {
+                if (!graph->is_empty(ph)) {
+                    extra_node_weight[graph->get_id(graph->get_handle_of_step(graph->path_begin(ph)))] += EXTRA_WEIGHT;
+                    extra_node_weight[graph->get_id(graph->get_handle_of_step(graph->path_back(ph)))] += EXTRA_WEIGHT;
+                }
+            }
+        }
+        // The decomposition the cover is mapped onto: a distance index built with no
+        // distances at all, which is exactly the snarl decomposition and nothing more.
+        // This is the API new code should use -- the protobuf SnarlManager is on its way
+        // out -- and on chrY it is also cheaper (27 s vs 38 s for `vg snarls -T`).
+        //
+        // The same reference-endpoint weight bias is handed to the finder here.  Without it
+        // IntegratedSnarlFinder picks its chain spine on topology alone, which on graphs
+        // like test/nesting/mnp.gfa runs the top-level chain through the *alt* allele and
+        // buries reference nodes inside top-level snarls.
+        bdsg::SnarlDistanceIndex distance_index;
+        {
+            auto start_time = std::chrono::steady_clock::now();
+            IntegratedSnarlFinder finder(*graph, extra_node_weight);
+            fill_in_distance_index(&distance_index, graph, &finder,
+                                   /*size_limit=*/0,
+                                   /*only_top_level_chain_distances=*/true);
+            if (progress) {
+                cerr << "[vg paths] built the snarl decomposition in "
+                     << std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - start_time).count()
+                     << " s" << endl;
+            }
+        }
+
+        // Compute and apply gref cover
+        GrefCover cover;
+        cover.set_verbose(progress);
+        cover.clear(mutable_graph);
+        cover.compute(graph, &distance_index, ref_paths, min_gref_length);
+
+        // Write gref segment table if requested
+        if (!gref_segments_file.empty()) {
+            ofstream segments_out(gref_segments_file);
+            if (!segments_out) {
+                logger.error() << "could not open gref-segs file: " << gref_segments_file << std::endl;
+                return 1;
+            }
+            cover.write_gref_segments(segments_out);
+        }
+
+        cover.apply(mutable_graph);
+
+        // Output the modified graph
+        vg::io::save_handle_graph(mutable_graph, cout);
+        return 0;
+    }
+
     set<string> path_names;
     if (!path_file.empty()) {
         ifstream path_stream(path_file);
-        if (!path_stream) {
-            cerr << "error: cannot open path name file " << path_file << endl;
-            exit(EXIT_FAILURE);
-        }
-        
         string line;
         while (getline(path_stream, line)) {
             path_names.emplace(std::move(line));
@@ -413,34 +596,70 @@ int main_paths(int argc, char** argv) {
     // We may need to emit a stream of Alignments
     unique_ptr<vg::io::AlignmentEmitter> aln_emitter; 
 
-    // Or we might need to emit a stream of VG Graph objects
-    unique_ptr<vg::io::ProtobufEmitter<Graph>> graph_emitter;
     if (extract_as_gam || extract_as_gaf) {
         // Open up a GAM/GAF output stream
-        aln_emitter = vg::io::get_non_hts_alignment_emitter("-", extract_as_gaf ? "GAF" : "GAM", {}, get_thread_count(),
-                                                            graph.get());
-    } else if (extract_as_vg) {
-        // Open up a VG Graph chunk output stream
-        graph_emitter = unique_ptr<vg::io::ProtobufEmitter<Graph>>(new vg::io::ProtobufEmitter<Graph>(cout));
+        aln_emitter = vg::io::get_non_hts_alignment_emitter("-", extract_as_gaf ? "GAF" : "GAM", {},
+                                                            vg::get_thread_count(),
+                                                            graph);
     }
     
     if (gbwt_index) {
+        // TODO: Use GBWTGraph or a lightweight verison that just uses a
+        // backing HandleGraph's nodes directly to unify this all with the
+        // HandleGraph case. The problem there is that GBWTGraph is immutable,
+        // and we don't have good code for efficiently moving selected stuff
+        // from immutable graphs to mutable graphs.
+
         // We want to operate on a GBWT instead of the graph.
+        if (progress) {
+            logger.info() << "Extracting from GBWT" << std::endl;
+        }
 
         if (!(gbwt_index->hasMetadata() && gbwt_index->metadata.hasPathNames())) {
-            std::cerr << "warning: [vg paths] the GBWT index does not contain thread names" << std::endl;
-            std::exit(EXIT_SUCCESS);
+            logger.error() << "the GBWT index does not contain path names" << std::endl;
         }
         
         // Pre-parse some metadata
         auto gbwt_reference_samples = gbwtgraph::parse_reference_samples_tag(*gbwt_index);
+
+        MutablePathMutableHandleGraph* out_graph = nullptr;
+        std::unique_ptr<MutablePathMutableHandleGraph> graph_holder;
+        if (drop_paths || retain_paths) {
+            // We need to output a graph.
+            // Which means we need a graph to start with.
+            crash_unless(graph);
+            // Maybe we can use the input graph as the output graph.
+            out_graph = dynamic_cast<MutablePathMutableHandleGraph*>(graph);
+            
+            if (out_graph) {
+                // We need to use the GBWT threads *instead* of whatever might
+                // have been in the graph.
+                if (progress) {
+                    logger.info() << "Operating on loaded graph" << std::endl;
+                }
+                std::vector<path_handle_t> paths_to_clear;
+                out_graph->for_each_path_handle([&](const path_handle_t& h) {
+                    paths_to_clear.push_back(h);
+                });
+                out_graph->destroy_paths(paths_to_clear);
+            } else {
+                // We need to make a new graph
+                if (progress) {
+                    logger.info() << "Creating graph copy" << std::endl;
+                }
+                graph_holder = std::make_unique<bdsg::PackedGraph>();
+                out_graph = graph_holder.get();
+                // We need to copy the nodes over, but not the paths.
+                handlegraph::algorithms::copy_handle_graph(graph, out_graph);
+            }
+        }
 
         // Select the threads we are interested in.
         std::vector<gbwt::size_type> thread_ids;
         if (!sample_name.empty()) {
             thread_ids = threads_for_sample(*gbwt_index, sample_name);
         } else if(!path_prefix.empty()) {
-            for (size_t i = 0; i < gbwt_index->metadata.paths(); i++) {
+            for (gbwt::size_type i = 0; i < gbwt_index->metadata.paths(); i++) {
                 PathSense sense = gbwtgraph::get_path_sense(*gbwt_index, i, gbwt_reference_samples);
                 std::string name = gbwtgraph::compose_path_name(*gbwt_index, i, sense);
                 if (name.length() >= path_prefix.length() && std::equal(path_prefix.begin(), path_prefix.end(), name.begin())) {
@@ -458,8 +677,7 @@ int main_paths(int argc, char** argv) {
                 }
             }
             if (thread_ids.size() != path_names.size()) {
-                std::cerr << "error: [vg paths] could not find all path names from file in GBWT index" << std::endl;
-                std::exit(EXIT_FAILURE);
+                logger.error() << "could not find all path names from file in GBWT index" << std::endl;
             }
         } else {
             thread_ids.reserve(gbwt_index->metadata.paths());
@@ -467,16 +685,48 @@ int main_paths(int argc, char** argv) {
                 thread_ids.push_back(i);
             }
         }
-        
+
+        if (!exclude_sample.empty()) {
+            std::vector<gbwt::size_type> filtered_ids;
+            filtered_ids.reserve(thread_ids.size());
+            for (gbwt::size_type id : thread_ids) {
+                PathSense sense = gbwtgraph::get_path_sense(*gbwt_index, id, gbwt_reference_samples);
+                std::string sample = gbwtgraph::get_path_sample_name(*gbwt_index, id, sense);
+                if (sample != exclude_sample) {
+                    filtered_ids.push_back(id);
+                }
+            }
+            thread_ids = std::move(filtered_ids);
+        }
+
+        if (drop_paths) {
+            // Invert the set of thread IDs
+            std::unordered_set<gbwt::size_type> selected_ids {thread_ids.begin(), thread_ids.end()};
+            std::vector<gbwt::size_type> inverted_ids;
+            for (gbwt::size_type i = 0; i < gbwt_index->metadata.paths(); i++) {
+                if (!selected_ids.count(i)) {
+                    inverted_ids.push_back(i);
+                }
+            }
+            thread_ids = std::move(inverted_ids);
+        }
+
+        if (thread_ids.empty()) {
+            logger.warn() << "no matching paths found in GBWT index" << std::endl;
+            return 0;
+        } else if (progress) {
+            logger.info() << "found " << thread_ids.size() << " matching paths in GBWT index" << std::endl;
+        }
+
         // Process the threads.
         for (gbwt::size_type id : thread_ids) {
             PathSense sense = gbwtgraph::get_path_sense(*gbwt_index, id, gbwt_reference_samples);
-            std::string name = gbwtgraph::compose_path_name(*gbwt_index, id, sense);        
+            std::string name = gbwtgraph::compose_path_name(*gbwt_index, id, sense);
 
             // We are only interested in the name
             // TODO: do we need to consult list_cyclicity or list_metadata here?
             if (list_names && !list_lengths) {
-                std::cout << name << endl;
+                std::cout << name << std::endl;
                 continue;
             }
             
@@ -487,14 +737,11 @@ int main_paths(int argc, char** argv) {
             if (extract_as_gam || extract_as_gaf) {
                 // Write as an Alignment. Must contain the whole path.
                 aln_emitter->emit_singles({alignment_from_path(*graph, path)});
-            } else if (extract_as_vg) {
-                // Write as a Path in a VG
-                chunk_to_emitter(path, *graph_emitter);
             } else if (extract_as_fasta) {
                 write_fasta_sequence(name, path_sequence(*graph, path), cout);
             }
             if (list_lengths) {
-                cout << path.name() << "\t" << path_to_length(path) << endl;
+                cout << path.name() << "\t" << path_to_length(path) << std::endl;
             }
             if (list_cyclicity) {
                 bool cyclic = false;
@@ -507,12 +754,37 @@ int main_paths(int argc, char** argv) {
                         cyclic = true;
                     }
                 }
-                cout << path.name() << "\t" << (cyclic ? "cyclic" : "acyclic") << endl;
+                cout << path.name() << "\t" << (cyclic ? "cyclic" : "acyclic") << std::endl;
             }
+            if (retain_paths || drop_paths) {
+                // We need to copy this path into the new graph.
+                path_handle_t new_path = out_graph->create_path(
+                    sense,
+                    gbwtgraph::get_path_sample_name(*gbwt_index, id, sense),
+                    gbwtgraph::get_path_locus_name(*gbwt_index, id, sense),
+                    gbwtgraph::get_path_haplotype(*gbwt_index, id, sense),
+                    gbwtgraph::get_path_phase_block(*gbwt_index, id, sense),
+                    gbwtgraph::get_path_subrange(*gbwt_index, id, sense)
+                );
+
+                for (auto& mapping : path.mapping()) {
+                    // Put each step onto the path
+                    out_graph->append_step(new_path, out_graph->get_handle(mapping.position().node_id(), mapping.position().is_reverse()));
+                }
+
+            }
+        }
+
+        if (out_graph) {
+            // Write the graph to standard output.
+            vg::io::save_handle_graph(out_graph, std::cout);
         }
     } else if (graph) {
         
         // Handle queries from the graph
+        if (graph->get_path_count() == 0) {
+            logger.error() << "graph does not contain any paths" << std::endl;
+        }
         
         // Make a helper to loop over the selected paths in the graph
         auto for_each_selected_path = [&](const std::function<void(const path_handle_t)>& iteratee) {
@@ -522,6 +794,10 @@ int main_paths(int argc, char** argv) {
                     if (graph->has_path(name)) {
                         auto path_handle = graph->get_path_handle(name);
                         if (path_senses.count(graph->get_sense(path_handle))) {
+                            if (!exclude_sample.empty() &&
+                                graph->get_sample_name(path_handle) == exclude_sample) {
+                                continue;
+                            }
                             // But only take those with senses we want.
                             iteratee(path_handle);
                         }
@@ -544,19 +820,25 @@ int main_paths(int argc, char** argv) {
                 
                 graph->for_each_path_matching(&path_senses, sample_name_filter, locus_name_filter,
                     [&](const path_handle_t& path_handle) {
-                
+
+                    // Filter out excluded sample
+                    if (!exclude_sample.empty() &&
+                        graph->get_sample_name(path_handle) == exclude_sample) {
+                        return;
+                    }
+
                     // We got a path of appropriate sense, locus, and sample.
                     if (!path_prefix.empty()) {
                         // Filter by name prefix
                         std::string path_name = graph->get_path_name(path_handle);
-                        
+
                         if (std::mismatch(path_name.begin(), path_name.end(),
                                           path_prefix.begin(), path_prefix.end()).second != path_prefix.end()) {
                             // The path does not match the prefix. Skip it.
                             return;
                         }
                     }
-                    
+
                     // It didn't fail a prefix check, so use it.
                     iteratee(path_handle);
                 });
@@ -587,12 +869,20 @@ int main_paths(int argc, char** argv) {
             
             
         };
+
+        unordered_set<path_handle_t> selected;
+        for_each_selected_path([&](const path_handle_t& path_handle) {
+            selected.insert(path_handle);
+        });
+        if (selected.empty()) {
+            logger.warn() << "no matching paths found in graph" << std::endl;
+            return 0;
+        }
         
         if (drop_paths || retain_paths || normalize_paths) {
-            MutablePathMutableHandleGraph* mutable_graph = dynamic_cast<MutablePathMutableHandleGraph*>(graph.get());
+            MutablePathMutableHandleGraph* mutable_graph = dynamic_cast<MutablePathMutableHandleGraph*>(graph);
             if (!mutable_graph) {
-                std::cerr << "error[vg paths]: graph cannot be modified" << std::endl;
-                exit(1);
+                logger.error() << "graph cannot be modified" << std::endl;
             }
 
             vector<path_handle_t> to_destroy;
@@ -610,7 +900,7 @@ int main_paths(int argc, char** argv) {
                 for_each_selected_path([&](const path_handle_t& path_handle) {
                     selected_paths.insert(path_handle);
                 });
-                merge_equivalent_traversals_in_graph(mutable_graph, selected_paths);
+                merge_equivalent_traversals_in_graph(mutable_graph, selected_paths, true);
             }
             if (!to_destroy.empty()) {
                 mutable_graph->destroy_paths(to_destroy);
@@ -700,7 +990,7 @@ int main_paths(int argc, char** argv) {
                     cout << (2 + (cov - 2) * bin_size) << "-" << (2 + (cov - 2) * bin_size + bin_size - 1);
                 } 
             }
-            cout << endl;
+            cout << std::endl;
             for_each_selected_path([&](path_handle_t path_handle) {
                 string path_name = graph->get_path_name(path_handle);
                 cout << path_name;
@@ -708,7 +998,7 @@ int main_paths(int argc, char** argv) {
                 for (size_t cov = 0; cov < path_cov.size(); ++cov) {
                     cout << "\t" << path_cov[cov];
                 }
-                cout << endl;
+                cout << std::endl;
             });
         } else {
             if (list_metadata) {
@@ -726,7 +1016,7 @@ int main_paths(int argc, char** argv) {
                 if (list_cyclicity) {
                     cout << "\tCYCLICITY";
                 }
-                cout << endl;
+                cout << std::endl;
             }
             for_each_selected_path([&](path_handle_t path_handle) {
                 if (list_names) {
@@ -742,13 +1032,17 @@ int main_paths(int argc, char** argv) {
                         // Dump fields for all the metadata
                         cout << "\t" << SENSE_TO_STRING.at(graph->get_sense(path_handle));
                         auto sample = graph->get_sample_name(path_handle);
-                        cout << "\t" << (sample == PathMetadata::NO_SAMPLE_NAME ? "NO_SAMPLE_NAME" : sample);
+                        cout << "\t" << (sample == PathMetadata::NO_SAMPLE_NAME ? "NO_SAMPLE_NAME"
+                                                                                : sample);
                         auto haplotype = graph->get_haplotype(path_handle);
-                        cout << "\t" << (haplotype == PathMetadata::NO_HAPLOTYPE ? "NO_HAPLOTYPE" : std::to_string(haplotype));
+                        cout << "\t" << (haplotype == PathMetadata::NO_HAPLOTYPE ? "NO_HAPLOTYPE"
+                                                                                 : std::to_string(haplotype));
                         auto locus = graph->get_locus_name(path_handle);
-                        cout << "\t" << (locus == PathMetadata::NO_LOCUS_NAME ? "NO_LOCUS_NAME" : locus);
+                        cout << "\t" << (locus == PathMetadata::NO_LOCUS_NAME ? "NO_LOCUS_NAME"
+                                                                              : locus);
                         auto phase_block = graph->get_phase_block(path_handle);
-                        cout << "\t" << (phase_block == PathMetadata::NO_PHASE_BLOCK ? "NO_PHASE_BLOCK" : std::to_string(phase_block));
+                        cout << "\t" << (phase_block == PathMetadata::NO_PHASE_BLOCK ? "NO_PHASE_BLOCK" 
+                                                                                     : std::to_string(phase_block));
                         auto subrange = graph->get_subrange(path_handle);
                         cout << "\t";
                         if (subrange == PathMetadata::NO_SUBRANGE) {
@@ -777,13 +1071,11 @@ int main_paths(int argc, char** argv) {
                         cout << "\t" << (directed_cyclic ? "directed-cyclic" : "directed-acyclic")
                              << "\t" << (undirected_cyclic ? "undirected-cyclic" : "undirected-acyclic");
                     }
-                    cout << endl;
+                    cout << std::endl;
                 } else {
                     Path path = path_from_path_handle(*graph, path_handle);
                     if (extract_as_gam || extract_as_gaf) {
                         aln_emitter->emit_singles({alignment_from_path(*graph, path)});
-                    } else if (extract_as_vg) {
-                        chunk_to_emitter(path, *graph_emitter); 
                     } else if (extract_as_fasta) {
                         write_fasta_sequence(graph->get_path_name(path_handle), path_sequence(*graph, path), cout);
                     }

@@ -3,6 +3,7 @@
 #include "../xg.hpp"
 #include "../utility.hpp"
 #include "../packer.hpp"
+#include "../gbwtgraph_helper.hpp"
 #include <vg/io/stream.hpp>
 #include <vg/io/vpkg.hpp>
 #include <handlegraph/handle_graph.hpp>
@@ -17,26 +18,29 @@ using namespace vg::subcommand;
 void help_pack(char** argv) {
     cerr << "usage: " << argv[0] << " pack [options]" << endl
          << "options:" << endl
-         << "    -x, --xg FILE          use this basis graph (any format accepted, does not have to be xg)" << endl
-         << "    -o, --packs-out FILE   write compressed coverage packs to this output file" << endl
-         << "    -i, --packs-in FILE    begin by summing coverage packs from each provided FILE" << endl
-         << "    -g, --gam FILE         read alignments from this GAM file (could be '-' for stdin)" << endl
-         << "    -a, --gaf FILE         read alignments from this GAF file (could be '-' for stdin)" << endl
-         << "    -d, --as-table         write table on stdout representing packs" << endl
-         << "    -D, --as-edge-table    write table on stdout representing edge coverage" << endl
-         << "    -u, --as-qual-table    write table on stdout representing average node mapqs" << endl
-         << "    -e, --with-edits       record and write edits rather than only recording graph-matching coverage" << endl
-         << "    -b, --bin-size N       number of sequence bases per CSA bin [default: inf]" << endl
-         << "    -n, --node ID          write table for only specified node(s)" << endl
-         << "    -N, --node-list FILE   a white space or line delimited list of nodes to collect" << endl
-         << "    -Q, --min-mapq N       ignore reads with MAPQ < N and positions with base quality < N [default: 0]" << endl
-         << "    -c, --expected-cov N   expected coverage.  used only for memory tuning [default : 128]" << endl
-         << "    -s, --trim-ends N      ignore the first and last N bases of each read" << endl 
-         << "    -t, --threads N        use N threads (defaults to numCPUs)" << endl;
+         << "  -x, --xg FILE          use this basis graph (does not have to be xg format)" << endl
+         << "  -o, --packs-out FILE   write compressed coverage packs to this output file" << endl
+         << "  -i, --packs-in FILE    begin by summing coverage packs from each provided FILE" << endl
+         << "  -g, --gam FILE         read alignments from this GAM file ('-' for stdin)" << endl
+         << "  -a, --gaf FILE         read alignments from this GAF file ('-' for stdin)" << endl
+         << "  -d, --as-table         write table on stdout representing packs" << endl
+         << "  -D, --as-edge-table    write table on stdout representing edge coverage" << endl
+         << "  -u, --as-qual-table    write table on stdout representing average node mapqs" << endl
+         << "  -e, --with-edits       record and write edits" << endl
+         << "                         rather than only recording graph-matching coverage" << endl
+         << "  -b, --bin-size N       number of sequence bases per CSA bin [inf]" << endl
+         << "  -n, --node ID          write table for only specified node(s)" << endl
+         << "  -N, --node-list FILE   white space or line delimited list of nodes to collect" << endl
+         << "  -Q, --min-mapq N       ignore reads with MAPQ < N" << endl
+         << "                         and positions with base quality < N [0]" << endl
+         << "  -c, --expected-cov N   expected coverage.  used only for memory tuning [128]" << endl
+         << "  -s, --trim-ends N      ignore the first and last N bases of each read" << endl 
+         << "  -t, --threads N        use N threads [numCPUs]" << endl
+         << "  -h, --help             print this help message to stderr and exit" << endl;
 }
 
-
 int main_pack(int argc, char** argv) {
+    Logger logger("vg pack");
 
     string xg_name;
     vector<string> packs_in;
@@ -68,7 +72,7 @@ int main_pack(int argc, char** argv) {
             {"help", no_argument, 0, 'h'},
             {"xg", required_argument,0, 'x'},
             {"packs-out", required_argument,0, 'o'},
-            {"count-in", required_argument, 0, 'i'},
+            {"packs-in", required_argument, 0, 'i'},
             {"gam", required_argument, 0, 'g'},
             {"gaf", required_argument, 0, 'a'},
             {"as-table", no_argument, 0, 'd'},
@@ -86,8 +90,8 @@ int main_pack(int argc, char** argv) {
 
         };
         int option_index = 0;
-        c = getopt_long (argc, argv, "hx:o:i:g:a:dDut:eb:n:N:Q:c:s:",
-                long_options, &option_index);
+        c = getopt_long (argc, argv, "h?x:o:i:g:a:dDut:eb:n:N:Q:c:s:",
+                         long_options, &option_index);
 
         // Detect the end of the options.
         if (c == -1)
@@ -101,19 +105,19 @@ int main_pack(int argc, char** argv) {
             help_pack(argv);
             return 1;
         case 'x':
-            xg_name = optarg;
+            xg_name = require_exists(logger, optarg);
             break;
         case 'o':
-            packs_out = optarg;
+            packs_out = ensure_writable(logger, optarg);
             break;
         case 'i':
-            packs_in.push_back(optarg);
+            packs_in.push_back(require_exists(logger, optarg));
             break;
         case 'g':
-            gam_in = optarg;
+            gam_in = require_exists(logger, optarg);
             break;
         case 'a':
-            gaf_in = optarg;
+            gaf_in = require_exists(logger, optarg);
             break;
         case 'd':
             write_table = true;
@@ -131,20 +135,13 @@ int main_pack(int argc, char** argv) {
             bin_size = atoll(optarg);
             break;            
         case 't':
-        {
-            int num_threads = parse<int>(optarg);
-            if (num_threads <= 0) {
-                cerr << "error:[vg pack] Thread count (-t) set to " << num_threads << ", must set to a positive integer." << endl;
-                exit(1);
-            }
-            omp_set_num_threads(num_threads);
+            set_thread_count(logger, optarg);
             break;
-        }
         case 'n':
             node_ids.push_back(parse<int>(optarg));
             break;
         case 'N':
-            node_list_file = optarg;
+            node_list_file = require_exists(logger, optarg);
             break;
         case 'Q':
             min_mapq = parse<int>(optarg);
@@ -164,8 +161,7 @@ int main_pack(int argc, char** argv) {
     unique_ptr<HandleGraph> handle_graph;
     HandleGraph* graph = nullptr;
     if (xg_name.empty()) {
-        cerr << "error [vg pack]: No basis graph given. One must be provided with -x." << endl;
-        exit(1);
+        logger.error() << "No basis graph given. One must be provided with -x." << endl;
     } else {
         handle_graph = vg::io::VPKG::load_one<HandleGraph>(xg_name);
     }
@@ -173,28 +169,21 @@ int main_pack(int argc, char** argv) {
     graph = dynamic_cast<HandleGraph*>(overlay_helper.apply(handle_graph.get()));
 
     if (gam_in.empty() && packs_in.empty() && gaf_in.empty()) {
-        cerr << "error [vg pack]: Input must be provided with -g, -a or -i" << endl;
-        exit(1);
+        logger.error() << "Input must be provided with -g, -a or -i" << endl;
     }
 
     if (!gam_in.empty() && !gaf_in.empty()) {
-        cerr << "error [vg pack]: -g cannot be used with -a" << endl;
-        exit(1);
+        logger.error() << "-g cannot be used with -a" << endl;
     }
 
     if (packs_out.empty() && write_table == false && write_edge_table == false && write_qual_table == false) {
-        cerr << "error [vg pack]: Output must be selected with -o, -d or -D" << endl;
-        exit(1);
+        logger.error() << "Output must be selected with -o, -d, -D or -u" << endl;
     }
 
     // process input node list
     if (!node_list_file.empty()) {
         ifstream nli;
         nli.open(node_list_file);
-        if (!nli.good()){
-            cerr << "[vg pack] error, unable to open the node list input file." << endl;
-            exit(1);
-        }
         string line;
         while (getline(nli, line)){
             for (auto& idstr : split_delims(line, " \t")) {
@@ -211,7 +200,7 @@ int main_pack(int argc, char** argv) {
     // use some naive heuristics to come up with bin count and batch size based on thread count
     // more bins: finer grained parallelism at cost of more mutexes and allocations
     // bigger batch size: more robustness to sorted input at cost of less parallelism
-    size_t num_threads = get_thread_count();
+    size_t num_threads = vg::get_thread_count();
     size_t batch_size = Packer::estimate_batch_size(num_threads);
     size_t bin_count = Packer::estimate_bin_count(num_threads);
 
@@ -234,6 +223,8 @@ int main_pack(int argc, char** argv) {
                 vg::io::for_each_parallel(in, lambda, batch_size);
             });
     } else if (!gaf_in.empty()) {
+        require_compatible_reference(gaf_in, handle_graph.get(), nullptr, false);
+
         // we use this interface so we can ignore sequence, which takes a lot of time to parse
         // and is unused by pack
         function<size_t(nid_t)> node_to_length = [&graph](nid_t node_id) {

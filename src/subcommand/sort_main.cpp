@@ -15,7 +15,7 @@
 #include "../vg.hpp"
 #include "../stream_index.hpp"
 #include "../flow_sort.hpp"
-#include "../algorithms/gfa_to_handle.hpp"
+#include "../algorithms/gfaz_to_handle.hpp"
 #include "../algorithms/id_sort.hpp"
 #include <vg/io/vpkg.hpp>
 
@@ -23,18 +23,20 @@ using namespace std;
 using namespace vg;
 using namespace vg::subcommand;
 
-void help_sort(char** argv){
+void help_sort(char** argv) {
     cerr << "usage: " << argv[0] << " sort [options] > sorted.vg " << endl
          << "options: " << endl
-         << "    -a, --algorithm NAME   sort by the given algorithm (eades, max-flow, id, or topo; default id)" << endl
-         << "    -g, --gfa              input in GFA format" << endl
-         << "    -r, --ref              reference name, for eades and max-flow algorithms; makes -a default to max-flow" << endl
-         << "    -w, --without-grooming no grooming mode for eades" << endl
-         << "    -I, --index-to FILE    produce an index of an id-sorted vg file to the given filename" << endl
-         << endl;
+         << "  -a, --algorithm NAME    sort algorithm {eades, max-flow, id, or topo} [id]" << endl
+         << "  -g, --gfa               input in GFA format" << endl
+         << "  -r, --ref NAME          reference name, for eades and max-flow algorithms;" << endl
+         << "                          makes -a default to max-flow" << endl
+         << "  -w, --without-grooming  no grooming mode for eades" << endl
+         << "  -I, --index-to FILE     save index of an ID-sorted vg file to the given file" << endl
+         << "  -h, --help              print this help message to stderr and exit" << endl;
 }
 
 int main_sort(int argc, char *argv[]) {
+    Logger logger("vg sort");
 
     // What should we sort the graph by?
     string algorithm;
@@ -55,12 +57,13 @@ int main_sort(int argc, char *argv[]) {
                 {"gfa", no_argument, 0, 'g'},
                 {"ref", required_argument, 0, 'r'},
                 {"without-grooming", no_argument, 0, 'w'},
-                {"index-to", no_argument, 0, 'I'},
+                {"index-to", required_argument, 0, 'I'},
+                {"help", no_argument, 0, 'h'},
                 {0, 0, 0, 0}
             };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "a:gr:wI:",
+        c = getopt_long (argc, argv, "a:gr:wI:h?",
                          long_options, &option_index);
 
         /* Detect the end of the options. */
@@ -85,7 +88,7 @@ int main_sort(int argc, char *argv[]) {
             without_grooming = true;
             break;
         case 'I':
-            sorted_index_filename = optarg;
+            sorted_index_filename = ensure_writable(logger, optarg);
             break;
         case 'h':
         case '?':
@@ -106,25 +109,23 @@ int main_sort(int argc, char *argv[]) {
     // Validate the algorithm selection and option combination
     if (algorithm == "id" || algorithm == "topo") {
         if (!reference_name.empty()) {
-            cerr << "error[vg sort]: Reference name not used with " << algorithm << " sort algorithm" << endl;
-            exit(1);
+            logger.error() << "Reference name not used with "
+                           << algorithm << " sort algorithm" << endl;
         }
         if (without_grooming) {
-            cerr << "error[vg sort]: Not sensible to turn off grooming with " << algorithm << " sort algorithm" << endl;
-            exit(1);
+            logger.error() << "Not sensible to turn off grooming with "
+                           << algorithm << " sort algorithm" << endl;
         }
     } else if (algorithm == "max-flow" || algorithm == "eades") {
         if (reference_name.empty()) {
-            cerr << "error[vg sort]: Reference name required with " << algorithm << " sort algorithm" << endl;
-            exit(1);
+            logger.error() << "Reference name required with "
+                           << algorithm << " sort algorithm" << endl;
         }
     } else {
-        cerr << "error[vg sort]: Unrecognized sort algorithm " << algorithm << endl;
-        exit(1);
+        logger.error() << "Unrecognized sort algorithm: " << algorithm << endl;
     }
     if (!sorted_index_filename.empty() && algorithm != "id") {
-        cerr << "error[vg sort]: Sorted VG index can only be produced when sorting by ID" << endl;
-        exit(1);
+        logger.error() << "Sorted VG index can only be produced when sorting by ID" << endl;
     }
     
     // With the input graph file
@@ -137,15 +138,13 @@ int main_sort(int argc, char *argv[]) {
         // Read as GFA
         graph.reset(new VG());
         try {
-            algorithms::gfa_to_path_handle_graph(filename, graph.get());
+            algorithms::load_gfa_or_gfaz_to_path_handle_graph(filename, graph.get());
         } catch(algorithms::GFAFormatError& e) {
             // GFA loading has failed because the file is invalid
-            cerr << e.what() << endl;
-            exit(1);
+            logger.error() << e.what() << endl;
         } catch(ios_base::failure& e) {
             // GFA loading has failed because the file couldn't be read
-            cerr << e.what() << endl;
-            exit(1);
+            logger.error() << e.what() << endl;
         }
     } else {
         // Read as Handle Graph and copy into VG           
@@ -231,4 +230,3 @@ int main_sort(int argc, char *argv[]) {
 
 // Register subcommand
 static Subcommand vg_sort("sort", "sort variant graph by various algorithms", DEPRECATED, main_sort);
-

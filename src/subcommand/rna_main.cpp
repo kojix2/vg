@@ -21,48 +21,60 @@ using namespace std;
 using namespace vg;
 using namespace vg::subcommand;
 
-
 void help_rna(char** argv) {
-    cerr << "\nusage: " << argv[0] << " rna [options] graph.[vg|pg|hg|gbz] > splicing_graph.[vg|pg|hg]" << endl
+    cerr << "usage: " << argv[0] << " rna [options] graph.[vg|pg|hg|gbz] > splicing_graph.[vg|pg|hg]" << endl
 
-         << "\nGeneral options:" << endl
+         << endl 
+         << "General options:" << endl
 
-         << "    -t, --threads INT          number of compute threads to use [1]" << endl
-         << "    -p, --progress             show progress" << endl
-         << "    -h, --help                 print help message" << endl
+         << "  -t, --threads INT          number of compute threads to use [1]" << endl
+         << "  -p, --progress             show progress" << endl
+         << "  -h, --help                 print this help message to stderr and exit" << endl
 
-         << "\nInput options:" << endl
+         << endl
+         << "Input options:" << endl
 
-         << "    -n, --transcripts FILE     transcript file(s) in gtf/gff format; may repeat" << endl
-         << "    -m, --introns FILE         intron file(s) in bed format; may repeat" << endl
-         << "    -y, --feature-type NAME    parse only this feature type in the gtf/gff (parses all if empty) [exon]" << endl
-         << "    -s, --transcript-tag NAME  use this attribute tag in the gtf/gff file(s) as id [transcript_id]" << endl
-         << "    -l, --haplotypes FILE      project transcripts onto haplotypes in GBWT index file" << endl
-         << "    -z, --gbz-format           input graph is in GBZ format (contains both a graph and haplotypes (GBWT index))" << endl
+         << "  -n, --transcripts FILE     transcript file(s) in gtf/gff format (may repeat)" << endl
+         << "  -m, --introns FILE         intron file(s) in bed format (may repeat)" << endl
+         << "  -y, --feature-type NAME    parse only this feature type in the GTF/GFF" << endl
+         << "                             (parses all if empty) [exon]" << endl
+         << "  -s, --transcript-tag NAME  use this attribute tag in the GTF/GFf file(s) as ID" << endl
+         << "                             to group exons and name paths [transcript_id]" << endl
+         << "  -l, --haplotypes FILE      project transcripts onto haplotypes in GBWT index" << endl
+         << "  -z, --gbz-format           input graph is GBZ format (has graph & GBWT index)" << endl
 
-         << "\nConstruction options:" << endl
+         << endl
+         << "Construction options:" << endl
 
-         << "    -j, --use-hap-ref          use haplotype paths in GBWT index as reference sequences (disables projection)" << endl
-         << "    -e, --proj-embed-paths     project transcripts onto embedded haplotype paths" << endl
-         << "    -c, --path-collapse TYPE   collapse identical transcript paths across no|haplotype|all paths [haplotype]" << endl
-         << "    -k, --max-node-length INT  chop nodes longer than maximum node length (0 disables chopping) [0]" << endl
-         << "    -d, --remove-non-gene      remove intergenic and intronic regions (deletes all paths in the graph)" << endl
-         << "    -o, --do-not-sort          do not topological sort and compact the graph" << endl
-         << "    -r, --add-ref-paths        add reference transcripts as embedded paths in the graph" << endl
-         << "    -a, --add-hap-paths        add projected transcripts as embedded paths in the graph" << endl
+         << "  -j, --use-hap-ref          use haplotype paths in GBWT index as references" << endl
+         << "                             (disables projection)" << endl
+         << "  -e, --proj-embed-paths     project transcripts onto embedded haplotype paths" << endl
+         << "  -c, --path-collapse TYPE   collapse identical transcript paths across" << endl
+         << "                             no|haplotype|all paths [haplotype]" << endl
+         << "  -k, --max-node-length INT  chop nodes longer than INT (disable with 0) [0]" << endl
+         << "  -d, --remove-non-gene      remove intergenic and intronic regions" << endl
+         << "                             (deletes all paths in the graph)" << endl
+         << "  -o, --do-not-sort          do not topological sort and compact the graph" << endl
+         << "DON'T FORGET TO EMBED PATHS:" << endl
+         << "  -r, --add-ref-paths        add reference transcripts as embedded paths" << endl
+         << "  -a, --add-hap-paths        add projected transcripts as embedded paths" << endl
 
-         << "\nOutput options:" << endl
+         << endl
+         << "Output options:" << endl
 
-         << "    -b, --write-gbwt FILE      write pantranscriptome transcript paths as GBWT index file" << endl
-         << "    -f, --write-fasta FILE     write pantranscriptome transcript sequences as fasta file" << endl
-         << "    -i, --write-info FILE      write pantranscriptome transcript info table as tsv file" << endl
-         << "    -q, --out-exclude-ref      exclude reference transcripts from pantranscriptome output" << endl
-         << "    -g, --gbwt-bidirectional   use bidirectional paths in GBWT index construction" << endl
+         << "  -b, --write-gbwt FILE      write pantranscriptome transcript paths as GBWT" << endl
+         << "  -v, --write-hap-gbwt FILE  write input haplotypes as a GBWT" << endl
+         << "                             with node IDs matching the output graph" << endl
+         << "  -f, --write-fasta FILE     write pantranscriptome transcript sequences to here" << endl
+         << "  -i, --write-info FILE      write pantranscriptome transcript info table as TSV" << endl
+         << "  -q, --out-exclude-ref      exclude reference transcripts from pantranscriptome" << endl
+         << "  -g, --gbwt-bidirectional   use bidirectional paths in GBWT index construction" << endl
 
          << endl;
 }
 
 int32_t main_rna(int32_t argc, char** argv) {
+    Logger logger("vg rna");
 
     if (argc == 2) {
         help_rna(argv);
@@ -88,6 +100,7 @@ int32_t main_rna(int32_t argc, char** argv) {
     bool gbwt_add_bidirectional = false;
     string fasta_out_filename = "";
     string info_out_filename = "";
+    string hap_gbwt_out_filename = "";
     int32_t num_threads = 1;
     bool show_progress = false;
 
@@ -110,8 +123,9 @@ int32_t main_rna(int32_t argc, char** argv) {
                 {"remove-non-gene",  no_argument, 0, 'd'},
                 {"do-not-sort",  no_argument, 0, 'o'},
                 {"add-ref-paths",  no_argument, 0, 'r'},
-                {"add-hap-paths",  no_argument, 0, 'a'},      
+                {"add-hap-paths",  no_argument, 0, 'a'},
                 {"write-gbwt",  required_argument, 0, 'b'},
+                {"write-hap-gbwt",  required_argument, 0, 'v'},
                 {"write-fasta",  required_argument, 0, 'f'},
                 {"write-info",  required_argument, 0, 'i'},
                 {"out-ref-paths",  no_argument, 0, 'u'},
@@ -124,7 +138,7 @@ int32_t main_rna(int32_t argc, char** argv) {
             };
 
         int32_t option_index = 0;
-        c = getopt_long(argc, argv, "n:m:y:s:l:zjec:k:dorab:f:i:uqgt:ph?", long_options, &option_index);
+        c = getopt_long(argc, argv, "n:m:y:s:l:zjec:k:dorab:v:f:i:uqgt:ph?", long_options, &option_index);
 
         /* Detect the end of the options. */
         if (c == -1)
@@ -134,11 +148,13 @@ int32_t main_rna(int32_t argc, char** argv) {
         {
 
         case 'n':
-            transcript_filenames.push_back(optarg);
+            transcript_filenames.push_back(require_exists(logger, optarg));
+            require_non_gzipped(logger, transcript_filenames.back());
             break;
 
         case 'm':
-            intron_filenames.push_back(optarg);
+            intron_filenames.push_back(require_exists(logger, optarg));
+            require_non_gzipped(logger, intron_filenames.back());
             break;
 
         case 'y':
@@ -150,7 +166,7 @@ int32_t main_rna(int32_t argc, char** argv) {
             break;
 
         case 'l':
-            haplotypes_filename = optarg;
+            haplotypes_filename = require_exists(logger, optarg);
             break;
 
         case 'z':
@@ -188,17 +204,21 @@ int32_t main_rna(int32_t argc, char** argv) {
         case 'a':
             add_projected_transcript_paths = true;
             break;
-
+                
         case 'b':
-            gbwt_out_filename = optarg;
+            gbwt_out_filename = ensure_writable(logger, optarg);
+            break;
+            
+        case 'v':
+            hap_gbwt_out_filename = ensure_writable(logger, optarg);
             break;
 
         case 'f':
-            fasta_out_filename = optarg;
+            fasta_out_filename = ensure_writable(logger, optarg);
             break;
 
         case 'i':
-            info_out_filename = optarg;
+            info_out_filename = ensure_writable(logger, optarg);
             break;
 
         case 'u':
@@ -214,7 +234,7 @@ int32_t main_rna(int32_t argc, char** argv) {
             break;
 
         case 't':
-            num_threads = stoi(optarg);
+            num_threads = set_thread_count(logger, optarg);
             break;
 
         case 'p':
@@ -238,30 +258,29 @@ int32_t main_rna(int32_t argc, char** argv) {
     }
 
     if (transcript_filenames.empty() && intron_filenames.empty()) {
-
-        cerr << "[vg rna] ERROR: No transcripts or introns were given. Use --transcripts FILE and/or --introns FILE." << endl;
-        return 1;       
+        logger.error() << "No transcripts or introns were given. "
+                       << "Use --transcripts FILE and/or --introns FILE." << endl;
     }
 
     if (!haplotypes_filename.empty() && gbz_format) {
-
-        cerr << "[vg rna] ERROR: Only one set of haplotypes can be provided (GBZ file contains both a graph and haplotypes). Use either --haplotypes or --gbz-format." << endl;
-        return 1;       
+        logger.error() << "Only one set of haplotypes can be provided "
+                       << "(GBZ file contains both a graph and haplotypes). "
+                       << "Use either --haplotypes or --gbz-format." << endl;
     }
 
     if (remove_non_transcribed_nodes && !add_reference_transcript_paths && !add_projected_transcript_paths) {
-
-        cerr << "[vg rna] WARNING: Reference paths are deleted when removing intergenic and intronic regions. Consider adding transcripts as embedded paths using --add-ref-paths and/or --add-hap-paths." << endl;
+        logger.warn() << "Reference paths are deleted when removing intergenic and intronic regions. "
+                      << "Consider adding transcripts as embedded paths "
+                      << "using --add-ref-paths and/or --add-hap-paths." << endl;
     }
 
     if (path_collapse_type != "no" && path_collapse_type != "haplotype" && path_collapse_type != "all") {
-
-        cerr << "[vg rna] ERROR: Path collapse type (--path-collapse) provided not supported. Options: no, haplotype or all." << endl;
-        return 1;
+        logger.error() << "Path collapse type (--path-collapse) provided not supported. "
+                       << "Options: no, haplotype or all." << endl;
     }
 
     double time_parsing_start = gcsa::readTimer();
-    if (show_progress) { cerr << "[vg rna] Parsing graph file ..." << endl; }
+    if (show_progress) { logger.info() << "Parsing graph file ..." << endl; }
 
     string graph_filename = get_input_file_name(optind, argc, argv);
 
@@ -271,12 +290,12 @@ int32_t main_rna(int32_t argc, char** argv) {
     if (!gbz_format) {
 
         // Load pangenome graph.
-        graph = move(vg::io::VPKG::load_one<MutablePathDeletableHandleGraph>(graph_filename));
+        graph = std::move(vg::io::VPKG::load_one<MutablePathDeletableHandleGraph>(graph_filename));
     
         if (!haplotypes_filename.empty()) {
 
             // Load haplotype GBWT index.
-            if (show_progress) { cerr << "[vg rna] Parsing haplotype GBWT index file ..." << endl; }
+            if (show_progress) { logger.info() << "Parsing haplotype GBWT index file ..." << endl; }
             haplotype_index = vg::io::VPKG::load_one<gbwt::GBWT>(haplotypes_filename);
             assert(haplotype_index->bidirectional());
 
@@ -293,14 +312,15 @@ int32_t main_rna(int32_t argc, char** argv) {
         // Load GBZ file 
         unique_ptr<gbwtgraph::GBZ> gbz = vg::io::VPKG::load_one<gbwtgraph::GBZ>(graph_filename);
         
-        if (show_progress) { cerr << "[vg rna] Converting graph format ..." << endl; }
+        if (show_progress) { logger.info() << "Converting graph format ..." << endl; }
 
         // Convert GBWTGraph to mutable graph type (PackedGraph).
         graph->set_id_increment(gbz->graph.min_node_id());
         handlealgs::copy_handle_graph(&(gbz->graph), graph.get());
 
         // Copy reference and generic paths to new graph.
-        gbz->graph.for_each_path_matching({PathSense::GENERIC, PathSense::REFERENCE}, {}, {}, [&](const path_handle_t& path) {
+        gbz->graph.for_each_path_matching({PathSense::GENERIC, PathSense::REFERENCE}, {}, {},
+            [&](const path_handle_t& path) {
             
             handlegraph::algorithms::copy_path(&(gbz->graph), path, graph.get());
         });
@@ -309,12 +329,11 @@ int32_t main_rna(int32_t argc, char** argv) {
     }
 
     if (graph == nullptr) {
-        cerr << "[transcriptome] ERROR: Could not load graph." << endl;
-        exit(1);
+        logger.error() << "Could not load graph." << endl;
     }
 
     // Construct transcriptome and parse graph.
-    Transcriptome transcriptome(move(graph));
+    Transcriptome transcriptome(std::move(graph));
     assert(graph == nullptr);
 
     transcriptome.show_progress = show_progress;
@@ -323,13 +342,17 @@ int32_t main_rna(int32_t argc, char** argv) {
     transcriptome.transcript_tag = transcript_tag;
     transcriptome.path_collapse_type = path_collapse_type;
     
-    if (show_progress) { cerr << "[vg rna] Graph " << ((!haplotype_index->empty()) ? "and GBWT index " : "") << "parsed in " << gcsa::readTimer() - time_parsing_start << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl; };
+    if (show_progress) {
+        logger.info() << "Graph " << ((!haplotype_index->empty()) ? "and GBWT index " : "")
+                      << "parsed in " << gcsa::readTimer() - time_parsing_start << " seconds, "
+                      << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl;
+    };
 
 
     if (!intron_filenames.empty()) {
 
         double time_intron_start = gcsa::readTimer();
-        if (show_progress) { cerr << "[vg rna] Adding intron splice-junctions to graph ..." << endl; }
+        if (show_progress) { logger.info() << "Adding intron splice-junctions to graph ..." << endl; }
 
         vector<istream *> intron_streams;
         intron_streams.reserve(intron_filenames.size());
@@ -337,10 +360,6 @@ int32_t main_rna(int32_t argc, char** argv) {
         for (auto & filename: intron_filenames) {
 
             auto intron_stream = new ifstream(filename);
-            if (!(*intron_stream)) {
-                cerr << "ERROR: intron file " << filename << " could not be opened" << endl;
-                return 1;
-            }
             intron_streams.emplace_back(intron_stream);
         }
 
@@ -352,7 +371,11 @@ int32_t main_rna(int32_t argc, char** argv) {
             delete intron_stream;
         }
 
-        if (show_progress) { cerr << "[vg rna] Introns parsed and graph updated in " << gcsa::readTimer() - time_intron_start << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl; };
+        if (show_progress) {
+            logger.info() << "Introns parsed and graph updated in "
+                          << gcsa::readTimer() - time_intron_start << " seconds, "
+                          << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl;
+        };
     }
 
     vector<istream *> transcript_streams;
@@ -360,30 +383,32 @@ int32_t main_rna(int32_t argc, char** argv) {
     if (!transcript_filenames.empty()) {
 
         double time_transcript_start = gcsa::readTimer();
-        if (show_progress) { cerr << "[vg rna] Adding transcript splice-junctions and exon boundaries to graph ..." << endl; }
+        if (show_progress) { 
+            logger.info() << "Adding transcript splice-junctions and exon boundaries to graph ..." << endl;
+        }
 
         transcript_streams.reserve(transcript_filenames.size());
 
         for (auto & filename: transcript_filenames) {
 
             auto transcript_stream = new ifstream(filename);
-            if (!(*transcript_stream)) {
-                cerr << "ERROR: transcript file " << filename << " could not be opened" << endl;
-                return 1;
-            }
             transcript_streams.emplace_back(transcript_stream);
         }
 
         // Add transcripts as novel exon boundaries and splice-junctions to graph.
         transcriptome.add_reference_transcripts(transcript_streams, haplotype_index, use_hap_ref, !use_hap_ref);
 
-        if (show_progress) { cerr << "[vg rna] Transcripts parsed and graph updated in " << gcsa::readTimer() - time_transcript_start << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl; };
+        if (show_progress) {
+            logger.info() << "Transcripts parsed and graph updated in "
+                          << gcsa::readTimer() - time_transcript_start << " seconds, "
+                          << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl;
+        };
     }
 
     if (!transcript_streams.empty() && (!haplotype_index->empty() || proj_emded_paths) && !use_hap_ref) {
 
         double time_project_start = gcsa::readTimer();
-        if (show_progress) { cerr << "[vg rna] Projecting transcripts to haplotypes ..." << endl; }
+        if (show_progress) { logger.info() << "Projecting transcripts to haplotypes ..." << endl; }
 
         for (auto & transcript_stream: transcript_streams) {
 
@@ -396,7 +421,11 @@ int32_t main_rna(int32_t argc, char** argv) {
         // in a graph and/or haplotypes in a GBWT index.
         transcriptome.add_haplotype_transcripts(transcript_streams, *haplotype_index, proj_emded_paths);
 
-        if (show_progress) { cerr << "[vg rna] Haplotype-specific transcripts constructed in " << gcsa::readTimer() - time_project_start << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl; };
+        if (show_progress) {
+            logger.info() << "Haplotype-specific transcripts constructed in "
+                          << gcsa::readTimer() - time_project_start << " seconds, "
+                          << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl;
+        };
     }
 
     for (auto & transcript_stream: transcript_streams) {
@@ -408,37 +437,51 @@ int32_t main_rna(int32_t argc, char** argv) {
     if (remove_non_transcribed_nodes) {
 
         double time_remove_start = gcsa::readTimer();
-        if (show_progress) { cerr << "[vg rna] Removing non-transcribed regions ..." << endl; }
+        if (show_progress) { logger.info() << "Removing non-transcribed regions ..." << endl; }
 
         transcriptome.remove_non_transcribed_nodes();
 
-        if (show_progress) { cerr << "[vg rna] Regions removed in " << gcsa::readTimer() - time_remove_start << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl; };
+        if (show_progress) {
+            logger.info() << "Regions removed in " << gcsa::readTimer() - time_remove_start
+                          << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl;
+        };
     }
 
 
     if (max_node_length > 0) {
 
         double time_chop_start = gcsa::readTimer();
-        if (show_progress) { cerr << "[vg rna] Chopping long nodes ..." << endl; }
+        if (show_progress) { logger.info() << "Chopping long nodes ..." << endl; }
 
         transcriptome.chop_nodes(max_node_length);
 
-        if (show_progress) { cerr << "[vg rna] Nodes chopped in " << gcsa::readTimer() - time_chop_start << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl; };
+        if (show_progress) {
+            logger.info() << "Nodes chopped in " << gcsa::readTimer() - time_chop_start 
+                          << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl;
+        };
     }
 
 
     if (sort_collapse_graph) {
     
         double time_sort_start = gcsa::readTimer();
-        if (show_progress) { cerr << "[vg rna] Topological sorting graph and compacting node ids ..." << endl; }
+        if (show_progress) {
+            logger.info() << "Topological sorting graph and compacting node ids ..." << endl;
+        }
         
         if (transcriptome.sort_compact_nodes()) {
 
-            if (show_progress) { cerr << "[vg rna] Graph sorted and compacted in " << gcsa::readTimer() - time_sort_start << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl; };
+            if (show_progress) { 
+                logger.info() << "Graph sorted and compacted in " 
+                              << gcsa::readTimer() - time_sort_start << " seconds, " 
+                              << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl;
+            };
 
         } else {
 
-            if (show_progress) { cerr << "[vg rna] WARNING: Can only sort and compact node ids for a graph in the PackedGraph format" << endl; };            
+            if (show_progress) {
+                logger.warn() << "Can only sort and compact node ids for a graph in the PackedGraph format" << endl;
+            };            
         }        
     }
 
@@ -449,16 +492,25 @@ int32_t main_rna(int32_t argc, char** argv) {
 
         if (add_reference_transcript_paths && add_projected_transcript_paths) {
 
-            if (show_progress) { cerr << "[vg rna] Adding reference and projected transcripts as embedded paths in the graph ..." << endl; }
+            if (show_progress) {
+                logger.info() << "Adding reference and projected transcripts "
+                              << "as embedded paths in the graph ..." << endl;
+            }
 
         } else {
 
-            if (show_progress) { cerr << "[vg rna] Adding " << ((add_reference_transcript_paths) ? "reference" : "projected") << " transcripts as embedded paths in the graph ..." << endl; }
+            if (show_progress) { 
+                logger.info() << "Adding " << ((add_reference_transcript_paths) ? "reference" : "projected")
+                              << " transcripts as embedded paths in the graph ..." << endl;
+            }
         }
 
         transcriptome.embed_transcript_paths(add_reference_transcript_paths, add_projected_transcript_paths);
 
-        if (show_progress) { cerr << "[vg rna] Transcript paths added in " << gcsa::readTimer() - time_add_start << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl; };
+        if (show_progress) {
+            logger.info() << "Transcript paths added in " << gcsa::readTimer() - time_add_start 
+                          << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl;
+        };
     }
 
 
@@ -468,7 +520,9 @@ int32_t main_rna(int32_t argc, char** argv) {
 
     if (write_pantranscriptome) {
 
-        if (show_progress) { cerr << "[vg rna] Writing pantranscriptome transcripts to file(s) ..." << endl; }
+        if (show_progress) {
+            logger.info() << "Writing pantranscriptome transcripts to file(s) ..." << endl;
+        }
     }
 
     // Write transcript paths in transcriptome as GBWT index.
@@ -476,7 +530,8 @@ int32_t main_rna(int32_t argc, char** argv) {
 
         // Silence GBWT index construction. 
         gbwt::Verbosity::set(gbwt::Verbosity::SILENT); 
-        gbwt::GBWTBuilder gbwt_builder(gbwt::bit_length(gbwt::Node::encode(transcriptome.graph().max_node_id(), true)), gbwt::DynamicGBWT::INSERT_BATCH_SIZE, gbwt::DynamicGBWT::SAMPLE_INTERVAL);
+        gbwt::GBWTBuilder gbwt_builder(gbwt::bit_length(gbwt::Node::encode(transcriptome.graph().max_node_id(), true)),
+                                       gbwt::DynamicGBWT::INSERT_BATCH_SIZE, gbwt::DynamicGBWT::SAMPLE_INTERVAL);
 
         transcriptome.add_transcripts_to_gbwt(&gbwt_builder, gbwt_add_bidirectional, exclude_reference_transcripts);
 
@@ -485,6 +540,20 @@ int32_t main_rna(int32_t argc, char** argv) {
         // Finish contruction and recode index.
         gbwt_builder.finish();
         save_gbwt(gbwt_builder.index, gbwt_out_filename);
+    }
+    
+    // Write a haplotype GBWT with node IDs updated to match the spliced graph.
+    if (!hap_gbwt_out_filename.empty()) {
+        if (!haplotype_index.get()) {
+            logger.warn() << "not saving updated haplotypes to " << hap_gbwt_out_filename 
+                          << " because haplotypes were not provided as input" << endl;
+        }
+        else {
+            ofstream hap_gbwt_ostream;
+            hap_gbwt_ostream.open(hap_gbwt_out_filename);
+            
+            haplotype_index->serialize(hap_gbwt_ostream);
+        }
     }
 
     // Write transcript sequences in transcriptome as fasta file.
@@ -496,7 +565,7 @@ int32_t main_rna(int32_t argc, char** argv) {
         transcriptome.write_transcript_sequences(&fasta_ostream, exclude_reference_transcripts);
      
         fasta_ostream.close();
-    }    
+    }
 
     // Write transcript info in transcriptome as tsv file.
     if (!info_out_filename.empty()) {
@@ -509,12 +578,16 @@ int32_t main_rna(int32_t argc, char** argv) {
         info_ostream.close();
     }    
 
-    if (show_progress) { cerr << "[vg rna] Writing splicing graph to stdout ..." << endl; }
+    if (show_progress) { logger.info() << "Writing splicing graph to stdout ..." << endl; }
 
     // Write splicing graph to stdout 
     transcriptome.write_graph(&cout);
 
-    if (show_progress) { cerr << "[vg rna] Graph " << (write_pantranscriptome ? "and pantranscriptome " : "") << "written in " << gcsa::readTimer() - time_writing_start << " seconds, " << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl; };
+    if (show_progress) {
+        logger.info() << "Graph " << (write_pantranscriptome ? "and pantranscriptome " : "")
+                      << "written in " << gcsa::readTimer() - time_writing_start << " seconds, " 
+                      << gcsa::inGigabytes(gcsa::memoryUsage()) << " GB" << endl;
+    };
 
     return 0;
 }

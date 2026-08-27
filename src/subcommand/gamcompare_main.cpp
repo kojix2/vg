@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <iomanip>
 
 #include "subcommand.hpp"
 
@@ -25,13 +26,18 @@ void help_gamcompare(char** argv) {
     cerr << "usage: " << argv[0] << " gamcompare aln.gam truth.gam >output.gam" << endl
          << endl
          << "options:" << endl
-         << "    -d, --distance-index FILE  use distances from this distance index instead of path position annotations" << endl
-         << "    -r, --range N              distance within which to consider reads correct" << endl
-         << "    -n, --rename Q=T           interpret the given query contig name as the given truth contig (may repeat)" << endl
-         << "    -T, --tsv                  output TSV (correct, mq, aligner, read) compatible with plot-qq.R instead of GAM" << endl
-         << "    -a, --aligner              aligner name for TSV output [\"vg\"]" << endl
-         << "    -s, --score-alignment      get a correctness score of the alignment (higher is better)" << endl
-         << "    -t, --threads N            number of threads to use" << endl;
+         << "  -d, --distance-index FILE  use distances from this distance index" << endl
+         << "                             instead of path position annotations" << endl
+         << "  -r, --range N              distance within which to consider reads correct" << endl
+         << "  -n, --rename Q=T           treat query contig Q as truth contig T (may repeat)" << endl
+         << "  -I, --ignore T             ignore the given truth contig name (may repeat)" << endl
+         << "  -o, --output-gam FILE      output GAM to FILE instead of standard output" << endl
+         << "  -T, --tsv                  output TSV (correct, mq, aligner, read)" << endl
+         << "                             compatible with plot-qq.R to standard output" << endl
+         << "  -a, --aligner STR          aligner name for TSV output [\"vg\"]" << endl
+         << "  -s, --score-alignment      get alignment correctness score (higher is better)" << endl
+         << "  -t, --threads N            number of threads to use" << endl
+         << "  -h, --help                 print this help message to stderr and exit" << endl;
 }
 
 // A gapless alignment between a read and a single node.
@@ -85,6 +91,7 @@ std::vector<MappingRun> base_mappings(const Alignment& aln) {
 }
 
 int main_gamcompare(int argc, char** argv) {
+    Logger logger("vg gamcompare");
 
     if (argc == 2) {
         help_gamcompare(argv);
@@ -93,12 +100,15 @@ int main_gamcompare(int argc, char** argv) {
 
     int threads = 1;
     int64_t range = -1;
+    string output_gam;
     bool output_tsv = false;
     string aligner_name = "vg";
     bool score_alignment = false;
     string distance_name;
     // Map from query contigs to corresponding truth contigs
     std::unordered_map<string, string> renames;
+    // Keep a set of ignored truth contigs
+    std::unordered_set<std::string> ignores;
 
     int c;
     optind = 2;
@@ -109,6 +119,8 @@ int main_gamcompare(int argc, char** argv) {
             {"distance-index", required_argument, 0, 'd'},
             {"range", required_argument, 0, 'r'},
             {"rename", required_argument, 0, 'n'},
+            {"ignore", required_argument, 0, 'I'},
+            {"output-gam", required_argument, 0, 'o'},
             {"tsv", no_argument, 0, 'T'},
             {"aligner", required_argument, 0, 'a'},
             {"score-alignment", no_argument, 0, 's'},
@@ -117,7 +129,7 @@ int main_gamcompare(int argc, char** argv) {
         };
 
         int option_index = 0;
-        c = getopt_long (argc, argv, "hd:r:n:Ta:st:",
+        c = getopt_long (argc, argv, "h?d:r:I:n:o:Ta:st:",
                          long_options, &option_index);
 
         // Detect the end of the options.
@@ -132,23 +144,23 @@ int main_gamcompare(int argc, char** argv) {
             
         case 'n':
             {
-                // Parse the rename old=new
-                string key_value(optarg);
-                auto found = key_value.find('=');
-                if (found == string::npos || found == 0 || found + 1 == key_value.size()) {
-                    cerr << "error:[vg gamcompare] could not parse rename " << key_value << endl;
-                    exit(1);
-                }
-                // Parse out the two parts
-                string query_contig = key_value.substr(0, found);
-                string truth_contig = key_value.substr(found + 1);
+                string query_contig, truth_contig;
+                tie(query_contig, truth_contig) = parse_pair(logger, optarg, '=', "--rename");
                 // Add the name mapping
                 renames.emplace(query_contig, truth_contig);
             }
             break;
 
+        case 'I':
+            ignores.insert(optarg);
+            break;
+
         case 'd':
-            distance_name = optarg;
+            distance_name = require_exists(logger, optarg);
+            break;
+
+        case 'o':
+            output_gam = ensure_writable(logger, optarg);
             break;
 
         case 'T':
@@ -164,8 +176,7 @@ int main_gamcompare(int argc, char** argv) {
             break;
 
         case 't':
-            threads = parse<int>(optarg);
-            omp_set_num_threads(threads);
+            set_thread_count(logger, optarg);
             break;
 
         case 'h':
@@ -186,11 +197,31 @@ int main_gamcompare(int argc, char** argv) {
     // True path positions. For each alignment name, store a mapping from reference path names
     // to sets of (sequence offset, is_reverse). There is usually either one position per
     // alignment or one position per node.
-    vg::string_hash_map<string, map<string, vector<pair<size_t, bool> > > > true_path_positions;
-    function<void(Alignment&)> record_path_positions = [&true_path_positions](Alignment& aln) {
-        auto val = alignment_refpos_to_path_offsets(aln);
-#pragma omp critical (truth_table)
-        true_path_positions[aln.name()] = val;
+    vg::string_hash_map<string, map<string, vector<pair<size_t, bool>>>> true_path_positions;
+    function<void(Alignment&)> record_path_positions = [&true_path_positions,&ignores](Alignment& aln) {
+        if (aln.refpos_size() > 0) {
+            std::map<std::string, std::vector<std::pair<size_t, bool>>> val = alignment_refpos_to_path_offsets(aln);
+
+            // TODO: Is it faster to poll all the contigs against the ignores
+            // list and drop them as we go, or look up and remove each ignored
+            // contig?
+            auto it = val.begin();
+            while(it != val.end()) {
+                // See if each contig we have a position on is ignored.
+                if (ignores.count(it->first)) {
+                    // Drop this contig
+                    it = val.erase(it);
+                } else {
+                    // Keep this contig
+                    ++it;
+                }
+            }
+
+            if (!val.empty()) {
+                #pragma omp critical (truth_table)
+                true_path_positions[aln.name()] = val;
+            }
+        }
     };
 
     // True graph positions. For each alignment name, we find the maximal read intervals that correspond
@@ -206,12 +237,10 @@ int main_gamcompare(int argc, char** argv) {
     if (truth_file_name == "-") {
         // Read truth fropm standard input, if it looks good.
         if (test_file_name == "-") {
-            cerr << "error[vg gamcompare]: Standard input can only be used for truth or test file, not both" << endl;
-            exit(1);
+            logger.error() << "Standard input can only be used for truth or test file, not both" << endl;
         }
         if (!std::cin) {
-            cerr << "error[vg gamcompare]: Unable to read standard input when looking for true reads" << endl;
-            exit(1);
+            logger.error() << "Unable to read standard input when looking for true reads" << endl;
         }
         if (distance_name.empty()) {
             vg::io::for_each_parallel(std::cin, record_path_positions);
@@ -221,10 +250,6 @@ int main_gamcompare(int argc, char** argv) {
     } else {
         // Read truth from this file, if it looks good.
         ifstream truth_file_in(truth_file_name);
-        if (!truth_file_in) {
-            cerr << "error[vg gamcompare]: Unable to read " << truth_file_name << " when looking for true reads" << endl;
-            exit(1);
-        }
         if (distance_name.empty()) {
             vg::io::for_each_parallel(truth_file_in, record_path_positions);
         } else {
@@ -232,9 +257,11 @@ int main_gamcompare(int argc, char** argv) {
         }
     }
     if (score_alignment && range == -1) {
-        cerr << "error[vg gamcompare]: Score-alignment requires range" << endl;
-        exit(1);
+        logger.error() << "Score-alignment requires range" << endl;
     }
+
+    // Count eligible reads that actually have positions that could be got.
+    size_t eligible_reads = distance_name.empty() ? true_path_positions.size() : true_graph_positions.size();
 
     // Load the distance index.
     unique_ptr<SnarlDistanceIndex> distance_index;
@@ -242,9 +269,16 @@ int main_gamcompare(int argc, char** argv) {
         distance_index = vg::io::VPKG::load_one<SnarlDistanceIndex>(distance_name);
     }
 
-    // We have a buffered emitter for annotated alignments, if we're not outputting text
+    // We have a buffered emitter for annotated alignments, if we're not outputting text.
+    // Start out with this empty so we output nowhere.
     std::unique_ptr<vg::io::ProtobufEmitter<Alignment>> emitter;
-    if (!output_tsv) {
+    std::ofstream output_gam_stream;
+    if (!output_gam.empty()) {
+        // Output to specified location
+        output_gam_stream.open(output_gam, std::ios_base::out | std::ios_base::trunc | std::ios_base::binary);
+        emitter = std::unique_ptr<vg::io::ProtobufEmitter<Alignment>>(new vg::io::ProtobufEmitter<Alignment>(output_gam_stream));
+    } else if (!output_tsv) {
+        // Output to standard output.
         emitter = std::unique_ptr<vg::io::ProtobufEmitter<Alignment>>(new vg::io::ProtobufEmitter<Alignment>(cout));
     }
     
@@ -252,7 +286,7 @@ int main_gamcompare(int argc, char** argv) {
     vector<Alignment> text_buffer;
     
     // We have an output function to dump all the reads in the text buffer in TSV
-    auto flush_text_buffer = [&text_buffer,&output_tsv,&aligner_name]() {
+    auto flush_text_buffer = [&text_buffer,&aligner_name]() {
         // We print exactly one header line.
         static bool header_printed = false;
         // Output TSV to standard out in the format plot-qq.R needs.
@@ -388,15 +422,14 @@ int main_gamcompare(int argc, char** argv) {
 
     if (test_file_name == "-") {
         if (!std::cin) {
-            cerr << "error[vg gamcompare]: Unable to read standard input when looking for reads under test" << endl;
-            exit(1);
+            logger.error() << "Unable to read standard input when looking for reads under test" << endl;
         }
         vg::io::for_each_parallel(std::cin, annotate_test);
     } else {
         ifstream test_file_in(test_file_name);
         if (!test_file_in) {
-            cerr << "error[vg gamcompare]: Unable to read " << test_file_name << " when looking for reads under test" << endl;
-            exit(1);
+            logger.error() << "Unable to read " << test_file_name
+                           << " when looking for reads under test" << endl;
         }
         vg::io::for_each_parallel(test_file_in, annotate_test);
     }
@@ -414,7 +447,14 @@ int main_gamcompare(int argc, char** argv) {
             total_correct += count;
         }
         
-        cerr << total_correct << " reads correct" << endl;
+        cerr << total_correct << " reads correct, " << eligible_reads << " reads eligible";
+        if (eligible_reads > 0 && eligible_reads >= total_correct) {
+            std::ios state(nullptr);
+            state.copyfmt(cerr);
+            cerr << ", " << std::fixed << std::setprecision(2) << (double)total_correct / eligible_reads * 100 << "% accuracy";
+            cerr.copyfmt(state);
+        }
+        cerr << endl;
     }
 
     if (score_alignment) {
@@ -447,6 +487,14 @@ int main_gamcompare(int argc, char** argv) {
         }
         cerr << "mapping goodness score: " << mapping_goodness_score / total_reads << endl;
 
+    }
+
+    if (emitter) {
+        // Make sure to get rid of the emitter before the file it might write to
+        emitter.reset();
+    }
+    if (output_gam_stream.is_open()) {
+        output_gam_stream.close();
     }
     
     return 0;

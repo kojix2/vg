@@ -487,7 +487,7 @@ namespace vg {
         if (!multipath_alns_out.empty()) {
             // find clusters whose likelihoods are approximately the same as the low end of the clusters we aligned
             auto aligner = get_aligner(!alignment.quality().empty());
-            int64_t score_diff = round(aligner->mapping_quality_score_diff(truncation_multiplicity_mq_limit));
+            int64_t score_diff = round(aligner->mapq_calc->mapping_quality_score_diff(truncation_multiplicity_mq_limit));
             int64_t max_tail_idx = multipath_alns_out.size();
             while (max_tail_idx < cluster_graphs.size()
                    && get<2>(cluster_graphs[max_tail_idx]) >= get<2>(cluster_graphs[multipath_alns_out.size() - 1]) - score_diff) {
@@ -576,8 +576,8 @@ namespace vg {
             auto aligner = get_aligner(!alignment1.quality().empty() && !alignment2.quality().empty());
             
             // score possible of a perfect match (at full base quality)
-            int32_t max_score_1 = multipath_aln_1.sequence().size() * aligner->match + 2 * aligner->full_length_bonus * !strip_bonuses;
-            int32_t max_score_2 = multipath_aln_2.sequence().size() * aligner->match + 2 * aligner->full_length_bonus * !strip_bonuses;
+            int32_t max_score_1 = multipath_aln_1.sequence().size() * aligner->scorer->match + 2 * aligner->scorer->full_length_bonus * !strip_bonuses;
+            int32_t max_score_2 = multipath_aln_2.sequence().size() * aligner->scorer->match + 2 * aligner->scorer->full_length_bonus * !strip_bonuses;
             
 #ifdef debug_multipath_mapper
             cerr << "single ended mappings achieves scores " << optimal_alignment_score(multipath_aln_1) << " and " << optimal_alignment_score(multipath_aln_2) << ", looking for scores " << .8 * max_score_1 << " and " << .8 * max_score_2 << endl;
@@ -609,7 +609,7 @@ namespace vg {
                     cerr << "registering measurement, now have " << fragment_length_distr.curr_sample_size() << " of " << fragment_length_distr.max_sample_size() << endl;
 #endif
                     
-                    multipath_aln_pairs_out.emplace_back(move(multipath_aln_1), move(multipath_aln_2));
+                    multipath_aln_pairs_out.emplace_back(std::move(multipath_aln_1), std::move(multipath_aln_2));
                     fragment_length_distr.register_fragment_length(fragment_length);
                     
                     is_ambiguous = false;
@@ -675,7 +675,7 @@ namespace vg {
         
         auto aligner = get_aligner(!multipath_aln.quality().empty() && !other_aln.quality().empty());
         vector<double> score(1, optimal_alignment_score(rescue_multipath_aln));
-        int32_t solo_mapq = mapq_scaling_factor * aligner->compute_max_mapping_quality(score, mapping_quality_method == Approx);
+        int32_t solo_mapq = mapq_scaling_factor * aligner->mapq_calc->compute_max_mapping_quality(score, mapping_quality_method == Approx);
         int32_t adjusted_mapq = min<int32_t>(solo_mapq, min(max_mapping_quality, multipath_aln.mapping_quality()));
         rescue_multipath_aln.set_mapping_quality(adjusted_mapq);
         
@@ -731,7 +731,7 @@ namespace vg {
         
         // the longest path we could possibly align to (full gap and a full sequence)
         auto aligner = get_aligner(!multipath_aln.quality().empty() && !other_aln.quality().empty());
-        size_t target_length = other_aln.sequence().size() + min(aligner->longest_detectable_gap(other_aln), max_alignment_gap);
+        size_t target_length = other_aln.sequence().size() + min(aligner->scorer->longest_detectable_gap(other_aln), max_alignment_gap);
         
         // convert from bidirected to directed
         StrandSplitGraph align_digraph(&rescue_graph);
@@ -1328,7 +1328,7 @@ namespace vg {
 #ifdef debug_multipath_mapper
             cerr << "found consistent, confident pair mapping from independent end mapping" << endl;
 #endif
-            multipath_aln_pairs_out.emplace_back(move(multipath_alns_1.front()), move(multipath_alns_2.front()));
+            multipath_aln_pairs_out.emplace_back(std::move(multipath_alns_1.front()), std::move(multipath_alns_2.front()));
             pair_distances.emplace_back(make_pair(cluster_idxs_1.front(), cluster_idxs_2.front()),
                                         distance_between(multipath_aln_pairs_out.back().first, multipath_aln_pairs_out.back().second, true));
             pair_multiplicities.emplace_back(min(multiplicities_1.front(), multiplicities_2.front()));
@@ -1338,7 +1338,7 @@ namespace vg {
         // figure out how many rescues we will do and could do from each side
         
         int32_t max_score_diff = get_aligner(!alignment1.quality().empty() &&
-                                             !alignment2.quality().empty())->mapping_quality_score_diff(max_mapping_quality);
+                                             !alignment2.quality().empty())->mapq_calc->mapping_quality_score_diff(max_mapping_quality);
         
         int32_t top_score_1 = multipath_alns_1.empty() ? 0 : optimal_alignment_score(multipath_alns_1.front());
         int32_t top_score_2 = multipath_alns_2.empty() ? 0 : optimal_alignment_score(multipath_alns_2.front());
@@ -1378,7 +1378,7 @@ namespace vg {
             multipath_alignment_t rescue_multipath_aln;
             if (attempt_rescue(multipath_alns_1[i], alignment2, true, rescue_multipath_aln)) {
                 rescued_from_1.insert(i);
-                rescue_multipath_alns_2[i] = move(rescue_multipath_aln);
+                rescue_multipath_alns_2[i] = std::move(rescue_multipath_aln);
             }
         }
         
@@ -1386,7 +1386,7 @@ namespace vg {
             multipath_alignment_t rescue_multipath_aln;
             if (attempt_rescue(multipath_alns_2[i], alignment1, false, rescue_multipath_aln)) {
                 rescued_from_2.insert(i);
-                rescue_multipath_alns_1[i] = move(rescue_multipath_aln);
+                rescue_multipath_alns_1[i] = std::move(rescue_multipath_aln);
             }
         }
         
@@ -1427,7 +1427,7 @@ namespace vg {
                             // move the original mappings
                             int64_t dist = distance_between(multipath_alns_1[i], multipath_alns_2[j], true);
                             if (dist != numeric_limits<int64_t>::max() && dist >= 0) {
-                                multipath_aln_pairs_out.emplace_back(move(multipath_alns_1[i]), move(multipath_alns_2[j]));
+                                multipath_aln_pairs_out.emplace_back(std::move(multipath_alns_1[i]), std::move(multipath_alns_2[j]));
                                 pair_distances.emplace_back(make_pair(cluster_idxs_1[i], cluster_idxs_2[j]), dist);
                                 pair_multiplicities.emplace_back(min(estimated_multiplicity_from_1 * multiplicities_1[i],
                                                                      estimated_multiplicity_from_2 * multiplicities_2[j]));
@@ -1446,7 +1446,7 @@ namespace vg {
 #ifdef debug_multipath_mapper
                         cerr << "adding read1 and rescued read2 " << i << " to output vector" << endl;
 #endif
-                        multipath_aln_pairs_out.emplace_back(move(multipath_alns_1[i]), move(rescue_multipath_alns_2[i]));
+                        multipath_aln_pairs_out.emplace_back(std::move(multipath_alns_1[i]), std::move(rescue_multipath_alns_2[i]));
                         pair_distances.emplace_back(make_pair(cluster_idxs_1[i], RESCUED), dist);
                         pair_multiplicities.emplace_back(estimated_multiplicity_from_1 * multiplicities_1[i]);
                         found_consistent = true;
@@ -1465,7 +1465,7 @@ namespace vg {
 #ifdef debug_multipath_mapper
                     cerr << "adding rescued read1 and read2 " << j << " to output vector" << endl;
 #endif
-                    multipath_aln_pairs_out.emplace_back(move(rescue_multipath_alns_1[j]), move(multipath_alns_2[j]));
+                    multipath_aln_pairs_out.emplace_back(std::move(rescue_multipath_alns_1[j]), std::move(multipath_alns_2[j]));
                     pair_distances.emplace_back(make_pair(RESCUED, cluster_idxs_2[j]), dist);
                     pair_multiplicities.emplace_back(estimated_multiplicity_from_2 * multiplicities_2[j]);
                     found_consistent = true;
@@ -1479,7 +1479,7 @@ namespace vg {
             for (size_t i: rescued_from_1) {
                 int64_t dist = distance_between(multipath_alns_1[i], rescue_multipath_alns_2[i], true);
                 if (dist != numeric_limits<int64_t>::max() && dist >= 0) {
-                    multipath_aln_pairs_out.emplace_back(move(multipath_alns_1[i]), move(rescue_multipath_alns_2[i]));
+                    multipath_aln_pairs_out.emplace_back(std::move(multipath_alns_1[i]), std::move(rescue_multipath_alns_2[i]));
                     pair_distances.emplace_back(make_pair(cluster_idxs_1[i], RESCUED), dist);
                     pair_multiplicities.emplace_back(estimated_multiplicity_from_1 * multiplicities_1[i]);
                     found_consistent = true;
@@ -1493,7 +1493,7 @@ namespace vg {
             for (size_t i : rescued_from_2) {
                 int64_t dist = distance_between(rescue_multipath_alns_1[i], multipath_alns_2[i], true);
                 if (dist != numeric_limits<int64_t>::max() && dist >= 0) {
-                    multipath_aln_pairs_out.emplace_back(move(rescue_multipath_alns_1[i]), move(multipath_alns_2[i]));
+                    multipath_aln_pairs_out.emplace_back(std::move(rescue_multipath_alns_1[i]), std::move(multipath_alns_2[i]));
                     pair_distances.emplace_back(make_pair(RESCUED, cluster_idxs_2[i]), dist);
                     pair_multiplicities.emplace_back(estimated_multiplicity_from_2 * multiplicities_2[i]);
                     found_consistent = true;
@@ -1567,17 +1567,17 @@ namespace vg {
             multipath_aln_pairs_out.reserve(num_pairs_to_report);
             for (size_t i = 0; i < num_pairs_to_report; i++) {
                 if (i < multipath_alns_1.size() && i < multipath_alns_2.size()) {
-                    multipath_aln_pairs_out.emplace_back(move(multipath_alns_1[i]), move(multipath_alns_2[i]));
+                    multipath_aln_pairs_out.emplace_back(std::move(multipath_alns_1[i]), std::move(multipath_alns_2[i]));
                     
                 }
                 else if (i < multipath_alns_1.size()) {
-                    multipath_aln_pairs_out.emplace_back(move(multipath_alns_1[i]), multipath_alignment_t());
+                    multipath_aln_pairs_out.emplace_back(std::move(multipath_alns_1[i]), multipath_alignment_t());
                     to_multipath_alignment(alignment2, multipath_aln_pairs_out.back().second);
                     multipath_aln_pairs_out.back().second.clear_subpath();
                     multipath_aln_pairs_out.back().second.clear_start();
                 }
                 else {
-                    multipath_aln_pairs_out.emplace_back(multipath_alignment_t(), move(multipath_alns_2[i]));
+                    multipath_aln_pairs_out.emplace_back(multipath_alignment_t(), std::move(multipath_alns_2[i]));
                     to_multipath_alignment(alignment1, multipath_aln_pairs_out.back().first);
                     multipath_aln_pairs_out.back().first.clear_subpath();
                     multipath_aln_pairs_out.back().first.clear_start();
@@ -1639,9 +1639,9 @@ namespace vg {
         }
         
         auto aligner = get_aligner(!alignment1.quality().empty() && !alignment2.quality().empty());
-        int32_t cluster_score_1 = aligner->match * get<2>(cluster_graphs1[cluster_pairs.front().first.first]);
-        int32_t cluster_score_2 = aligner->match * get<2>(cluster_graphs2[cluster_pairs.front().first.second]);
-        int32_t max_score_diff = secondary_rescue_score_diff * aligner->mapping_quality_score_diff(max_mapping_quality);
+        int32_t cluster_score_1 = aligner->scorer->match * get<2>(cluster_graphs1[cluster_pairs.front().first.first]);
+        int32_t cluster_score_2 = aligner->scorer->match * get<2>(cluster_graphs2[cluster_pairs.front().first.second]);
+        int32_t max_score_diff = secondary_rescue_score_diff * aligner->mapq_calc->mapping_quality_score_diff(max_mapping_quality);
         
         vector<pair<multipath_alignment_t, multipath_alignment_t>> rescued_secondaries;
         vector<pair<pair<size_t, size_t>, int64_t>> rescued_distances;
@@ -1670,10 +1670,10 @@ namespace vg {
                 }
                 
 #ifdef debug_multipath_mapper
-                cerr << "cluster " << i << "'s approximate score is " << get<2>(cluster_graphs[i]) * aligner->match << ", looking for " << max_score - max_score_diff << endl;
+                cerr << "cluster " << i << "'s approximate score is " << get<2>(cluster_graphs[i]) * aligner->scorer->match << ", looking for " << max_score - max_score_diff << endl;
 #endif
                 
-                if (get<2>(cluster_graphs[i]) * aligner->match < max_score - max_score_diff) {
+                if (get<2>(cluster_graphs[i]) * aligner->scorer->match < max_score - max_score_diff) {
 #ifdef debug_multipath_mapper
                     cerr << "the approximate score of the remaining is too low to consider" << endl;
 #endif
@@ -1728,7 +1728,7 @@ namespace vg {
                             int64_t dist = distance_between(cluster_multipath_alns.front(), rescue_multipath_aln, true);
                             if (dist >= 0 && dist != numeric_limits<int64_t>::max()) {
                                 simplify_complicated_multipath_alignment(cluster_multipath_alns.front());
-                                rescued_secondaries.emplace_back(move(cluster_multipath_alns.front()), move(rescue_multipath_aln));
+                                rescued_secondaries.emplace_back(std::move(cluster_multipath_alns.front()), std::move(rescue_multipath_aln));
                                 rescued_distances.emplace_back(make_pair(i, RESCUED), dist);
                                 
                             }
@@ -1737,7 +1737,7 @@ namespace vg {
                             int64_t dist = distance_between(rescue_multipath_aln, cluster_multipath_alns.front(), true);
                             if (dist >= 0 && dist != numeric_limits<int64_t>::max()) {
                                 simplify_complicated_multipath_alignment(cluster_multipath_alns.front());
-                                rescued_secondaries.emplace_back(move(rescue_multipath_aln), move(cluster_multipath_alns.front()));
+                                rescued_secondaries.emplace_back(std::move(rescue_multipath_aln), std::move(cluster_multipath_alns.front()));
                                 rescued_distances.emplace_back(make_pair(RESCUED, i), dist);
                                 
                             }
@@ -2092,7 +2092,7 @@ namespace vg {
             
             if (proper_paired) {
                 // we'll want to remember the multiplicities
-                pair_multiplicities = move(rescue_multiplicities);
+                pair_multiplicities = std::move(rescue_multiplicities);
             }
         }
         
@@ -2390,13 +2390,13 @@ namespace vg {
                 int32_t min_gap_penalty = 0;
                 int64_t link_length = left_clip_length + right_clip_length - opt.sequence().size();
                 if (link_length < min_dist) {
-                    min_gap_penalty = aligner.score_gap(min_dist - link_length);
+                    min_gap_penalty = aligner.scorer->score_gap(min_dist - link_length);
                 }
                 else if (link_length > max_dist) {
-                    min_gap_penalty = aligner.score_gap(link_length - max_dist);
+                    min_gap_penalty = aligner.scorer->score_gap(link_length - max_dist);
                 }
                 return (min_gap_penalty
-                        + aligner.score_exact_match(opt, opt.sequence().size() - left_clip_length,
+                        + aligner.scorer->score_exact_match(opt, opt.sequence().size() - left_clip_length,
                                                     link_length)
                         + fixed_score_components(splice_stats, opt));
             }
@@ -2448,7 +2448,7 @@ namespace vg {
                     // in the left_idxs and right_idxs vectors
                     int64_t target_len = 2 * seq_len - left_side.clip_length - right_side.clip_length;
                     auto distance_diff = [&](size_t l, size_t r) {
-                        return abs<int64_t>(get<2>(left_sites[left_idxs[l]]) + get<2>(right_sites[right_idxs[r]]) - target_len);
+                        return std::abs(static_cast<int64_t>(get<2>(left_sites[left_idxs[l]]) + get<2>(right_sites[right_idxs[r]]) - target_len));
                     };
                     
                     // sweep to identify pairs that most nearly align
@@ -2761,7 +2761,7 @@ namespace vg {
                 vector<size_t> motif_max_num_pairs;
                 if (total_num_pairs < max_motif_pairs) {
                     // we can afford to do all of the candidates
-                    motif_max_num_pairs = move(num_candidate_pairs);
+                    motif_max_num_pairs = std::move(num_candidate_pairs);
                 }
                 else {
                     // we have to budget out the number of candidates, so we have this procedure
@@ -2951,7 +2951,7 @@ namespace vg {
 #endif
                     best_intron_length = join.estimated_intron_length;
                     best_net_score = net_score;
-                    best_join = unique_ptr<PutativeJoin>(new PutativeJoin(move(join)));
+                    best_join = unique_ptr<PutativeJoin>(new PutativeJoin(std::move(join)));
                     
                 }
             }
@@ -3246,7 +3246,7 @@ namespace vg {
                         mapping->mutable_edit()->insert(mapping->edit().begin(), softclip);
                         // we need to take away the full length bonus
                         subpath->set_score(subpath->score()
-                                           - get_aligner(alignment.quality().empty())->score_full_length_bonus(true, splice_aln));
+                                           - get_aligner(alignment.quality().empty())->scorer->score_full_length_bonus(true, splice_aln));
                     }
                 }
             }
@@ -3275,7 +3275,7 @@ namespace vg {
                             softclip->set_from_length(0);
                             // we need to take away the full length bonus
                             subpath->set_score(subpath->score()
-                                               - get_aligner(alignment.quality().empty())->score_full_length_bonus(false, splice_aln));
+                                               - get_aligner(alignment.quality().empty())->scorer->score_full_length_bonus(false, splice_aln));
                         }
                     }
                 }
@@ -3577,7 +3577,7 @@ namespace vg {
         
         // choose the score cutoff based on the original unspliced mappings
         int32_t min_score_to_attempt = (optimal_alignment_score(multipath_alns_out.front())
-                                        - get_aligner()->mapping_quality_score_diff(max_mapping_quality));
+                                        - get_aligner()->mapq_calc->mapping_quality_score_diff(max_mapping_quality));
         
         vector<int64_t> current_index(multipath_alns_out.size(), 0);
         for (int64_t i = 1; i < multipath_alns_out.size(); ++i) {
@@ -3617,11 +3617,11 @@ namespace vg {
             }
             // TODO: repetitive with paired version
             auto alnr = get_aligner(!alignment.quality().empty());
-            int64_t left_max_score = (alnr->score_exact_match(alignment, 0, interval.first)
-                                      + (interval.first == 0 ? 0 : alnr->score_full_length_bonus(true, alignment)));
-            int64_t right_max_score = (alnr->score_exact_match(alignment, interval.second,
+            int64_t left_max_score = (alnr->scorer->score_exact_match(alignment, 0, interval.first)
+                                      + (interval.first == 0 ? 0 : alnr->scorer->score_full_length_bonus(true, alignment)));
+            int64_t right_max_score = (alnr->scorer->score_exact_match(alignment, interval.second,
                                                                alignment.sequence().size() - interval.second)
-                                       + (interval.second == alignment.sequence().size() ? 0 : alnr->score_full_length_bonus(false, alignment)));
+                                       + (interval.second == alignment.sequence().size() ? 0 : alnr->scorer->score_full_length_bonus(false, alignment)));
             bool search_left = left_max_score >= min_softclipped_score_for_splice;
             bool search_right = right_max_score >= min_softclipped_score_for_splice;
             
@@ -3662,7 +3662,7 @@ namespace vg {
                 }
                 
                 // move the anchor out of the vector to protect it from any shuffling that goes on
-                multipath_alignment_t splice_anchor = move(multipath_alns_out[current_index[j]]);
+                multipath_alignment_t splice_anchor = std::move(multipath_alns_out[current_index[j]]);
                 
                 // identify which alignments, clusters, and hits could be part of a spliced alignment
                 vector<size_t> mp_aln_candidates;
@@ -3709,7 +3709,7 @@ namespace vg {
                 function<multipath_alignment_t&&(int64_t)> consume_candidate = [&](int64_t i) -> multipath_alignment_t&& {
                     if (i < 0) {
                         // consume the anchor
-                        return move(splice_anchor);
+                        return std::move(splice_anchor);
                     }
                     else if (i < mp_aln_candidates.size()) {
                         
@@ -3718,10 +3718,10 @@ namespace vg {
 #endif
                         
                         // pull the alignment out
-                        tmp = move(multipath_alns_out[mp_aln_candidates[i]]);
+                        tmp = std::move(multipath_alns_out[mp_aln_candidates[i]]);
                         
                         // replace it in the vectors and clear the final position
-                        multipath_alns_out[mp_aln_candidates[i]] = move(multipath_alns_out.back());
+                        multipath_alns_out[mp_aln_candidates[i]] = std::move(multipath_alns_out.back());
                         multiplicities[mp_aln_candidates[i]] = multiplicities.back();
                         cluster_idxs[mp_aln_candidates[i]] = cluster_idxs.back();
                         multipath_alns_out.pop_back();
@@ -3751,15 +3751,15 @@ namespace vg {
                         }
 #endif
                         
-                        return move(tmp);
+                        return std::move(tmp);
                     }
                     else {
                         // remove the candidate from the bank
                         auto candidate_id = unaligned_candidates[i - mp_aln_candidates.size()];
-                        tmp = move(unaligned_candidate_bank.at(candidate_id).first);
+                        tmp = std::move(unaligned_candidate_bank.at(candidate_id).first);
                         unaligned_candidate_bank.erase(candidate_id);
                         // and return it
-                        return move(tmp);
+                        return std::move(tmp);
                     }
                 };
                 
@@ -3791,7 +3791,7 @@ namespace vg {
                 found_splice_for_anchor = found_splice_for_anchor || did_splice;
                 
                 // move the alignment back now that all of the shuffling is finished
-                multipath_alns_out[current_index[j]] = move(splice_anchor);
+                multipath_alns_out[current_index[j]] = std::move(splice_anchor);
             }
             
             if (!found_splice_for_anchor) {
@@ -3831,9 +3831,9 @@ namespace vg {
         
         // choose the score cutoff based on the original unspliced mappings
         int32_t min_score_to_attempt_1 = (optimal_alignment_score(multipath_aln_pairs_out.front().first)
-                                          - get_aligner()->mapping_quality_score_diff(max_mapping_quality));
+                                          - get_aligner()->mapq_calc->mapping_quality_score_diff(max_mapping_quality));
         int32_t min_score_to_attempt_2 = (optimal_alignment_score(multipath_aln_pairs_out.front().second)
-                                          - get_aligner()->mapping_quality_score_diff(max_mapping_quality));
+                                          - get_aligner()->mapq_calc->mapping_quality_score_diff(max_mapping_quality));
         
         vector<int64_t> current_index(multipath_aln_pairs_out.size(), 0);
         for (int64_t i = 1; i < multipath_aln_pairs_out.size(); ++i) {
@@ -3888,11 +3888,11 @@ namespace vg {
                 
                 const Alignment& aln = do_read_1 ? alignment1 : alignment2;
                 
-                int64_t left_max_score = (alnr->score_exact_match(aln, 0, interval.first)
-                                          + (interval.first == 0 ? 0 : alnr->score_full_length_bonus(true, aln)));
-                int64_t right_max_score = (alnr->score_exact_match(aln, interval.second,
+                int64_t left_max_score = (alnr->scorer->score_exact_match(aln, 0, interval.first)
+                                          + (interval.first == 0 ? 0 : alnr->scorer->score_full_length_bonus(true, aln)));
+                int64_t right_max_score = (alnr->scorer->score_exact_match(aln, interval.second,
                                                                    aln.sequence().size() - interval.second)
-                                           + (interval.second == aln.sequence().size() ? 0 : alnr->score_full_length_bonus(false, aln)));
+                                           + (interval.second == aln.sequence().size() ? 0 : alnr->scorer->score_full_length_bonus(false, aln)));
                 bool search_left = left_max_score >= min_softclipped_score_for_splice;
                 bool search_right = right_max_score >= min_softclipped_score_for_splice;
                 
@@ -3953,12 +3953,12 @@ namespace vg {
                     const vector<MaximalExactMatch>* mems;
                     vector<clustergraph_t>* cluster_graphs;
                     if (do_read_1) {
-                        anchor_mp_aln = move(multipath_aln_pairs_out[current_index[j]].first);
+                        anchor_mp_aln = std::move(multipath_aln_pairs_out[current_index[j]].first);
                         mems = &mems1;
                         cluster_graphs = &cluster_graphs1;
                     }
                     else {
-                        anchor_mp_aln = move(multipath_aln_pairs_out[current_index[j]].second);
+                        anchor_mp_aln = std::move(multipath_aln_pairs_out[current_index[j]].second);
                         mems = &mems2;
                         cluster_graphs = &cluster_graphs2;
                     }
@@ -4015,7 +4015,7 @@ namespace vg {
                             cerr << "consuming anchor for read " << (do_read_1 ? 1 : 2) << " in pair at current index " << current_index[j] << " and original index " << original_index[current_index[j]] << endl;
 #endif
                             // consume the anchor
-                            return move(anchor_mp_aln);
+                            return std::move(anchor_mp_aln);
                         }
                         else if (i < mp_aln_candidates.size()) {
 #ifdef debug_multipath_mapper
@@ -4044,11 +4044,11 @@ namespace vg {
                                 cerr << "will swap with current index " << multipath_aln_pairs_out.size() - 1 << ", which has original index " << original_index[multipath_aln_pairs_out.size() - 1] << endl;
 #endif
                                 
-                                tmp = do_read_1 ? move(multipath_aln_pairs_out[mp_aln_candidates[i]].first)
-                                                : move(multipath_aln_pairs_out[mp_aln_candidates[i]].second);
+                                tmp = do_read_1 ? std::move(multipath_aln_pairs_out[mp_aln_candidates[i]].first)
+                                                : std::move(multipath_aln_pairs_out[mp_aln_candidates[i]].second);
                                 
                                 // replace it in the vectors and clear the final position
-                                multipath_aln_pairs_out[mp_aln_candidates[i]] = move(multipath_aln_pairs_out.back());
+                                multipath_aln_pairs_out[mp_aln_candidates[i]] = std::move(multipath_aln_pairs_out.back());
                                 pair_multiplicities[mp_aln_candidates[i]] = pair_multiplicities.back();
                                 cluster_pairs[mp_aln_candidates[i]] = cluster_pairs.back();
                                 multipath_aln_pairs_out.pop_back();
@@ -4097,15 +4097,15 @@ namespace vg {
                             }
 #endif
                             
-                            return move(tmp);
+                            return std::move(tmp);
                         }
                         else {
                             // remove the candidate from the bank
                             auto candidate_id = unaligned_candidates[i - mp_aln_candidates.size()];
-                            tmp = move(unaligned_candidate_bank.at(candidate_id).first);
+                            tmp = std::move(unaligned_candidate_bank.at(candidate_id).first);
                             unaligned_candidate_bank.erase(candidate_id);
                             // and return it
-                            return move(tmp);
+                            return std::move(tmp);
                         }
                     };
                     
@@ -4153,10 +4153,10 @@ namespace vg {
                     
                     // move the anchor back now that we've done all of the shuffling we were going to do
                     if (do_read_1) {
-                        multipath_aln_pairs_out[current_index[j]].first = move(anchor_mp_aln);
+                        multipath_aln_pairs_out[current_index[j]].first = std::move(anchor_mp_aln);
                     }
                     else {
-                        multipath_aln_pairs_out[current_index[j]].second = move(anchor_mp_aln);
+                        multipath_aln_pairs_out[current_index[j]].second = std::move(anchor_mp_aln);
                     }
                 }
                 
@@ -4239,10 +4239,10 @@ namespace vg {
                 function<multipath_alignment_t&&(int64_t)> consume_rescued = [&](int64_t i) -> multipath_alignment_t&& {
                     if (i < 0) {
                         // consume the anchor
-                        return move(splice_anchor);
+                        return std::move(splice_anchor);
                     }
                     else {
-                        return move(rescued);
+                        return std::move(rescued);
                     }
                 };
 #ifdef debug_multipath_mapper
@@ -4363,13 +4363,13 @@ namespace vg {
                 // either copy or move the individual end mappings
                 multipath_aln_pairs_out.emplace_back();
                 if (--left_count[cluster_pair.first.first] == 0) {
-                    multipath_aln_pairs_out.back().first = move(multipath_alns_1[cluster_pair.first.first]);
+                    multipath_aln_pairs_out.back().first = std::move(multipath_alns_1[cluster_pair.first.first]);
                 }
                 else {
                     multipath_aln_pairs_out.back().first = multipath_alns_1[cluster_pair.first.first];
                 }
                 if (--right_count[cluster_pair.first.second] == 0) {
-                    multipath_aln_pairs_out.back().second = move(multipath_alns_2[cluster_pair.first.second]);
+                    multipath_aln_pairs_out.back().second = std::move(multipath_alns_2[cluster_pair.first.second]);
                 }
                 else {
                     multipath_aln_pairs_out.back().second = multipath_alns_2[cluster_pair.first.second];
@@ -4432,7 +4432,7 @@ namespace vg {
         // the likelihoods of each alignment, which we assume to be sorted
         vector<double> scores = mapping_likelihoods(multipath_alns_out);
         auto alnr = get_aligner(!multipath_alns_out.front().quality().empty());
-        double min_score = scores.front() - alnr->mapping_quality_score_diff(max_mapping_quality);
+        double min_score = scores.front() - alnr->mapq_calc->mapping_quality_score_diff(max_mapping_quality);
         
         size_t i;
         vector<size_t> agglomerated_group;
@@ -4453,7 +4453,7 @@ namespace vg {
         if (i > 1) {
             
             // figure out the mapping quality for the whole aggregated alignment
-            double raw_mapq = alnr->compute_group_mapping_quality(scores, agglomerated_group,
+            double raw_mapq = alnr->mapq_calc->compute_group_mapping_quality(scores, agglomerated_group,
                                                                   multiplicities);
             int32_t mapq = min<int32_t>(max_mapping_quality, int32_t(mapq_scaling_factor * raw_mapq));
             multipath_alns_out.front().set_mapping_quality(mapq);
@@ -4462,7 +4462,7 @@ namespace vg {
             
             // move the remaining alignments up in the return vector and resize the remnants away
             for (size_t j = i, k = 1; j < multipath_alns_out.size(); ++j, ++k) {
-                multipath_alns_out[k] = move(multipath_alns_out[j]);
+                multipath_alns_out[k] = std::move(multipath_alns_out[j]);
             }
             multipath_alns_out.resize(multipath_alns_out.size() - i + 1);
         }
@@ -4480,7 +4480,7 @@ namespace vg {
         vector<double> scores = pair_mapping_likelihoods(multipath_aln_pairs_out, cluster_pairs);
         auto alnr = get_aligner(!multipath_aln_pairs_out.front().first.quality().empty()
                                 && !multipath_aln_pairs_out.front().second.quality().empty());
-        double min_score = scores.front() - alnr->mapping_quality_score_diff(max_mapping_quality);
+        double min_score = scores.front() - alnr->mapq_calc->mapping_quality_score_diff(max_mapping_quality);
         
         size_t i;
         vector<size_t> agglomerated_group_1, agglomerated_group_2;
@@ -4507,9 +4507,9 @@ namespace vg {
         if (i > 1) {
             
             // figure out the mapping quality for the whole aggregated alignment
-            double raw_mapq_1 = alnr->compute_group_mapping_quality(scores, agglomerated_group_1,
+            double raw_mapq_1 = alnr->mapq_calc->compute_group_mapping_quality(scores, agglomerated_group_1,
                                                                     &multiplicities);
-            double raw_mapq_2 = alnr->compute_group_mapping_quality(scores, agglomerated_group_2,
+            double raw_mapq_2 = alnr->mapq_calc->compute_group_mapping_quality(scores, agglomerated_group_2,
                                                                     &multiplicities);
             int32_t mapq_1 = min<int32_t>(max_mapping_quality, int32_t(mapq_scaling_factor * raw_mapq_1));
             int32_t mapq_2 = min<int32_t>(max_mapping_quality, int32_t(mapq_scaling_factor * raw_mapq_2));
@@ -4520,7 +4520,7 @@ namespace vg {
             
             // move the remaining alignments up in the return vector and resize the remnants away
             for (size_t j = i, k = 1; j < multipath_aln_pairs_out.size(); ++j, ++k) {
-                multipath_aln_pairs_out[k] = move(multipath_aln_pairs_out[j]);
+                multipath_aln_pairs_out[k] = std::move(multipath_aln_pairs_out[j]);
             }
             multipath_aln_pairs_out.resize(multipath_aln_pairs_out.size() - i + 1);
         }
@@ -4617,7 +4617,7 @@ namespace vg {
             // so we'll see if we can maybe get rid of parts of it for having low score
             
             auto aligner = get_aligner(!multipath_aln.quality().empty());
-            int32_t max_diff = ceil(aligner->mapping_quality_score_diff(max_mapping_quality) / mapq_scaling_factor);
+            int32_t max_diff = ceil(aligner->mapq_calc->mapping_quality_score_diff(max_mapping_quality) / mapq_scaling_factor);
             
 #ifdef debug_multipath_mapper
             cerr << "multipath alignment has " << multipath_aln.subpath_size() << " subpaths, which is large relative to sequence length of " << multipath_aln.sequence().size() << ", attempting to simplify by pruning low-scoring sections, diff = " << max_diff << endl;
@@ -4666,7 +4666,7 @@ namespace vg {
                 // put the first component into the original location
                 multipath_alignment_t last_component;
                 extract_sub_multipath_alignment(multipath_alns_out[i], comps[0], last_component);
-                multipath_alns_out[i] = move(last_component);
+                multipath_alns_out[i] = std::move(last_component);
                 split_idxs.push_back(i);
             }
         }
@@ -4791,7 +4791,7 @@ namespace vg {
                     
                     // this is the first time we're encountering this combination of hits, so we need to make
                     // a corresponding cluster
-                    it = new_cluster.insert(make_pair(move(hits_found_in_aln[j]), cluster_graphs.size())).first;
+                    it = new_cluster.insert(make_pair(std::move(hits_found_in_aln[j]), cluster_graphs.size())).first;
                     
                     // and now make the cluster graph itself
                     cluster_graphs.emplace_back();
@@ -4927,7 +4927,7 @@ namespace vg {
 #ifdef debug_multipath_mapper
                 cerr << "no duplicate, adding to return vector if distance is finite and positive" << endl;
 #endif
-                multipath_aln_pairs_out.emplace_back(move(rescued_multipath_aln_pairs[j]));
+                multipath_aln_pairs_out.emplace_back(std::move(rescued_multipath_aln_pairs[j]));
                 cluster_pairs.emplace_back(rescued_cluster_pairs[j]);
                 pair_multiplicities.emplace_back(rescued_multiplicities[j]);
             }
@@ -5041,7 +5041,7 @@ namespace vg {
             assert(fanouts.size() == mems.size());
             for (size_t i = 0; i < mems.size(); ++i) {
                 if (!fanouts[i].empty()) {
-                    match_fanouts[&mems[i]] = move(fanouts[i]);
+                    match_fanouts[&mems[i]] = std::move(fanouts[i]);
                 }
             }
         }
@@ -5146,7 +5146,7 @@ namespace vg {
                         
                         if (!replaced_original) {
                             // put the first one back into the original position in the output vector
-                            multipath_aln_pairs_out[i] = move(split_multipath_aln_pair);
+                            multipath_aln_pairs_out[i] = std::move(split_multipath_aln_pair);
                             cluster_pairs[i].second = dist;
                             replaced_original = true;
                             if (connected_components_1.size() > 1) {
@@ -5164,7 +5164,7 @@ namespace vg {
                             if (connected_components_2.size() > 1) {
                                 split_idxs_2.push_back(multipath_aln_pairs_out.size());
                             }
-                            multipath_aln_pairs_out.emplace_back(move(split_multipath_aln_pair));
+                            multipath_aln_pairs_out.emplace_back(std::move(split_multipath_aln_pair));
                             cluster_pairs.emplace_back(cluster_pairs[i].first, dist);
                             pair_multiplicities.emplace_back(pair_multiplicities[i]);
                         }
@@ -5234,8 +5234,8 @@ namespace vg {
         auto aligner = get_aligner(!alignment1.quality().empty() && !alignment2.quality().empty());
         auto get_pair_approx_likelihood = [&](const pair<pair<size_t, size_t>, int64_t>& cluster_pair) {
             return ((get<2>(cluster_graphs1[cluster_pair.first.first])
-                     + get<2>(cluster_graphs2[cluster_pair.first.second])) * aligner->match
-                    + fragment_length_log_likelihood(cluster_pair.second) / aligner->log_base);
+                     + get<2>(cluster_graphs2[cluster_pair.first.second])) * aligner->scorer->match
+                    + fragment_length_log_likelihood(cluster_pair.second) / aligner->scorer->get_log_base());
         };
         
         // sort the pairs descending by approximate likelihood
@@ -5353,7 +5353,7 @@ namespace vg {
         
         if (!multipath_aln_pairs_out.empty()) {
             
-            double likelihood_diff = aligner->mapping_quality_score_diff(truncation_multiplicity_mq_limit);
+            double likelihood_diff = aligner->mapq_calc->mapping_quality_score_diff(truncation_multiplicity_mq_limit);
             double tail_likelihood = get_pair_approx_likelihood(cluster_pairs[multipath_aln_pairs_out.size() - 1]);
             
             // find clusters whose likelihoods are approximately the same as the low end of the clusters we aligned
@@ -5401,7 +5401,7 @@ namespace vg {
                 
                 // figure out a truncation multiplier for this pruning step
                 auto scores = pair_mapping_likelihoods(multipath_aln_pairs_out, cluster_pairs);
-                double score_diff = aligner->mapping_quality_score_diff(truncation_multiplicity_mq_limit);
+                double score_diff = aligner->mapq_calc->mapping_quality_score_diff(truncation_multiplicity_mq_limit);
                 size_t last_idx = max_split_pairs - 1;
                 size_t min_tail_idx = last_idx;
                 while (min_tail_idx > 0 && scores[min_tail_idx - 1] <= scores[last_idx] + score_diff) {
@@ -5478,9 +5478,9 @@ namespace vg {
             // get the start position of the MEM
             positions.push_back(mem_hit.second);
             // search far enough away to get any hit detectable without soft clipping
-            forward_max_dist.push_back(min(aligner->longest_detectable_gap(alignment, mem_hit.first->end), max_alignment_gap)
+            forward_max_dist.push_back(min(aligner->scorer->longest_detectable_gap(alignment, mem_hit.first->end), max_alignment_gap)
                                        + (alignment.sequence().end() - mem_hit.first->begin));
-            backward_max_dist.push_back(min(aligner->longest_detectable_gap(alignment, mem_hit.first->begin), max_alignment_gap)
+            backward_max_dist.push_back(min(aligner->scorer->longest_detectable_gap(alignment, mem_hit.first->begin), max_alignment_gap)
                                         + (mem_hit.first->begin - alignment.sequence().begin()));
         }
         
@@ -5494,7 +5494,7 @@ namespace vg {
         algorithms::extract_containing_graph(xindex, cluster_graph.get(), positions, forward_max_dist, backward_max_dist,
                                              num_alt_alns > 1 ? reversing_walk_length : 0);
         
-        return move(make_pair(move(cluster_graph), cluster.size() == 1));
+        return std::move(make_pair(std::move(cluster_graph), cluster.size() == 1));
     }
 
     // TODO: entirely duplicative with MultipathAlignmentGraph...
@@ -5552,7 +5552,7 @@ namespace vg {
                     backward_dist[i] = tail_length + pessimistic_gap(tail_length, pessimistic_gap_multiplier);
                 }
                 else {
-                    backward_dist[i] = aligner->longest_detectable_gap(alignment, cluster[i].first->begin);
+                    backward_dist[i] = aligner->scorer->longest_detectable_gap(alignment, cluster[i].first->begin);
                 }
             }
             else {
@@ -5568,7 +5568,7 @@ namespace vg {
                     forward_dist[i] = tail_length + pessimistic_gap(tail_length, pessimistic_gap_multiplier) + cluster[i].first->length();
                 }
                 else {
-                    forward_dist[i] = aligner->longest_detectable_gap(alignment, cluster[i].first->end) + cluster[i].first->length();
+                    forward_dist[i] = aligner->scorer->longest_detectable_gap(alignment, cluster[i].first->end) + cluster[i].first->length();
                 }
             }
             else {
@@ -5608,9 +5608,9 @@ namespace vg {
                 bool any_dists_changed = false;
                 for (size_t i = 0; i < cluster.size(); ++i) {
                     size_t bwd_dist = min<size_t>(backward_dist[i] * 2,
-                                                  aligner->longest_detectable_gap(alignment, cluster[i].first->begin));
+                                                  aligner->scorer->longest_detectable_gap(alignment, cluster[i].first->begin));
                     size_t fwd_dist = min<size_t>(forward_dist[i] * 2,
-                                                  aligner->longest_detectable_gap(alignment, cluster[i].first->end) + cluster[i].first->length());
+                                                  aligner->scorer->longest_detectable_gap(alignment, cluster[i].first->end) + cluster[i].first->length());
                     if (bwd_dist > backward_dist[i]) {
                         backward_dist[i] = bwd_dist;
                         any_dists_changed = true;
@@ -5624,7 +5624,7 @@ namespace vg {
                 do_extract = any_dists_changed;
             }
         }
-        return move(make_pair(move(cluster_graph), connected));
+        return std::move(make_pair(std::move(cluster_graph), connected));
     }
 
     pair<unique_ptr<bdsg::HashGraph>, bool> MultipathMapper::extract_cluster_graph(const Alignment& alignment,
@@ -5674,7 +5674,7 @@ namespace vg {
             // gather the parameters for subgraph extraction from the MEM hits
             auto& cluster = clusters[i];
             auto extracted = extract_cluster_graph(alignment, cluster);
-            tuple<unique_ptr<bdsg::HashGraph>, bool, double> cluster_graph(move(extracted.first), extracted.second, cluster.second);
+            tuple<unique_ptr<bdsg::HashGraph>, bool, double> cluster_graph(std::move(extracted.first), extracted.second, cluster.second);
             
             // check if this subgraph overlaps with any previous subgraph (indicates a probable clustering failure where
             // one cluster was split into multiple clusters)
@@ -5705,7 +5705,7 @@ namespace vg {
 #ifdef debug_multipath_mapper
                 cerr << "cluster graph does not overlap with any other cluster graphs, adding as cluster " << i << endl;
 #endif
-                cluster_graphs[i] = move(cluster_graph);
+                cluster_graphs[i] = std::move(cluster_graph);
             }
             else {
                 // this graph overlaps at least one other graph, so we merge them into one
@@ -5732,7 +5732,7 @@ namespace vg {
                 double multiplicity;
                 if (remaining_idx == i) {
                     // the new graph was chosen to remain, so add it to the record
-                    cluster_graphs[i] = move(cluster_graph);
+                    cluster_graphs[i] = std::move(cluster_graph);
                     merging_graph = get<0>(cluster_graph).get();
                     all_connected = get<1>(cluster_graph);
                     multiplicity = get<2>(cluster_graph);
@@ -5750,7 +5750,7 @@ namespace vg {
                 // merge any other chained graphs into the remaining graph
                 for (size_t j : overlapping_graphs) {
                     if (j != remaining_idx) {
-                        auto removing_graph = move(cluster_graphs[j]);
+                        auto removing_graph = std::move(cluster_graphs[j]);
                         handlealgs::extend(get<0>(removing_graph).get(), merging_graph);
                         all_connected = all_connected && get<1>(removing_graph);
                         multiplicity = min(multiplicity, get<2>(removing_graph));
@@ -5863,7 +5863,7 @@ namespace vg {
         for (pair<const size_t, tuple<unique_ptr<bdsg::HashGraph>, bool, double>>& cluster_graph : cluster_graphs) {
             cluster_to_idx[cluster_graph.first] = cluster_graphs_out.size();
             cluster_graphs_out.emplace_back();
-            get<0>(cluster_graphs_out.back()) = move(get<0>(cluster_graph.second));
+            get<0>(cluster_graphs_out.back()) = std::move(get<0>(cluster_graph.second));
             get<1>(cluster_graphs_out.back()).second = get<2>(cluster_graph.second);
 #ifdef debug_multipath_mapper
             cerr << "adding cluster graph " << cluster_graph.first << " to return vector at index " << cluster_graphs_out.size() << " with multiplicity " << get<1>(cluster_graphs_out.back()).second << endl;
@@ -5981,7 +5981,7 @@ namespace vg {
             const auto& edit = mapping.edit().front();
             if (edit.from_length() == 0 && edit.to_length() != 0) {
                 // this is soft-clipped
-                size_t max_len = get_aligner()->longest_detectable_gap(multipath_aln.sequence().size(), edit.to_length());
+                size_t max_len = get_aligner()->scorer->longest_detectable_gap(multipath_aln.sequence().size(), edit.to_length());
                 if (mapping.position().offset() < max_len) {
                     // the clipped sequence's alignment might not fit on this node
                     handle_t handle = graph.get_handle(mapping.position().node_id(), mapping.position().is_reverse());
@@ -6005,7 +6005,7 @@ namespace vg {
                     // this is soft-clipped
                     handle_t handle = graph.get_handle(mapping.position().node_id(), mapping.position().is_reverse());
                     int64_t final_offset = mapping.position().offset() + mapping_from_length(mapping);
-                    size_t max_len = get_aligner()->longest_detectable_gap(multipath_aln.sequence().size(), edit.to_length());
+                    size_t max_len = get_aligner()->scorer->longest_detectable_gap(multipath_aln.sequence().size(), edit.to_length());
                     if (graph.get_length(handle) - final_offset < max_len) {
                         // the clipped sequence's alignment might not fit on this node
                         bool is_sink = graph.follow_edges(handle, false, [](const handle_t& h) {return false;});
@@ -6062,7 +6062,7 @@ namespace vg {
             
             // the longest path we could possibly align to (full gap and a full sequence)
             auto aligner = get_aligner(!alignment.quality().empty());
-            size_t target_length = alignment.sequence().size() + min(aligner->longest_detectable_gap(alignment), max_alignment_gap);
+            size_t target_length = alignment.sequence().size() + min(aligner->scorer->longest_detectable_gap(alignment), max_alignment_gap);
             
             // check if we can get away with using only one strand of the graph
             bool use_single_stranded = handlealgs::is_single_stranded(graph);
@@ -6244,7 +6244,7 @@ namespace vg {
 #endif
             
             // do the connecting alignments and fill out the multipath_alignment_t object
-            multi_aln_graph.align(alignment, *align_dag, aligner, true, num_alt_alns, dynamic_max_alt_alns, max_alignment_gap,
+            multi_aln_graph.align(alignment, *align_dag, aligner, aligner, true, num_alt_alns, dynamic_max_alt_alns, max_alignment_gap,
                                   use_pessimistic_tail_alignment ? pessimistic_gap_multiplier : 0.0, std::numeric_limits<size_t>::max(),
                                   simplify_topologies, max_tail_merge_supress_length, choose_band_padding, multipath_aln_out,
                                   snarl_manager, distance_index, &translator);
@@ -6295,7 +6295,7 @@ namespace vg {
         multi_aln_graph.remove_transitive_edges(topological_order);
         
         // do the connecting alignments and fill out the multipath_alignment_t object
-        multi_aln_graph.align(alignment, subgraph, aligner, false, num_alt_alns, dynamic_max_alt_alns, max_alignment_gap,
+        multi_aln_graph.align(alignment, subgraph, aligner, aligner, false, num_alt_alns, dynamic_max_alt_alns, max_alignment_gap,
                               use_pessimistic_tail_alignment ? pessimistic_gap_multiplier : 0.0, std::numeric_limits<size_t>::max(),
                               simplify_topologies, max_tail_merge_supress_length, choose_band_padding, multipath_aln_out);
         
@@ -6361,7 +6361,7 @@ namespace vg {
                 const edit_t& edit = source_subpath->path().mapping(0).edit(0);
                 if (edit.to_length() != 0 && edit.from_length() != 0) {
                     source_subpath->set_score(source_subpath->score()
-                                              - aligner.score_full_length_bonus(true, multipath_aln.sequence().begin(),
+                                              - aligner.scorer->score_full_length_bonus(true, multipath_aln.sequence().begin(),
                                                                                 multipath_aln.sequence().end(),
                                                                                 multipath_aln.quality().begin()));
                 }
@@ -6385,7 +6385,7 @@ namespace vg {
                 const edit_t& edit = source_subpath->path().mapping(0).edit(0);
                 if (edit.to_length() != 0 && edit.from_length() != 0) {
                     source_subpath->set_score(source_subpath->score()
-                                              - aligner.score_full_length_bonus(true, multipath_aln.sequence().begin(),
+                                              - aligner.scorer->score_full_length_bonus(true, multipath_aln.sequence().begin(),
                                                                                 multipath_aln.sequence().end(),
                                                                                 multipath_aln.quality().begin()));
                 }
@@ -6399,7 +6399,7 @@ namespace vg {
                 const edit_t& edit = final_mapping.edit(final_mapping.edit_size() - 1);
                 if (edit.to_length() != 0 && edit.from_length() != 0) {
                     subpath->set_score(subpath->score()
-                                       - aligner.score_full_length_bonus(false, multipath_aln.sequence().begin(),
+                                       - aligner.scorer->score_full_length_bonus(false, multipath_aln.sequence().begin(),
                                                                          multipath_aln.sequence().end(),
                                                                          multipath_aln.quality().begin()));
                 }
@@ -6420,7 +6420,7 @@ namespace vg {
         // consistent.
         bool all_multipaths_pop_consistent = true;
         
-        double log_base = get_aligner(!multipath_alns.front().quality().empty())->log_base;
+        double log_base = get_aligner(!multipath_alns.front().quality().empty())->scorer->get_log_base();
         
         // The score of the optimal Alignment for each multipath_alignment_t, not adjusted for population
         vector<double> scores(multipath_alns.size(), 0.0);
@@ -6627,7 +6627,7 @@ namespace vg {
         // we did population-aware alignment and succeeded for all the
         // multipath alignments.
         if (include_population_component && all_multipaths_pop_consistent) {
-            scores = move(pop_adjusted_scores);
+            scores = std::move(pop_adjusted_scores);
         }
         return scores;
     }
@@ -6650,7 +6650,7 @@ namespace vg {
         bool all_multipaths_pop_consistent = true;
         
         double log_base = get_aligner(!multipath_aln_pairs.front().first.quality().empty() &&
-                                      !multipath_aln_pairs.front().second.quality().empty())->log_base;
+                                      !multipath_aln_pairs.front().second.quality().empty())->scorer->get_log_base();
         
         // the scores of the optimal alignments and fragments, ignoring population
         vector<double> scores(multipath_aln_pairs.size(), 0.0);
@@ -6847,7 +6847,7 @@ namespace vg {
         
         // Decide which scores to use depending on whether we have pop adjusted scores we want to use
         if (include_population_component && all_multipaths_pop_consistent) {
-            scores = move(pop_adjusted_scores);
+            scores = std::move(pop_adjusted_scores);
         }
         
         // Pull the min frag or extra score out of the score so it will be nonnegative
@@ -6892,7 +6892,7 @@ namespace vg {
         
         if (scores.size() > 1 && max_alt_mappings > 1) {
             // we want MAPQs for all of the multi-mapped reads, so we need the exact algorithm
-            raw_mapqs = aligner->compute_all_mapping_qualities(scores, multiplicities);
+            raw_mapqs = aligner->mapq_calc->compute_all_mapping_qualities(scores, multiplicities);
         }
         else {
             // we only need a MAPQ for the primary
@@ -6900,11 +6900,11 @@ namespace vg {
             bool use_exact = (mapping_quality_method == Exact);
             if (!use_exact && scores.size() >= 2
                 && (scores[1] > scores[0] ||
-                    (mapping_quality_method == Adaptive && scores[1] < scores[0] - get_aligner()->mapping_quality_score_diff(max_mapping_quality)))) {
+                    (mapping_quality_method == Adaptive && scores[1] < scores[0] - get_aligner()->mapq_calc->mapping_quality_score_diff(max_mapping_quality)))) {
                 use_exact = true;
             }
             
-            raw_mapqs.push_back(aligner->compute_first_mapping_quality(scores, !use_exact, multiplicities));
+            raw_mapqs.push_back(aligner->mapq_calc->compute_first_mapping_quality(scores, !use_exact, multiplicities));
         }
         
         // arbitrary scaling, seems to help performance
@@ -6978,7 +6978,7 @@ namespace vg {
                 removed_so_far++;
             }
             else if (removed_so_far) {
-                multipath_alns[i - removed_so_far] = move(multipath_alns[i]);
+                multipath_alns[i - removed_so_far] = std::move(multipath_alns[i]);
                 scores[i - removed_so_far] = scores[i];
                 if (cluster_idxs) {
                     (*cluster_idxs)[i - removed_so_far] = (*cluster_idxs)[i];
@@ -7046,7 +7046,7 @@ namespace vg {
             for (size_t i = 1; i < num_reporting; ++i) {
                 reporting_idxs[i] = i;
             }
-            double raw_mapq = get_aligner(!multipath_alns.front().quality().empty())->compute_group_mapping_quality(scores, reporting_idxs,
+            double raw_mapq = get_aligner(!multipath_alns.front().quality().empty())->mapq_calc->compute_group_mapping_quality(scores, reporting_idxs,
                                                                                                                     multiplicities);
             // TODO: for some reason set_annotation will accept a double but not an int
             double group_mapq = min<double>(max_mapping_quality, mapq_scaling_factor * raw_mapq);
@@ -7237,9 +7237,9 @@ namespace vg {
                     }
                     else if (removed_so_far > 0) {
                         // move these items into their new position
-                        multipath_aln_pairs[i - removed_so_far] = move(multipath_aln_pairs[i]);
+                        multipath_aln_pairs[i - removed_so_far] = std::move(multipath_aln_pairs[i]);
                         scores[i - removed_so_far] = scores[i];
-                        cluster_pairs[i - removed_so_far] = move(cluster_pairs[i]);
+                        cluster_pairs[i - removed_so_far] = std::move(cluster_pairs[i]);
                         if (multiplicities) {
                             (*multiplicities)[i - removed_so_far] = (*multiplicities)[i];
                         }
@@ -7276,8 +7276,8 @@ namespace vg {
                 auto aligner = get_aligner(!multipath_aln_pairs.front().first.quality().empty() &&
                                            !multipath_aln_pairs.front().second.quality().empty());
                 
-                int32_t raw_mapq_1 = aligner->compute_group_mapping_quality(scores, duplicates_1, multiplicities);
-                int32_t raw_mapq_2 = aligner->compute_group_mapping_quality(scores, duplicates_2, multiplicities);
+                int32_t raw_mapq_1 = aligner->mapq_calc->compute_group_mapping_quality(scores, duplicates_1, multiplicities);
+                int32_t raw_mapq_2 = aligner->mapq_calc->compute_group_mapping_quality(scores, duplicates_2, multiplicities);
                 
 #ifdef debug_multipath_mapper
                 cerr << "deduplicated raw MAPQs are " << raw_mapq_1 << " and " << raw_mapq_2 << endl;
@@ -7302,8 +7302,8 @@ namespace vg {
                         scores[i] -= allelic_diff_2;
                     }
                     
-                    int32_t raw_allelic_mapq_1 = aligner->compute_group_mapping_quality(scores, duplicates_1, multiplicities);
-                    int32_t raw_allelic_mapq_2 = aligner->compute_group_mapping_quality(scores, duplicates_2, multiplicities);
+                    int32_t raw_allelic_mapq_1 = aligner->mapq_calc->compute_group_mapping_quality(scores, duplicates_1, multiplicities);
+                    int32_t raw_allelic_mapq_2 = aligner->mapq_calc->compute_group_mapping_quality(scores, duplicates_2, multiplicities);
                     
                     int32_t allelic_mapq_1 = min<int32_t>(raw_mapq_1 * mapq_scaling_factor, max_mapping_quality);
                     int32_t allelic_mapq_2 = min<int32_t>(raw_mapq_2 * mapq_scaling_factor, max_mapping_quality);
@@ -7337,7 +7337,7 @@ namespace vg {
             }
             auto aligner = get_aligner(!multipath_aln_pairs.front().first.quality().empty() &&
                                        !multipath_aln_pairs.front().second.quality().empty());
-            double raw_mapq = aligner->compute_group_mapping_quality(scores, reporting_idxs,
+            double raw_mapq = aligner->mapq_calc->compute_group_mapping_quality(scores, reporting_idxs,
                                                                      multiplicities);
             
             // TODO: for some reason set_annotation will accept a double but not an int
@@ -7367,22 +7367,22 @@ namespace vg {
         string dummy_c(length, 'C');
         string dummy_g(length, 'G');
         string dummy_t(length, 'T');
-        int32_t score_a = get_regular_aligner()->score_exact_match(dummy_a);
-        int32_t score_c = get_regular_aligner()->score_exact_match(dummy_c);
-        int32_t score_g = get_regular_aligner()->score_exact_match(dummy_g);
-        int32_t score_t = get_regular_aligner()->score_exact_match(dummy_t);
+        int32_t score_a = get_regular_aligner()->scorer->score_exact_match(dummy_a);
+        int32_t score_c = get_regular_aligner()->scorer->score_exact_match(dummy_c);
+        int32_t score_g = get_regular_aligner()->scorer->score_exact_match(dummy_g);
+        int32_t score_t = get_regular_aligner()->scorer->score_exact_match(dummy_t);
         int32_t lowest_score = min(score_a, min(score_c, min(score_g, score_t)));
         
         // add in the full length bonus, this is the criterion we will actually check against
         string dummy_qual(length, char(40));
-        min_softclipped_score_for_splice = lowest_score + get_regular_aligner()->score_full_length_bonus(false, dummy_a.begin(),
+        min_softclipped_score_for_splice = lowest_score + get_regular_aligner()->scorer->score_full_length_bonus(false, dummy_a.begin(),
                                                                                                          dummy_a.end(),
                                                                                                          dummy_qual.begin());
     }
 
     void MultipathMapper::set_log_odds_against_splice(double log_odds) {
         no_splice_natural_log_odds = log_odds;
-        no_splice_log_odds = round(log_odds / get_regular_aligner()->log_base);
+        no_splice_log_odds = round(log_odds / get_regular_aligner()->scorer->get_log_base());
     }
 
     void MultipathMapper::set_intron_length_distribution(const vector<double>& intron_mixture_weights,
@@ -7391,7 +7391,7 @@ namespace vg {
     }
 
     void MultipathMapper::set_max_merge_supression_length() {
-        max_tail_merge_supress_length = ceil(double(get_regular_aligner()->match) / double(get_regular_aligner()->mismatch));
+        max_tail_merge_supress_length = ceil(double(get_regular_aligner()->scorer->match) / double(get_regular_aligner()->scorer->mismatch));
     }
 
     void MultipathMapper::set_read_1_adapter(const string& adapter) {
